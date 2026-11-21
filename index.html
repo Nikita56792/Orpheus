@@ -7,16 +7,16 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>Orpheus Sync — Синхронная музыка на всех устройствах</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=3" />
   <!-- PeerJS (WebRTC DataChannel) с резервным CDN и генератор QR-кодов -->
   <script defer src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js" onerror="var s=document.createElement('script');s.src='https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';document.head.appendChild(s);"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js" onerror="var s=document.createElement('script');s.src='https://unpkg.com/qrcode-generator@1.4.4/qrcode.min.js';document.head.appendChild(s);"></script>
-  <!-- Модули приложения -->
-  <script defer src="js/wake-lock.js"></script>
-  <script defer src="js/clock-sync.js"></script>
-  <script defer src="js/audio-engine.js"></script>
-  <script defer src="js/network.js"></script>
-  <script defer src="js/app.js"></script>
+  <!-- Модули приложения (v=3 сбрасывает кэш браузера на GitHub Pages) -->
+  <script defer src="js/wake-lock.js?v=3"></script>
+  <script defer src="js/clock-sync.js?v=3"></script>
+  <script defer src="js/audio-engine.js?v=3"></script>
+  <script defer src="js/network.js?v=3"></script>
+  <script defer src="js/app.js?v=3"></script>
 </head>
 <body>
   <div class="app-shell">

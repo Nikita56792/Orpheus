@@ -11,8 +11,8 @@
  */
 class NetworkManager {
   static PEER_PREFIX = 'orpheus-sync-v1-';
-  static CHUNK_SIZE = 16384; // 16 КБ — безопасный размер SCTP-сообщения для Safari/Chrome/Firefox
-  static MAX_BUFFERED_AMOUNT = 256 * 1024; // Пауза отправки, если буфер WebRTC > 256 КБ
+  static CHUNK_SIZE = 8192; // 8 КБ raw (~11 КБ в JSON/base64) — строго ниже 16 КБ SCTP лимита iOS/Safari
+  static MAX_BUFFERED_AMOUNT = 64 * 1024; // Щадящий буфер 64 КБ для мобильного WebRTC
 
   static ICE_CONFIG = {
     iceServers: [
@@ -215,6 +215,7 @@ class NetworkManager {
         setTimeout(attachIceMonitor, 300);
 
         conn.on('open', () => {
+          if (this.hostConn !== conn) return;
           clearTimeout(timeout);
           if (!settled) {
             settled = true;
@@ -223,13 +224,25 @@ class NetworkManager {
           if (this.cb.onHostConnected) this.cb.onHostConnected();
         });
 
-        conn.on('data', (msg) => this._handleHostMessage(msg));
+        conn.on('data', (msg) => {
+          if (this.hostConn !== conn) return;
+          this._handleHostMessage(msg);
+        });
 
         conn.on('close', () => {
-          if (this.cb.onHostDisconnected) this.cb.onHostDisconnected();
+          if (this.hostConn !== conn) return;
+          const iceState = conn.peerConnection?.iceConnectionState || 'unknown';
+          if (!settled) {
+            clearTimeout(timeout);
+            settled = true;
+            reject(new Error(`Канал закрыт во время подключения (ICE: ${iceState}). Обновите страницу на Хосте и попробуйте снова.`));
+          } else if (this.cb.onHostDisconnected) {
+            this.cb.onHostDisconnected(iceState);
+          }
         });
 
         conn.on('error', (err) => {
+          if (this.hostConn !== conn) return;
           console.error('[Network/Listener] Conn error:', err);
           clearTimeout(timeout);
           if (!settled) {
@@ -448,13 +461,13 @@ class NetworkManager {
           b64: this._uint8ToBase64(slice),
         });
 
-        // Периодически отдаём поток браузеру и обновляем статус
-        if (i % 16 === 0 || i === totalChunks - 1) {
+        // Плавная подача чанков без перегрузки мобильного SCTP-канала
+        if (i % 4 === 0 || i === totalChunks - 1) {
           const pct = Math.round(((i + 1) / totalChunks) * 100);
           client.progress = pct;
           client.status = pct < 100 ? `Отправка ${pct}%` : 'Декодирование...';
           this._emitPeers();
-          await new Promise((r) => setTimeout(r, 0));
+          await new Promise((r) => setTimeout(r, 4));
         }
       }
     }

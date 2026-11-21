@@ -99,6 +99,8 @@
     isSeeking: false,
     rafId: null,
     pendingPlayCmd: null, // Если команда PLAY пришла до завершения декодирования трека
+    reconnectAttempts: 0,
+    reconnectTimer: null,
   };
 
   // Инициализация подсистем
@@ -132,17 +134,35 @@
   const network = new NetworkManager({
     onPeersChanged: (peers) => renderPeerList(peers),
     onHostConnected: () => {
+      state.reconnectAttempts = 0;
+      if (state.reconnectTimer) {
+        clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = null;
+      }
       setStatusMetric('Синхронизация...', 'metric-warn');
       ui.btnListenerReconnect.classList.add('hidden');
       ui.listenerBannerText.textContent = 'Подключено! Калибровка часов...';
     },
-    onHostDisconnected: () => {
+    onHostDisconnected: (iceState = '') => {
       audio.pause();
       if (clock) clock.stop();
-      setStatusMetric('Отключён', 'metric-bad');
-      ui.listenerBannerText.textContent = 'Связь с Хостом потеряна.';
+      setStatusMetric('Переподкл...', 'metric-warn');
       ui.btnListenerReconnect.classList.remove('hidden');
-      showToast('Соединение с Хостом разорвано', 'error');
+
+      const detail = iceState && iceState !== 'unknown' ? ` (${iceState})` : '';
+      if (state.role === 'listener' && state.roomCode && state.reconnectAttempts < 3) {
+        state.reconnectAttempts++;
+        ui.listenerBannerText.textContent = `Связь прервалась${detail}. Переподключение ${state.reconnectAttempts}/3...`;
+        state.reconnectTimer = setTimeout(() => {
+          if (state.role === 'listener' && state.roomCode) {
+            enterAsListener(state.roomCode, true);
+          }
+        }, 1800);
+      } else {
+        setStatusMetric('Отключён', 'metric-bad');
+        ui.listenerBannerText.textContent = `Связь с Хостом потеряна${detail}. Нажмите «Переподключиться».`;
+        showToast('Соединение с Хостом разорвано', 'error');
+      }
     },
     onSyncPong: (msg) => {
       if (clock) clock.handlePong(msg);
@@ -316,13 +336,21 @@
 
   /* ==================== ЗАПУСК СЛУШАТЕЛЯ ==================== */
 
-  async function enterAsListener(rawCode) {
+  async function enterAsListener(rawCode, isAutoReconnect = false) {
     const code = NetworkManager.normalizeCode(rawCode);
     if (code.length < 4) {
       const msg = 'Введите 6-значный код комнаты (например, K7M-4PX)';
       setConnectStatus(msg, true);
       showToast(msg, 'error');
       return;
+    }
+
+    if (state.reconnectTimer) {
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
+    if (!isAutoReconnect) {
+      state.reconnectAttempts = 0;
     }
 
     ui.btnJoinRoom.disabled = true;
@@ -333,8 +361,10 @@
 
     try {
       // 1. КРИТИЧНО: Разблокируем AudioContext строго внутри обработчика клика!
-      await audio.unlock();
-      wakeLock.acquire();
+      if (!isAutoReconnect) {
+        await audio.unlock();
+        wakeLock.acquire();
+      }
 
       // Если скрипт PeerJS ещё догружается с резервного CDN — подождём до 3 сек
       if (typeof Peer === 'undefined') {
@@ -747,6 +777,11 @@
   }
 
   function leaveRoom() {
+    if (state.reconnectTimer) {
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
+    state.reconnectAttempts = 0;
     if (state.rafId) {
       cancelAnimationFrame(state.rafId);
       state.rafId = null;
