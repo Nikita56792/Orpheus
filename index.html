@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0e14" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Orpheus Sync — Синхронная музыка на всех устройствах</title>
+  <link rel="stylesheet" href="styles.css" />
+  <!-- PeerJS (WebRTC DataChannel) и генератор QR-кодов без бэкенда -->
+  <script defer src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+  <!-- Модули приложения -->
+  <script defer src="js/wake-lock.js"></script>
+  <script defer src="js/clock-sync.js"></script>
+  <script defer src="js/audio-engine.js"></script>
+  <script defer src="js/network.js"></script>
+  <script defer src="js/app.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Верхняя панель -->
+    <header class="topbar">
+      <div class="brand" id="btnHome" role="button" tabindex="0" title="На главную">
+        <span class="brand-logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+            <path d="M4 12v0M8 7v10M12 4v16M16 7v10M20 12v0" />
+          </svg>
+        </span>
+        <span class="brand-name">Orpheus<span class="brand-accent">Sync</span></span>
+      </div>
+
+      <div class="status-pills">
+        <span class="pill pill-muted" id="wakeLockBadge" title="Защита от выключения экрана">
+          <span class="dot"></span>
+          <span class="pill-text">Экран: авто</span>
+        </span>
+        <button class="pill pill-btn hidden" id="btnLeaveRoom" type="button">Выйти</button>
+      </div>
+    </header>
+
+    <!-- ЭКРАН 1: Стартовый (Выбор роли) -->
+    <main id="viewLanding" class="view">
+      <section class="hero">
+        <h1>Идеально синхронная музыка на нескольких устройствах</h1>
+        <p class="hero-sub">
+          NTP-сверка часов по WebRTC и аппаратный запуск через Web Audio API — превратите телефоны и ноутбуки в единую аудиосистему.
+        </p>
+      </section>
+
+      <section class="role-grid">
+        <article class="card role-card">
+          <div class="role-icon role-icon-host">
+            <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="2" />
+              <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14" />
+            </svg>
+          </div>
+          <h2>Я — Хост</h2>
+          <p class="muted">Создайте комнату, выберите аудиофайл или тестовый ритм и управляйте воспроизведением для всех.</p>
+          <button id="btnCreateRoom" class="btn btn-primary btn-lg" type="button">
+            Создать комнату
+          </button>
+        </article>
+
+        <article class="card role-card">
+          <div class="role-icon role-icon-listener">
+            <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M3 18v-6a9 9 0 0 1 18 0v6" />
+              <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z" />
+            </svg>
+          </div>
+          <h2>Я — Слушатель</h2>
+          <p class="muted">Введите код комнаты от Хоста или отсканируйте QR-код на его экране.</p>
+          <form id="joinForm" class="join-form">
+            <input
+              id="inputRoomCode"
+              class="input code-input"
+              type="text"
+              inputmode="text"
+              autocomplete="off"
+              autocapitalize="characters"
+              spellcheck="false"
+              maxlength="7"
+              placeholder="КОД, НАПР. K7M-4PX"
+              required
+            />
+            <button id="btnJoinRoom" class="btn btn-accent btn-lg" type="submit">
+              Подключиться и включить звук
+            </button>
+          </form>
+          <p class="hint">Нажатие разблокирует Web Audio API в iOS Safari и Chrome.</p>
+        </article>
+      </section>
+    </main>
+
+    <!-- ЭКРАН 2: Быстрый вход по ссылке / QR (для Слушателя) -->
+    <main id="viewInviteUnlock" class="view hidden">
+      <section class="card unlock-card">
+        <div class="role-icon role-icon-listener center-icon">
+          <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+            <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+          </svg>
+        </div>
+        <h2>Подключение к комнате</h2>
+        <div class="room-code-big" id="inviteRoomCode">------</div>
+        <p class="muted">
+          Мобильные браузеры требуют одно касание для запуска аудиодвижка и синхронизации часов с Хостом.
+        </p>
+        <button id="btnUnlockAndJoin" class="btn btn-accent btn-xl" type="button">
+          Подключиться и разблокировать звук
+        </button>
+        <p class="hint">На iPhone убедитесь, что боковой переключатель звука не в беззвучном режиме.</p>
+        <button id="btnCancelInvite" class="btn btn-ghost" type="button">Выбрать другую роль</button>
+      </section>
+    </main>
+
+    <!-- ЭКРАН 3: Рабочая комната (Хост или Слушатель) -->
+    <main id="viewRoom" class="view hidden">
+      <!-- Информация о комнате и телеметрия -->
+      <section class="card room-header-card">
+        <div class="room-meta">
+          <div>
+            <span class="role-badge" id="roleBadge">ХОСТ</span>
+            <div class="room-code-row">
+              <span class="room-code-label">Комната:</span>
+              <strong class="room-code-value" id="displayRoomCode">------</strong>
+              <button class="icon-btn" id="btnCopyCode" type="button" title="Скопировать ссылку">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="room-actions-inline" id="hostShareActions">
+            <button class="btn btn-secondary btn-sm" id="btnToggleQR" type="button">QR-код</button>
+            <button class="btn btn-secondary btn-sm" id="btnShareLink" type="button">Поделиться</button>
+          </div>
+        </div>
+
+        <!-- Раскрывающийся блок с QR-кодом (для Хоста) -->
+        <div id="qrPanel" class="qr-panel hidden">
+          <div id="qrCanvasWrap" class="qr-box"></div>
+          <div class="qr-info">
+            <p class="qr-title">Отсканируйте камерой телефона</p>
+            <input id="shareLinkInput" class="input share-input" type="text" readonly />
+            <p class="hint">Слушатель сразу попадёт на экран подключения к этой комнате.</p>
+          </div>
+        </div>
+
+        <!-- Метрики синхронизации -->
+        <div class="telemetry-grid">
+          <div class="metric">
+            <span class="metric-label">Статус</span>
+            <span class="metric-value" id="metricStatus">Подключение...</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Пинг (RTT)</span>
+            <span class="metric-value mono" id="metricRtt">—</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Сдвиг часов</span>
+            <span class="metric-value mono" id="metricOffset">—</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Рассинхрон</span>
+            <span class="metric-value mono" id="metricDrift">0 мс</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Панель выбора трека (только для Хоста) -->
+      <section id="hostTrackSection" class="card hidden">
+        <div class="section-head">
+          <h3>Источник звука</h3>
+          <span class="hint">Передаётся напрямую по P2P</span>
+        </div>
+
+        <div class="source-tabs">
+          <label class="file-dropzone" id="fileDropzone">
+            <input type="file" id="audioFileInput" accept="audio/*" hidden />
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="17 8 12 3 7 8" />
+              <line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+            <span><strong>Выбрать аудиофайл</strong> (MP3, WAV, M4A, OGG)</span>
+          </label>
+        </div>
+
+        <div class="quick-sources">
+          <button id="btnLoadDemoTrack" class="btn btn-secondary btn-sm" type="button">
+            ⚡ Встроенный тест-бит (120 BPM)
+          </button>
+          <button id="btnToggleUrlInput" class="btn btn-ghost btn-sm" type="button">
+            🔗 Загрузить по URL
+          </button>
+        </div>
+
+        <form id="urlTrackForm" class="url-form hidden">
+          <input
+            id="inputAudioUrl"
+            class="input"
+            type="url"
+            placeholder="https://example.com/track.mp3 (с поддержкой CORS)"
+            required
+          />
+          <button class="btn btn-secondary btn-sm" type="submit">Загрузить</button>
+        </form>
+      </section>
+
+      <!-- Плеер и визуализатор -->
+      <section class="card player-card">
+        <div class="track-header">
+          <div class="track-info">
+            <div class="track-title" id="trackTitle">Трек не выбран</div>
+            <div class="track-sub" id="trackSub">Ожидание загрузки аудио...</div>
+          </div>
+          <div class="countdown-badge hidden" id="countdownBadge">Старт: 2.5с</div>
+        </div>
+
+        <!-- Прогресс передачи файла (для Слушателя или при декодировании) -->
+        <div id="transferWrap" class="transfer-wrap hidden">
+          <div class="transfer-head">
+            <span id="transferLabel">Загрузка трека от Хоста...</span>
+            <span class="mono" id="transferPct">0%</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill" id="transferBar" style="width: 0%"></div>
+          </div>
+        </div>
+
+        <!-- Аудио-визуализатор -->
+        <div class="visualizer-wrap">
+          <canvas id="visualizerCanvas" width="600" height="90"></canvas>
+        </div>
+
+        <!-- Полоса прогресса воспроизведения -->
+        <div class="seek-wrap">
+          <span class="time-label mono" id="timeCurrent">0:00</span>
+          <input
+            id="seekSlider"
+            class="range-slider"
+            type="range"
+            min="0"
+            max="100"
+            step="0.1"
+            value="0"
+            disabled
+          />
+          <span class="time-label mono" id="timeDuration">0:00</span>
+        </div>
+
+        <!-- Основные кнопки управления (Хост) -->
+        <div id="hostPlaybackControls" class="playback-controls hidden">
+          <button id="btnRestart" class="btn btn-secondary btn-circle" type="button" title="С начала" disabled>
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2">
+              <polygon points="19 20 9 12 19 4 19 20" />
+              <line x1="5" y1="19" x2="5" y2="5" />
+            </svg>
+          </button>
+
+          <button id="btnPlayPause" class="btn btn-primary btn-play" type="button" disabled>
+            <svg id="iconPlay" viewBox="0 0 24 24" width="28" height="28" fill="currentColor">
+              <polygon points="6 4 20 12 6 20 6 4" />
+            </svg>
+            <svg id="iconPause" class="hidden" viewBox="0 0 24 24" width="28" height="28" fill="currentColor">
+              <rect x="6" y="4" width="4" height="16" rx="1" />
+              <rect x="14" y="4" width="4" height="16" rx="1" />
+            </svg>
+            <span id="playPauseLabel">Старт (+2.8с)</span>
+          </button>
+
+          <button id="btnForceResync" class="btn btn-secondary btn-circle" type="button" title="Синхронизировать всех" disabled>
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2">
+              <polyline points="23 4 23 10 17 10" />
+              <polyline points="1 20 1 14 7 14" />
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+            </svg>
+          </button>
+        </div>
+
+        <!-- Статус воспроизведения (Слушатель) -->
+        <div id="listenerPlaybackBanner" class="listener-banner hidden">
+          <span class="pulse-dot" id="listenerPulse"></span>
+          <span id="listenerBannerText">Ожидание команды Хоста...</span>
+          <button id="btnListenerReconnect" class="btn btn-secondary btn-sm hidden" type="button">Переподключиться</button>
+        </div>
+
+        <!-- Локальная громкость -->
+        <div class="volume-row">
+          <button id="btnMute" class="icon-btn" type="button" title="Выключить/включить звук">
+            <svg id="iconVolOn" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+            </svg>
+            <svg id="iconVolOff" class="hidden" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+              <line x1="23" y1="9" x2="17" y2="15" />
+              <line x1="17" y1="9" x2="23" y2="15" />
+            </svg>
+          </button>
+          <input id="volumeSlider" class="range-slider" type="range" min="0" max="1" step="0.01" value="1" />
+          <span class="mono volume-pct" id="volumePct">100%</span>
+        </div>
+      </section>
+
+      <!-- Ручная микро-коррекция задержки (Bluetooth / динамики) -->
+      <section class="card nudge-card">
+        <div class="section-head">
+          <h3>Точная подстройка (Bluetooth / задержка)</h3>
+          <button id="btnResetOffset" class="btn-link mono" type="button" title="Сбросить в 0">
+            <span id="manualOffsetVal">0 мс</span>
+          </button>
+        </div>
+        <p class="hint">
+          Если звук на этом устройстве <strong>отстаёт</strong> (например, в Bluetooth-наушниках) — жмите <code>-50 мс</code>. Если <strong>спешит</strong> — жмите <code>+50 мс</code>.
+        </p>
+        <div class="nudge-buttons">
+          <button class="btn btn-nudge" data-nudge="-50" type="button">-50 мс</button>
+          <button class="btn btn-nudge" data-nudge="-10" type="button">-10 мс</button>
+          <button class="btn btn-nudge btn-nudge-reset" data-nudge="0" type="button">0</button>
+          <button class="btn btn-nudge" data-nudge="10" type="button">+10 мс</button>
+          <button class="btn btn-nudge" data-nudge="50" type="button">+50 мс</button>
+        </div>
+      </section>
+
+      <!-- Список подключенных слушателей (только для Хоста) -->
+      <section id="hostPeersSection" class="card hidden">
+        <div class="section-head">
+          <h3>Подключённые слушатели (<span id="peerCount">0</span>)</h3>
+          <span class="hint">Авто-сверка часов каждые 3 сек</span>
+        </div>
+        <ul id="peerList" class="peer-list">
+          <li class="peer-empty">Пока никто не подключился. Покажите QR-код или отправьте ссылку друзьям.</li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <!-- Всплывающие уведомления -->
+  <div id="toastContainer" class="toast-container" aria-live="polite"></div>
+</body>
+</html>
