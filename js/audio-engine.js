@@ -72,8 +72,17 @@ class AudioEngine {
    */
   async unlock() {
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) {
+      throw new Error('Ваш браузер не поддерживает Web Audio API');
+    }
+
     if (!this.ctx) {
-      this.ctx = new AudioCtx({ latencyHint: 'interactive' });
+      try {
+        this.ctx = new AudioCtx({ latencyHint: 'interactive' });
+      } catch (_) {
+        // Fallback для старых версий Safari
+        this.ctx = new AudioCtx();
+      }
 
       this.masterGain = this.ctx.createGain();
       this.masterGain.gain.value = this.muted ? 0 : this.volume;
@@ -86,11 +95,7 @@ class AudioEngine {
       this.analyser.connect(this.ctx.destination);
     }
 
-    if (this.ctx.state === 'suspended') {
-      await this.ctx.resume();
-    }
-
-    // 1) Проигрываем 1-сэмпловый тихий буфер в Web Audio (разблокировка iOS Safari / Chrome)
+    // 1) СИНХРОННО запускаем 1-сэмпловый тихий буфер внутри тапа (критично для iOS Safari!)
     try {
       const silentBuf = this.ctx.createBuffer(1, 1, 22050);
       const src = this.ctx.createBufferSource();
@@ -101,8 +106,7 @@ class AudioEngine {
       console.warn('[AudioEngine] Silent WebAudio warm-up:', err);
     }
 
-    // 2) Прогрев HTML5 <audio> миниатюрным WAV-файлом тишины — на iOS переводит аудио-сессию
-    //    в режим Media Playback, чтобы Web Audio работал надёжнее.
+    // 2) Прогрев HTML5 <audio> миниатюрным WAV тишины (переводит iOS в режим Media Playback)
     if (!this._iosSilentAudio) {
       try {
         const silentWav =
@@ -113,6 +117,18 @@ class AudioEngine {
         this._iosSilentAudio = el;
         el.play().catch(() => {});
       } catch (_) {}
+    }
+
+    // 3) Не блокируемся навечно на ctx.resume() (известный баг WebView/iOS): ждём максимум 400 мс
+    if (this.ctx.state === 'suspended') {
+      try {
+        await Promise.race([
+          this.ctx.resume(),
+          new Promise((r) => setTimeout(r, 400)),
+        ]);
+      } catch (err) {
+        console.warn('[AudioEngine] resume warning:', err);
+      }
     }
 
     this.unlocked = true;

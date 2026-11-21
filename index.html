@@ -8,9 +8,9 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>Orpheus Sync — Синхронная музыка на всех устройствах</title>
   <link rel="stylesheet" href="styles.css" />
-  <!-- PeerJS (WebRTC DataChannel) и генератор QR-кодов без бэкенда -->
-  <script defer src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+  <!-- PeerJS (WebRTC DataChannel) с резервным CDN и генератор QR-кодов -->
+  <script defer src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js" onerror="var s=document.createElement('script');s.src='https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';document.head.appendChild(s);"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js" onerror="var s=document.createElement('script');s.src='https://unpkg.com/qrcode-generator@1.4.4/qrcode.min.js';document.head.appendChild(s);"></script>
   <!-- Модули приложения -->
   <script defer src="js/wake-lock.js"></script>
   <script defer src="js/clock-sync.js"></script>
@@ -73,7 +73,7 @@
           </div>
           <h2>Я — Слушатель</h2>
           <p class="muted">Введите код комнаты от Хоста или отсканируйте QR-код на его экране.</p>
-          <form id="joinForm" class="join-form">
+          <form id="joinForm" class="join-form" novalidate>
             <input
               id="inputRoomCode"
               class="input code-input"
@@ -82,13 +82,13 @@
               autocomplete="off"
               autocapitalize="characters"
               spellcheck="false"
-              maxlength="7"
+              maxlength="80"
               placeholder="КОД, НАПР. K7M-4PX"
-              required
             />
             <button id="btnJoinRoom" class="btn btn-accent btn-lg" type="submit">
               Подключиться и включить звук
             </button>
+            <div id="joinStatus" class="connect-status hidden" role="status"></div>
           </form>
           <p class="hint">Нажатие разблокирует Web Audio API в iOS Safari и Chrome.</p>
         </article>
@@ -113,6 +113,7 @@
         <button id="btnUnlockAndJoin" class="btn btn-accent btn-xl" type="button">
           Подключиться и разблокировать звук
         </button>
+        <div id="inviteStatus" class="connect-status hidden" role="status"></div>
         <p class="hint">На iPhone убедитесь, что боковой переключатель звука не в беззвучном режиме.</p>
         <button id="btnCancelInvite" class="btn btn-ghost" type="button">Выбрать другую роль</button>
       </section>

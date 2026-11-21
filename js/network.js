@@ -19,7 +19,24 @@ class NetworkManager {
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
       { urls: 'stun:stun.cloudflare.com:3478' },
+      { urls: 'stun:openrelay.metered.ca:80' },
+      {
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject',
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject',
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject',
+      },
     ],
+    iceCandidatePoolSize: 4,
   };
 
   constructor(callbacks = {}) {
@@ -55,7 +72,11 @@ class NetworkManager {
   }
 
   static normalizeCode(raw) {
-    return String(raw || '')
+    let str = String(raw || '').trim();
+    // Если пользователь вставил полную ссылку ?room=K7M4PX
+    const match = str.match(/[?&#]room=([A-Za-z0-9-]+)/i);
+    if (match) str = match[1];
+    return str
       .toUpperCase()
       .replace(/[^A-Z0-9]/g, '')
       .slice(0, 6);
@@ -125,20 +146,22 @@ class NetworkManager {
   }
 
   /** Подключение к комнате в роли Слушателя */
-  joinAsListener(rawCode) {
+  joinAsListener(rawCode, onProgress = () => {}) {
     this.destroy();
     this.role = 'listener';
     const code = NetworkManager.normalizeCode(rawCode);
     if (code.length < 4) {
-      return Promise.reject(new Error('Некорректный код комнаты'));
+      return Promise.reject(new Error('Введите 6-значный код комнаты (например, K7M-4PX)'));
     }
     this.roomCode = code;
 
     return new Promise((resolve, reject) => {
       if (typeof Peer === 'undefined') {
-        reject(new Error('Библиотека PeerJS не загрузилась. Проверьте интернет-соединение.'));
+        reject(new Error('Не загрузилась библиотека PeerJS. Проверьте интернет или отключите VPN/блокировщик.'));
         return;
       }
+
+      onProgress('1/3 Подключение к сигнальному серверу...');
 
       const peer = new Peer({
         debug: 1,
@@ -147,20 +170,49 @@ class NetworkManager {
       this.peer = peer;
 
       let settled = false;
+      let stage = 'signaling';
       const timeout = setTimeout(() => {
         if (!settled) {
           settled = true;
-          reject(new Error('Таймаут подключения. Проверьте код комнаты и убедитесь, что Хост онлайн.'));
+          const reason =
+            stage === 'signaling'
+              ? 'Не удалось связаться с сервером PeerJS (проверьте интернет или VPN на телефоне).'
+              : 'Таймаут P2P-соединения (NAT/файрвол). Попробуйте подключить ПК и телефон к одному Wi-Fi или отключить VPN.';
+          reject(new Error(reason));
         }
-      }, 15000);
+      }, 18000);
 
       peer.on('open', () => {
+        stage = 'connecting';
+        onProgress(`2/3 Поиск комнаты ${NetworkManager.formatCode(code)}...`);
+
         const hostPeerId = NetworkManager.PEER_PREFIX + code;
+        // serialization: 'json' надёжно работает в iOS Safari и Android Chrome (без зависаний BinaryPack)
         const conn = peer.connect(hostPeerId, {
           reliable: true,
-          serialization: 'binary',
+          serialization: 'json',
         });
         this.hostConn = conn;
+
+        // Отслеживаем состояние WebRTC ICE для прозрачной диагностики
+        const attachIceMonitor = () => {
+          const pc = conn.peerConnection;
+          if (!pc) return;
+          pc.addEventListener('iceconnectionstatechange', () => {
+            const st = pc.iceConnectionState;
+            if (!settled) {
+              if (st === 'checking') {
+                onProgress('3/3 Установка прямого WebRTC-канала...');
+              } else if (st === 'failed') {
+                clearTimeout(timeout);
+                settled = true;
+                reject(new Error('Не удалось пробить NAT/файрвол (ICE failed). Попробуйте общий Wi-Fi или выключите VPN.'));
+              }
+            }
+          });
+        };
+        attachIceMonitor();
+        setTimeout(attachIceMonitor, 300);
 
         conn.on('open', () => {
           clearTimeout(timeout);
@@ -194,10 +246,12 @@ class NetworkManager {
         clearTimeout(timeout);
         if (!settled) {
           settled = true;
-          const message =
-            err.type === 'peer-unavailable'
-              ? `Комната ${NetworkManager.formatCode(code)} не найдена. Проверьте код.`
-              : err.message || 'Ошибка WebRTC-подключения';
+          let message = err.message || 'Ошибка WebRTC-подключения';
+          if (err.type === 'peer-unavailable') {
+            message = `Комната ${NetworkManager.formatCode(code)} не найдена. Убедитесь, что вкладка Хоста открыта.`;
+          } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
+            message = 'Не удалось подключиться к серверу PeerJS. Проверьте интернет или VPN.';
+          }
           reject(new Error(message));
         } else if (this.cb.onError) {
           this.cb.onError(err);
@@ -385,13 +439,13 @@ class NetworkManager {
 
         const start = i * chunkSize;
         const end = Math.min(start + chunkSize, totalBytes);
-        const slice = track.buffer.slice(start, end);
+        const slice = new Uint8Array(track.buffer, start, end - start);
 
         this._safeSend(client.conn, {
           type: 'FILE_CHUNK',
           trackId: track.id,
           index: i,
-          data: slice,
+          b64: this._uint8ToBase64(slice),
         });
 
         // Периодически отдаём поток браузеру и обновляем статус
@@ -517,7 +571,9 @@ class NetworkManager {
     const f = this.incomingFile;
     if (!f || f.trackId !== msg.trackId) return;
 
-    const bytes = this._toUint8Array(msg.data);
+    const bytes = msg.b64
+      ? this._base64ToUint8(msg.b64)
+      : this._toUint8Array(msg.data);
     if (!bytes) return;
 
     if (!f.chunks[msg.index]) {
@@ -551,6 +607,25 @@ class NetworkManager {
       this.incomingFile = null;
       if (this.cb.onFileComplete) this.cb.onFileComplete(completed);
     }
+  }
+
+  _uint8ToBase64(u8) {
+    let bin = '';
+    const step = 0x8000;
+    for (let i = 0; i < u8.length; i += step) {
+      bin += String.fromCharCode.apply(null, u8.subarray(i, i + step));
+    }
+    return btoa(bin);
+  }
+
+  _base64ToUint8(b64) {
+    const bin = atob(b64);
+    const len = bin.length;
+    const out = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      out[i] = bin.charCodeAt(i);
+    }
+    return out;
   }
 
   _toUint8Array(data) {

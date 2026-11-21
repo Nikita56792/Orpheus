@@ -276,6 +276,22 @@ body {
   margin-top: auto;
 }
 
+.connect-status {
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 0.84rem;
+  text-align: center;
+  background: rgba(99, 102, 241, 0.14);
+  border: 1px solid rgba(99, 102, 241, 0.35);
+  color: #c7d2fe;
+}
+
+.connect-status.error {
+  background: rgba(239, 68, 68, 0.14);
+  border-color: rgba(239, 68, 68, 0.45);
+  color: #fecaca;
+}
+
 .btn {
   display: inline-flex;
   align-items: center;

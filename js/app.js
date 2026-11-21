@@ -19,9 +19,12 @@
     btnCreateRoom: $('btnCreateRoom'),
     joinForm: $('joinForm'),
     inputRoomCode: $('inputRoomCode'),
+    btnJoinRoom: $('btnJoinRoom'),
+    joinStatus: $('joinStatus'),
 
     inviteRoomCode: $('inviteRoomCode'),
     btnUnlockAndJoin: $('btnUnlockAndJoin'),
+    inviteStatus: $('inviteStatus'),
     btnCancelInvite: $('btnCancelInvite'),
 
     roleBadge: $('roleBadge'),
@@ -296,26 +299,57 @@
     }
   }
 
+  function setConnectStatus(text, isError = false) {
+    for (const el of [ui.joinStatus, ui.inviteStatus]) {
+      if (!el) continue;
+      if (!text) {
+        el.classList.add('hidden');
+        el.textContent = '';
+        el.classList.remove('error');
+      } else {
+        el.classList.remove('hidden');
+        el.textContent = text;
+        el.classList.toggle('error', isError);
+      }
+    }
+  }
+
   /* ==================== ЗАПУСК СЛУШАТЕЛЯ ==================== */
 
   async function enterAsListener(rawCode) {
     const code = NetworkManager.normalizeCode(rawCode);
     if (code.length < 4) {
-      showToast('Введите корректный код комнаты', 'error');
+      const msg = 'Введите 6-значный код комнаты (например, K7M-4PX)';
+      setConnectStatus(msg, true);
+      showToast(msg, 'error');
       return;
     }
 
     ui.btnJoinRoom.disabled = true;
     ui.btnUnlockAndJoin.disabled = true;
+    ui.btnJoinRoom.textContent = 'Подключение...';
     ui.btnUnlockAndJoin.textContent = 'Подключение...';
+    setConnectStatus('Разблокировка звука...');
 
     try {
       // 1. КРИТИЧНО: Разблокируем AudioContext строго внутри обработчика клика!
       await audio.unlock();
       wakeLock.acquire();
 
-      // 2. Подключаемся к Хосту по WebRTC DataChannel
-      await network.joinAsListener(code);
+      // Если скрипт PeerJS ещё догружается с резервного CDN — подождём до 3 сек
+      if (typeof Peer === 'undefined') {
+        setConnectStatus('Загрузка PeerJS...');
+        const startWait = Date.now();
+        while (typeof Peer === 'undefined' && Date.now() - startWait < 3000) {
+          await new Promise((r) => setTimeout(r, 150));
+        }
+      }
+
+      // 2. Подключаемся к Хосту по WebRTC DataChannel с отображением шагов
+      await network.joinAsListener(code, (progressText) => {
+        setConnectStatus(progressText, false);
+      });
+      setConnectStatus('');
       state.role = 'listener';
       state.roomCode = code;
 
@@ -370,10 +404,13 @@
       startRenderLoop();
       showToast(`Подключено к комнате ${NetworkManager.formatCode(code)}`, 'success');
     } catch (err) {
-      showToast(err.message || 'Не удалось подключиться', 'error');
+      const msg = err.message || 'Не удалось подключиться';
+      setConnectStatus(msg, true);
+      showToast(msg, 'error');
     } finally {
       ui.btnJoinRoom.disabled = false;
       ui.btnUnlockAndJoin.disabled = false;
+      ui.btnJoinRoom.textContent = 'Подключиться и включить звук';
       ui.btnUnlockAndJoin.textContent = 'Подключиться и разблокировать звук';
     }
   }
