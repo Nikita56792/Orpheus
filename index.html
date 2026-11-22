@@ -6,17 +6,16 @@
   <meta name="theme-color" content="#0b0e14" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <title>Orpheus Sync — Синхронная музыка на всех устройствах</title>
-  <link rel="stylesheet" href="styles.css?v=3" />
-  <!-- PeerJS (WebRTC DataChannel) с резервным CDN и генератор QR-кодов -->
-  <script defer src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js" onerror="var s=document.createElement('script');s.src='https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';document.head.appendChild(s);"></script>
+  <title>Orpheus Sync — Синхронное аудио и плейлисты на всех устройствах</title>
+  <link rel="stylesheet" href="styles.css?v=4" />
+  <!-- Генератор QR-кодов (с резервным CDN) -->
   <script defer src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js" onerror="var s=document.createElement('script');s.src='https://unpkg.com/qrcode-generator@1.4.4/qrcode.min.js';document.head.appendChild(s);"></script>
-  <!-- Модули приложения (v=3 сбрасывает кэш браузера на GitHub Pages) -->
-  <script defer src="js/wake-lock.js?v=3"></script>
-  <script defer src="js/clock-sync.js?v=3"></script>
-  <script defer src="js/audio-engine.js?v=3"></script>
-  <script defer src="js/network.js?v=3"></script>
-  <script defer src="js/app.js?v=3"></script>
+  <!-- Модули Orpheus Sync v2 (нативный WebRTC без PeerJS Cloud + глобальная BT-компенсация + плейлисты) -->
+  <script defer src="js/wake-lock.js?v=4"></script>
+  <script defer src="js/clock-sync.js?v=4"></script>
+  <script defer src="js/audio-engine.js?v=4"></script>
+  <script defer src="js/network.js?v=4"></script>
+  <script defer src="js/app.js?v=4"></script>
 </head>
 <body>
   <div class="app-shell">
@@ -32,6 +31,10 @@
       </div>
 
       <div class="status-pills">
+        <span class="pill pill-muted hidden" id="transportBadge" title="Тип сетевого канала">
+          <span class="dot"></span>
+          <span class="pill-text">—</span>
+        </span>
         <span class="pill pill-muted" id="wakeLockBadge" title="Защита от выключения экрана">
           <span class="dot"></span>
           <span class="pill-text">Экран: авто</span>
@@ -43,9 +46,9 @@
     <!-- ЭКРАН 1: Стартовый (Выбор роли) -->
     <main id="viewLanding" class="view">
       <section class="hero">
-        <h1>Идеально синхронная музыка на нескольких устройствах</h1>
+        <h1>Идеально синхронная музыка и плейлисты по всему зданию</h1>
         <p class="hero-sub">
-          NTP-сверка часов по WebRTC и аппаратный запуск через Web Audio API — превратите телефоны и ноутбуки в единую аудиосистему.
+          Прямой P2P-транспорт между подсетями и точками доступа, выделенный UDP-NTP и автоматическое выравнивание всей сети под Bluetooth-колонки.
         </p>
       </section>
 
@@ -58,7 +61,7 @@
             </svg>
           </div>
           <h2>Я — Хост</h2>
-          <p class="muted">Создайте комнату, выберите аудиофайл или тестовый ритм и управляйте воспроизведением для всех.</p>
+          <p class="muted">Создайте комнату, соберите плейлист из локальных файлов или ссылок и управляйте единым звуком на всех устройствах.</p>
           <button id="btnCreateRoom" class="btn btn-primary btn-lg" type="button">
             Создать комнату
           </button>
@@ -72,7 +75,7 @@
             </svg>
           </div>
           <h2>Я — Слушатель</h2>
-          <p class="muted">Введите код комнаты от Хоста или отсканируйте QR-код на его экране.</p>
+          <p class="muted">Введите код комнаты от Хоста или отсканируйте QR-код. Работает в одной сети и между разными SSID/подсетями.</p>
           <form id="joinForm" class="join-form" novalidate>
             <input
               id="inputRoomCode"
@@ -90,7 +93,7 @@
             </button>
             <div id="joinStatus" class="connect-status hidden" role="status"></div>
           </form>
-          <p class="hint">Нажатие разблокирует Web Audio API в iOS Safari и Chrome.</p>
+          <p class="hint">Нажатие разблокирует Web Audio API и измерит системную задержку динамика / Bluetooth.</p>
         </article>
       </section>
     </main>
@@ -108,7 +111,7 @@
         <h2>Подключение к комнате</h2>
         <div class="room-code-big" id="inviteRoomCode">------</div>
         <p class="muted">
-          Мобильные браузеры требуют одно касание для запуска аудиодвижка и синхронизации часов с Хостом.
+          Одно касание активирует аудиодвижок, измерит задержку Bluetooth/динамика и синхронизирует часы с Хостом.
         </p>
         <button id="btnUnlockAndJoin" class="btn btn-accent btn-xl" type="button">
           Подключиться и разблокировать звук
@@ -150,7 +153,7 @@
           <div class="qr-info">
             <p class="qr-title">Отсканируйте камерой телефона</p>
             <input id="shareLinkInput" class="input share-input" type="text" readonly />
-            <p class="hint">Слушатель сразу попадёт на экран подключения к этой комнате.</p>
+            <p class="hint">Слушатель попадёт прямо в эту комнату (работает между разными Wi-Fi подсетями и точками доступа).</p>
           </div>
         </div>
 
@@ -175,57 +178,17 @@
         </div>
       </section>
 
-      <!-- Панель выбора трека (только для Хоста) -->
-      <section id="hostTrackSection" class="card hidden">
-        <div class="section-head">
-          <h3>Источник звука</h3>
-          <span class="hint">Передаётся напрямую по P2P</span>
-        </div>
-
-        <div class="source-tabs">
-          <label class="file-dropzone" id="fileDropzone">
-            <input type="file" id="audioFileInput" accept="audio/*" hidden />
-            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="17 8 12 3 7 8" />
-              <line x1="12" y1="3" x2="12" y2="15" />
-            </svg>
-            <span><strong>Выбрать аудиофайл</strong> (MP3, WAV, M4A, OGG)</span>
-          </label>
-        </div>
-
-        <div class="quick-sources">
-          <button id="btnLoadDemoTrack" class="btn btn-secondary btn-sm" type="button">
-            ⚡ Встроенный тест-бит (120 BPM)
-          </button>
-          <button id="btnToggleUrlInput" class="btn btn-ghost btn-sm" type="button">
-            🔗 Загрузить по URL
-          </button>
-        </div>
-
-        <form id="urlTrackForm" class="url-form hidden">
-          <input
-            id="inputAudioUrl"
-            class="input"
-            type="url"
-            placeholder="https://example.com/track.mp3 (с поддержкой CORS)"
-            required
-          />
-          <button class="btn btn-secondary btn-sm" type="submit">Загрузить</button>
-        </form>
-      </section>
-
       <!-- Плеер и визуализатор -->
       <section class="card player-card">
         <div class="track-header">
           <div class="track-info">
-            <div class="track-title" id="trackTitle">Трек не выбран</div>
-            <div class="track-sub" id="trackSub">Ожидание загрузки аудио...</div>
+            <div class="track-title" id="trackTitle">Плейлист пуст</div>
+            <div class="track-sub" id="trackSub">Добавьте треки или запустите тест-бит</div>
           </div>
           <div class="countdown-badge hidden" id="countdownBadge">Старт: 2.5с</div>
         </div>
 
-        <!-- Прогресс передачи файла (для Слушателя или при декодировании) -->
+        <!-- Прогресс передачи файла -->
         <div id="transferWrap" class="transfer-wrap hidden">
           <div class="transfer-head">
             <span id="transferLabel">Загрузка трека от Хоста...</span>
@@ -259,7 +222,7 @@
 
         <!-- Основные кнопки управления (Хост) -->
         <div id="hostPlaybackControls" class="playback-controls hidden">
-          <button id="btnRestart" class="btn btn-secondary btn-circle" type="button" title="С начала" disabled>
+          <button id="btnPrevTrack" class="btn btn-secondary btn-circle" type="button" title="Предыдущий трек" disabled>
             <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2">
               <polygon points="19 20 9 12 19 4 19 20" />
               <line x1="5" y1="19" x2="5" y2="5" />
@@ -274,11 +237,18 @@
               <rect x="6" y="4" width="4" height="16" rx="1" />
               <rect x="14" y="4" width="4" height="16" rx="1" />
             </svg>
-            <span id="playPauseLabel">Старт (+2.8с)</span>
+            <span id="playPauseLabel">Старт (+2.5с)</span>
+          </button>
+
+          <button id="btnNextTrack" class="btn btn-secondary btn-circle" type="button" title="Следующий трек" disabled>
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2">
+              <polygon points="5 4 15 12 5 20 5 4" />
+              <line x1="19" y1="5" x2="19" y2="19" />
+            </svg>
           </button>
 
           <button id="btnForceResync" class="btn btn-secondary btn-circle" type="button" title="Синхронизировать всех" disabled>
-            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2.2">
               <polyline points="23 4 23 10 17 10" />
               <polyline points="1 20 1 14 7 14" />
               <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
@@ -311,17 +281,117 @@
         </div>
       </section>
 
-      <!-- Ручная микро-коррекция задержки (Bluetooth / динамики) -->
-      <section class="card nudge-card">
+      <!-- Панель плейлиста и источников звука -->
+      <section id="playlistCard" class="card">
         <div class="section-head">
-          <h3>Точная подстройка (Bluetooth / задержка)</h3>
-          <button id="btnResetOffset" class="btn-link mono" type="button" title="Сбросить в 0">
+          <h3>Плейлист (<span id="playlistCount">0</span>)</h3>
+          <div class="playlist-head-actions">
+            <label class="toggle-chip hidden" id="loopToggleWrap" title="Повтор плейлиста по кругу">
+              <input type="checkbox" id="chkLoopPlaylist" checked />
+              <span>Повтор</span>
+            </label>
+            <span class="hint" id="playlistHint">Предзагрузка следующего трека в фоне</span>
+          </div>
+        </div>
+
+        <!-- Добавление треков (только Хост) -->
+        <div id="hostTrackSection" class="host-add-wrap hidden">
+          <label class="file-dropzone" id="fileDropzone">
+            <input type="file" id="audioFileInput" accept="audio/*" multiple hidden />
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="17 8 12 3 7 8" />
+              <line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+            <span><strong>Добавить аудиофайлы в плейлист</strong> (можно сразу несколько MP3/WAV/M4A/OGG)</span>
+          </label>
+
+          <div class="quick-sources">
+            <button id="btnLoadDemoTrack" class="btn btn-secondary btn-sm" type="button">
+              ⚡ Тест-бит 120 BPM
+            </button>
+            <button id="btnLoadPulseTrack" class="btn btn-secondary btn-sm" type="button">
+              🎯 Метроном (клик 1 Гц)
+            </button>
+            <button id="btnToggleUrlInput" class="btn btn-ghost btn-sm" type="button">
+              🔗 По URL
+            </button>
+          </div>
+
+          <form id="urlTrackForm" class="url-form hidden">
+            <input
+              id="inputAudioUrl"
+              class="input"
+              type="url"
+              placeholder="https://example.com/track.mp3 (с поддержкой CORS)"
+              required
+            />
+            <button class="btn btn-secondary btn-sm" type="submit">Добавить</button>
+          </form>
+        </div>
+
+        <!-- Список треков плейлиста -->
+        <ul id="playlistList" class="playlist-list">
+          <li class="peer-empty">Плейлист пока пуст.</li>
+        </ul>
+      </section>
+
+      <!-- Глобальное выравнивание задержек Bluetooth и аудиовывода -->
+      <section class="card bt-sync-card">
+        <div class="section-head">
+          <h3>Глобальный синхрон Bluetooth и аудио</h3>
+          <span class="bt-badge" id="btDeviceBadge">Динамик</span>
+        </div>
+
+        <!-- Сводка глобального выравнивания всей сети -->
+        <div class="latency-summary-grid">
+          <div class="metric">
+            <span class="metric-label">Системная (ОС)</span>
+            <span class="metric-value mono" id="metricSysLatency">0 мс</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Итого устройство</span>
+            <span class="metric-value mono" id="metricTotalLatency">0 мс</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Макс. в здании</span>
+            <span class="metric-value mono" id="metricRoomMaxLatency">0 мс</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Ожидание под BT</span>
+            <span class="metric-value mono metric-good" id="metricWaitDelay">+0 мс</span>
+          </div>
+        </div>
+
+        <p class="bt-explain" id="btSyncSummary">
+          Авто-выравнивание активно: устройства без Bluetooth автоматически подстраиваются под самую медленную Bluetooth-колонку в сети.
+        </p>
+
+        <div class="bt-controls-row">
+          <label class="toggle-chip">
+            <input type="checkbox" id="chkAutoSysLatency" checked />
+            <span>Авто-задержка ОС (outputLatency)</span>
+          </label>
+          <button id="btnDetectDevices" class="btn btn-secondary btn-sm" type="button" title="Определить имя Bluetooth-колонки и локальный LAN IP">
+            🎧 Определить BT / LAN IP
+          </button>
+        </div>
+
+        <!-- Быстрые профили Bluetooth (если ОС занижает задержку конкретной BT-колонки) -->
+        <div class="bt-presets">
+          <button class="btn btn-preset" data-bt-preset="0" type="button">Доп. 0 мс</button>
+          <button class="btn btn-preset" data-bt-preset="80" type="button">BT Быстр. +80</button>
+          <button class="btn btn-preset" data-bt-preset="180" type="button">BT AAC/SBC +180</button>
+          <button class="btn btn-preset" data-bt-preset="260" type="button">BT Колонка +260</button>
+        </div>
+
+        <!-- Тонкая ручная доводка -->
+        <div class="nudge-header">
+          <span class="hint">Доп. поправка (если BT-колонка имеет свой DSP-буфер):</span>
+          <button id="btnResetOffset" class="btn-link mono" type="button" title="Сбросить доп. поправку в 0">
             <span id="manualOffsetVal">0 мс</span>
           </button>
         </div>
-        <p class="hint">
-          Если звук на этом устройстве <strong>отстаёт</strong> (например, в Bluetooth-наушниках) — жмите <code>-50 мс</code>. Если <strong>спешит</strong> — жмите <code>+50 мс</code>.
-        </p>
         <div class="nudge-buttons">
           <button class="btn btn-nudge" data-nudge="-50" type="button">-50 мс</button>
           <button class="btn btn-nudge" data-nudge="-10" type="button">-10 мс</button>
@@ -334,11 +404,11 @@
       <!-- Список подключенных слушателей (только для Хоста) -->
       <section id="hostPeersSection" class="card hidden">
         <div class="section-head">
-          <h3>Подключённые слушатели (<span id="peerCount">0</span>)</h3>
-          <span class="hint">Авто-сверка часов каждые 3 сек</span>
+          <h3>Устройства в сети (<span id="peerCount">0</span>)</h3>
+          <span class="hint">UDP-NTP каждые 2.5 сек</span>
         </div>
         <ul id="peerList" class="peer-list">
-          <li class="peer-empty">Пока никто не подключился. Покажите QR-код или отправьте ссылку друзьям.</li>
+          <li class="peer-empty">Пока никто не подключился. Покажите QR-код или отправьте ссылку устройствам в здании.</li>
         </ul>
       </section>
     </main>

@@ -1,69 +1,85 @@
 /**
- * ClockSync — реализация NTP-алгоритма (4 временные метки) поверх WebRTC DataChannel.
+ * ClockSync — высокоточный NTP-алгоритм (4 временные метки) поверх выделенного канала.
  *
- * Почему performance.now(), а не Date.now():
- * performance.now() строго монотонен и имеет субмиллисекундную точность.
- * Даже если телефон во время трека скорректирует системные часы по сотовой сети,
- * наш монотонник не «прыгнет» и музыка не собьётся.
- *
- * Формулы NTP:
- *   t0 — локальное время Слушателя при отправке PING
- *   t1 — локальное время Хоста при получении PING
- *   t2 — локальное время Хоста при отправке PONG
- *   t3 — локальное время Слушателя при получении PONG
- *
- *   RTT    = (t3 - t0) - (t2 - t1)
- *   offset = ((t1 - t0) + (t2 - t3)) / 2
- *
- *   Текущее время Хоста на Слушателе = performance.now() + offset
+ * Особенности:
+ * - Работает поверх монотонного performance.now() (невосприимчив к скачкам системных часов).
+ * - При работе поверх WebRTC использует отдельный неупорядоченный UDP-канал (orpheus-ntp),
+ *   поэтому передача тяжёлых аудиофайлов вообще не искажает пинг и не вносит джиттер.
+ * - Фильтрация по минимальному RTT (отсекает очереди Wi-Fi и асимметричные скачки).
+ * - Адаптивный интервал опроса (чаще по LAN/P2P, бережно в WSS Relay).
  */
 class ClockSync {
-  constructor({ isHost, sendPing, onUpdate }) {
+  constructor({ isHost, sendPing, onUpdate, mode = 'p2p' }) {
     this.isHost = isHost;
     this.sendPing = sendPing;
     this.onUpdate = onUpdate || (() => {});
+    this.mode = mode; // 'p2p' | 'relay'
 
     this.offsetMs = 0;        // hostTime - localTime
-    this.rttMs = 0;           // лучшая медианная задержка туда-обратно
-    this.synced = isHost;     // Хост синхронизирован сам с собой изначально
+    this.rttMs = 0;           // лучший фильтрованный RTT
+    this.jitterMs = 0;        // оценка джиттера
+    this.synced = isHost;
     this.samples = [];        // скользящее окно замеров { rtt, offset, ts }
-    this.maxSamples = 14;
+    this.maxSamples = 18;
     this.seq = 0;
     this.pending = new Map(); // seq -> t0
     this.intervalId = null;
     this.burstTimeoutIds = [];
   }
 
-  /** Локальное монотонное время в миллисекундах */
   localNow() {
     return performance.now();
   }
 
-  /** Единое время комнаты (время Хоста) в миллисекундах */
   hostNow() {
     if (this.isHost) return this.localNow();
     return this.localNow() + this.offsetMs;
   }
 
-  /** Конвертация целевого времени Хоста в локальное performance.now() */
   hostToLocal(hostTimeMs) {
     if (this.isHost) return hostTimeMs;
     return hostTimeMs - this.offsetMs;
   }
 
-  /** Запуск серии быстрых пингов для первичной калибровки + фоновый опрос */
+  setMode(mode) {
+    if (this.mode === mode) return;
+    this.mode = mode;
+    if (!this.isHost && this.intervalId) {
+      this.start();
+    }
+  }
+
   start() {
     if (this.isHost) return;
     this.stop();
 
-    // Начальная серия: 8 пингов с шагом 130 мс (~1 секунда до точной калибровки)
-    for (let i = 0; i < 8; i++) {
-      const id = setTimeout(() => this._firePing(), i * 130);
+    if (this.mode === 'relay') {
+      // Бережный режим для публичного WSS-релея (без перегрузки лимитов)
+      for (let i = 0; i < 4; i++) {
+        const id = setTimeout(() => this._firePing(), i * 450);
+        this.burstTimeoutIds.push(id);
+      }
+      this.intervalId = setInterval(() => this._firePing(), 5000);
+    } else {
+      // Быстрая серия из 12 пингов (1.1 сек) для субмиллисекундного захвата по LAN/P2P
+      for (let i = 0; i < 12; i++) {
+        const id = setTimeout(() => this._firePing(), i * 95);
+        this.burstTimeoutIds.push(id);
+      }
+      // Фоновая подстройка каждые 2.5 секунды
+      this.intervalId = setInterval(() => this._firePing(), 2500);
+    }
+  }
+
+  /** Быстрая до-калибровка (например, после смены сети или выхода из фона) */
+  reburst() {
+    if (this.isHost) return;
+    const count = this.mode === 'relay' ? 2 : 5;
+    const step = this.mode === 'relay' ? 500 : 100;
+    for (let i = 0; i < count; i++) {
+      const id = setTimeout(() => this._firePing(), i * step);
       this.burstTimeoutIds.push(id);
     }
-
-    // Периодическая подстройка каждые 3 секунды для компенсации дрейфа кварца
-    this.intervalId = setInterval(() => this._firePing(), 3000);
   }
 
   stop() {
@@ -81,6 +97,7 @@ class ClockSync {
     this.samples = [];
     this.offsetMs = 0;
     this.rttMs = 0;
+    this.jitterMs = 0;
     this.synced = this.isHost;
   }
 
@@ -89,9 +106,8 @@ class ClockSync {
     const t0 = this.localNow();
     this.pending.set(seq, t0);
 
-    // Очистка зависших пингов старше 5 секунд
-    if (this.pending.size > 20) {
-      const cutoff = t0 - 5000;
+    if (this.pending.size > 24) {
+      const cutoff = t0 - 6000;
       for (const [k, v] of this.pending.entries()) {
         if (v < cutoff) this.pending.delete(k);
       }
@@ -100,7 +116,6 @@ class ClockSync {
     this.sendPing({ type: 'SYNC_PING', seq, t0 });
   }
 
-  /** Обработка ответа PONG от Хоста */
   handlePong({ seq, t0, t1, t2 }) {
     if (this.isHost) return;
     const t3 = this.localNow();
@@ -112,8 +127,9 @@ class ClockSync {
     const rtt = Math.max(0, (t3 - t0) - hostProc);
     const offset = ((t1 - t0) + (t2 - t3)) / 2;
 
-    // Отбрасываем аномальные спайки (> 1500 мс) если уже есть хорошие сэмплы
-    if (rtt > 1500 && this.samples.length >= 3) return;
+    // Отбрасываем сильные выбросы, если уже накоплена база
+    const maxAcceptableRtt = this.mode === 'relay' ? 3000 : 1200;
+    if (rtt > maxAcceptableRtt && this.samples.length >= 3) return;
 
     this.samples.push({ rtt, offset, ts: t3 });
     if (this.samples.length > this.maxSamples) {
@@ -123,21 +139,14 @@ class ClockSync {
     this._recomputeEstimate();
   }
 
-  /**
-   * Алгоритм фильтрации:
-   * 1. Сортируем окно по минимальному RTT (минимальный RTT = наименьшая очередь и асимметрия сети).
-   * 2. Берём лучшие 50% замеров (но не меньше 1 и не больше 6).
-   * 3. Вычисляем медиану и среднее без выбросов.
-   * 4. Плавно обновляем offsetMs через EMA, чтобы не дёргать аудиодвижок.
-   */
   _recomputeEstimate() {
     if (this.samples.length === 0) return;
 
+    // Сортируем по минимальному RTT — минимальный RTT имеет наименьшую асимметрию маршрута
     const byRtt = [...this.samples].sort((a, b) => a.rtt - b.rtt);
-    const keepCount = Math.max(1, Math.min(6, Math.ceil(byRtt.length * 0.5)));
+    const keepCount = Math.max(1, Math.min(7, Math.ceil(byRtt.length * 0.45)));
     const best = byRtt.slice(0, keepCount);
 
-    // Медиана смещения среди лучших по RTT
     const sortedOffsets = best.map((s) => s.offset).sort((a, b) => a - b);
     const mid = Math.floor(sortedOffsets.length / 2);
     const medianOffset =
@@ -145,22 +154,28 @@ class ClockSync {
         ? (sortedOffsets[mid - 1] + sortedOffsets[mid]) / 2
         : sortedOffsets[mid];
 
-    // Среднее по замерам, близким к медиане (отсекаем редкие асимметричные выбросы)
-    const filtered = best.filter((s) => Math.abs(s.offset - medianOffset) <= Math.max(25, s.rtt));
+    // Отсеиваем редкие асимметричные выбросы дальше от медианы
+    const tolerance = Math.max(15, best[0].rtt * 0.8 + 10);
+    const filtered = best.filter((s) => Math.abs(s.offset - medianOffset) <= tolerance);
     const finalSet = filtered.length > 0 ? filtered : best;
+
     const avgOffset = finalSet.reduce((sum, s) => sum + s.offset, 0) / finalSet.length;
     const avgRtt = finalSet.reduce((sum, s) => sum + s.rtt, 0) / finalSet.length;
 
+    const spread =
+      finalSet.length > 1
+        ? Math.max(...finalSet.map((s) => s.offset)) - Math.min(...finalSet.map((s) => s.offset))
+        : 0;
+    this.jitterMs = spread / 2;
+
     if (!this.synced || this.samples.length <= 4) {
-      // На старте быстро схватываем точное смещение
       this.offsetMs = avgOffset;
     } else {
-      // В процессе воспроизведения мягко сглаживаем (EMA)
       const diff = avgOffset - this.offsetMs;
-      if (Math.abs(diff) > 120) {
+      if (Math.abs(diff) > 100) {
         this.offsetMs = avgOffset;
       } else {
-        this.offsetMs += diff * 0.25;
+        this.offsetMs += diff * 0.28;
       }
     }
 
@@ -170,6 +185,7 @@ class ClockSync {
     this.onUpdate({
       offsetMs: this.offsetMs,
       rttMs: this.rttMs,
+      jitterMs: this.jitterMs,
       sampleCount: this.samples.length,
     });
   }

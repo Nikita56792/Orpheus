@@ -1,12 +1,12 @@
 /**
- * Orpheus Sync — главный контроллер интерфейса и координация модулей.
+ * Orpheus Sync v2 — главный контроллер интерфейса, плейлиста и глобальной
+ * Bluetooth-синхронизации по всему зданию.
  */
 (() => {
-  const START_BUFFER_MS = 2800; // Буфер запланированного старта (2.8 сек)
+  const MIN_START_BUFFER_MS = 2200; // Минимальный буфер старта (увеличивается автоматически под max Bluetooth)
 
   const $ = (id) => document.getElementById(id);
 
-  // DOM элементы
   const ui = {
     viewLanding: $('viewLanding'),
     viewInviteUnlock: $('viewInviteUnlock'),
@@ -15,6 +15,7 @@
     btnHome: $('btnHome'),
     btnLeaveRoom: $('btnLeaveRoom'),
     wakeLockBadge: $('wakeLockBadge'),
+    transportBadge: $('transportBadge'),
 
     btnCreateRoom: $('btnCreateRoom'),
     joinForm: $('joinForm'),
@@ -46,9 +47,16 @@
     fileDropzone: $('fileDropzone'),
     audioFileInput: $('audioFileInput'),
     btnLoadDemoTrack: $('btnLoadDemoTrack'),
+    btnLoadPulseTrack: $('btnLoadPulseTrack'),
     btnToggleUrlInput: $('btnToggleUrlInput'),
     urlTrackForm: $('urlTrackForm'),
     inputAudioUrl: $('inputAudioUrl'),
+
+    playlistCount: $('playlistCount'),
+    playlistList: $('playlistList'),
+    playlistHint: $('playlistHint'),
+    loopToggleWrap: $('loopToggleWrap'),
+    chkLoopPlaylist: $('chkLoopPlaylist'),
 
     trackTitle: $('trackTitle'),
     trackSub: $('trackSub'),
@@ -64,8 +72,9 @@
     seekSlider: $('seekSlider'),
 
     hostPlaybackControls: $('hostPlaybackControls'),
-    btnRestart: $('btnRestart'),
+    btnPrevTrack: $('btnPrevTrack'),
     btnPlayPause: $('btnPlayPause'),
+    btnNextTrack: $('btnNextTrack'),
     iconPlay: $('iconPlay'),
     iconPause: $('iconPause'),
     playPauseLabel: $('playPauseLabel'),
@@ -82,6 +91,15 @@
     volumeSlider: $('volumeSlider'),
     volumePct: $('volumePct'),
 
+    // Глобальная BT-синхронизация
+    btDeviceBadge: $('btDeviceBadge'),
+    metricSysLatency: $('metricSysLatency'),
+    metricTotalLatency: $('metricTotalLatency'),
+    metricRoomMaxLatency: $('metricRoomMaxLatency'),
+    metricWaitDelay: $('metricWaitDelay'),
+    btSyncSummary: $('btSyncSummary'),
+    chkAutoSysLatency: $('chkAutoSysLatency'),
+    btnDetectDevices: $('btnDetectDevices'),
     manualOffsetVal: $('manualOffsetVal'),
     btnResetOffset: $('btnResetOffset'),
 
@@ -91,19 +109,22 @@
     toastContainer: $('toastContainer'),
   };
 
-  // Состояние приложения
   const state = {
     role: null,
     roomCode: null,
-    currentTrackId: null,
+    playlist: [],          // [{ id, type, name, duration, size, mime, url, buffer }]
+    activeTrackId: null,
+    loopPlaylist: true,
     isSeeking: false,
     rafId: null,
-    pendingPlayCmd: null, // Если команда PLAY пришла до завершения декодирования трека
+    pendingPlayCmd: null,
     reconnectAttempts: 0,
     reconnectTimer: null,
+    roomLatency: { roomMaxLatencyMs: 0, slowestLabel: 'Хост', bluetoothCount: 0, deviceCount: 1 },
   };
 
-  // Инициализация подсистем
+  /* ==================== ПОДСИСТЕМЫ ==================== */
+
   const wakeLock = new WakeLockManager(({ active, supported }) => {
     const textEl = ui.wakeLockBadge.querySelector('.pill-text');
     if (!supported) {
@@ -120,36 +141,52 @@
 
   const audio = new AudioEngine({
     onDrift: (driftMs, mode) => updateDriftMetric(driftMs, mode),
-    onEnded: () => {
-      updatePlaybackUI(false);
-      if (state.role === 'host') {
-        network.broadcastPause({ trackOffset: 0 });
-      }
-    },
+    onEnded: () => handleTrackEnded(),
     onStateChange: ({ playing }) => updatePlaybackUI(playing),
+    onLatencyChange: (profile) => handleLocalLatencyChanged(profile),
   });
 
   let clock = null;
 
   const network = new NetworkManager({
     onPeersChanged: (peers) => renderPeerList(peers),
-    onHostConnected: () => {
+
+    onTransportChanged: (type, label) => {
+      updateTransportBadge(type, label);
+      if (clock) {
+        clock.setMode(type === 'relay' ? 'relay' : 'p2p');
+      }
+    },
+
+    onRoomLatencyChanged: (roomLat) => {
+      state.roomLatency = roomLat;
+      audio.setRoomMaxLatency(roomLat.roomMaxLatencyMs);
+      renderLatencyUI(audio.getLatencyProfile());
+      updatePlaybackUI(audio.isPlaying);
+    },
+
+    onHostConnected: (transportType) => {
       state.reconnectAttempts = 0;
       if (state.reconnectTimer) {
         clearTimeout(state.reconnectTimer);
         state.reconnectTimer = null;
       }
-      setStatusMetric('Синхронизация...', 'metric-warn');
+      setStatusMetric('Калибровка...', 'metric-warn');
       ui.btnListenerReconnect.classList.add('hidden');
-      ui.listenerBannerText.textContent = 'Подключено! Калибровка часов...';
+      ui.listenerBannerText.textContent = 'Подключено! Сверка часов с Хостом...';
+      updateTransportBadge(transportType, transportType === 'relay' ? 'WSS Relay' : 'P2P');
+
+      // Сразу отправляем нашу измеренную системную/BT задержку Хосту
+      sendLocalLatencyToHost();
     },
-    onHostDisconnected: (iceState = '') => {
+
+    onHostDisconnected: (reason = '') => {
       audio.pause();
       if (clock) clock.stop();
       setStatusMetric('Переподкл...', 'metric-warn');
       ui.btnListenerReconnect.classList.remove('hidden');
 
-      const detail = iceState && iceState !== 'unknown' ? ` (${iceState})` : '';
+      const detail = reason && reason !== 'unknown' ? ` (${reason})` : '';
       if (state.role === 'listener' && state.roomCode && state.reconnectAttempts < 3) {
         state.reconnectAttempts++;
         ui.listenerBannerText.textContent = `Связь прервалась${detail}. Переподключение ${state.reconnectAttempts}/3...`;
@@ -164,45 +201,59 @@
         showToast('Соединение с Хостом разорвано', 'error');
       }
     },
+
     onSyncPong: (msg) => {
       if (clock) clock.handlePong(msg);
     },
-    onTrackDemo: async ({ trackId, name }) => {
-      await handleListenerDemoTrack(trackId, name);
+
+    onPlaylistState: ({ activeTrackId, tracks }) => {
+      handleListenerPlaylistState(tracks || [], activeTrackId || null);
     },
-    onTrackUrl: async ({ trackId, name, url }) => {
-      await handleListenerUrlTrack(trackId, name, url);
+
+    onTrackSynth: async ({ trackId, synthType, name, isActive }) => {
+      await handleListenerSynthTrack(trackId, synthType, name, isActive);
     },
-    onFileProgress: ({ name, pct }) => {
-      if (pct === 0) {
+
+    onTrackUrl: async ({ trackId, name, url, isActive }) => {
+      await handleListenerUrlTrack(trackId, name, url, isActive);
+    },
+
+    onFileProgress: ({ trackId, name, pct, isActive }) => {
+      if (!isActive && trackId !== state.activeTrackId) return;
+      if (pct === 0 && trackId === state.activeTrackId) {
         state.pendingPlayCmd = null;
         audio.pause(0);
       }
       ui.trackTitle.textContent = name;
-      ui.trackSub.textContent = 'Приём аудиофайла от Хоста (WebRTC P2P)...';
-      showTransfer(true, `Загрузка от Хоста...`, pct);
+      ui.trackSub.textContent = 'Приём аудиофайла от Хоста (бинарный P2P)...';
+      showTransfer(true, 'Загрузка от Хоста...', pct);
     },
-    onFileComplete: async ({ trackId, name, buffer }) => {
-      await handleListenerFileComplete(trackId, name, buffer);
+
+    onFileComplete: async ({ trackId, name, buffer, isActive }) => {
+      await handleListenerFileComplete(trackId, name, buffer, isActive);
     },
+
     onCmdPlay: (cmd) => handleListenerPlayCmd(cmd),
+
     onCmdPause: ({ trackOffset }) => {
       state.pendingPlayCmd = null;
       audio.pause(trackOffset);
       ui.listenerBannerText.textContent = 'Пауза (ожидание Хоста)';
     },
+
     onError: (err) => {
       showToast(err.message || 'Сетевая ошибка', 'error');
     },
   });
 
-  /* ==================== НАВИГАЦИЯ И ИНИЦИАЛИЗАЦИЯ ==================== */
+  /* ==================== УТИЛИТЫ UI ==================== */
 
   function showView(name) {
     ui.viewLanding.classList.toggle('hidden', name !== 'landing');
     ui.viewInviteUnlock.classList.toggle('hidden', name !== 'invite');
     ui.viewRoom.classList.toggle('hidden', name !== 'room');
     ui.btnLeaveRoom.classList.toggle('hidden', name !== 'room');
+    ui.transportBadge.classList.toggle('hidden', name !== 'room');
   }
 
   function showToast(text, type = 'info') {
@@ -220,20 +271,34 @@
     return `${m}:${String(s).padStart(2, '0')}`;
   }
 
+  function escapeHtml(str) {
+    return String(str || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
   function buildShareUrl(code) {
     const base = `${window.location.origin}${window.location.pathname}`;
     return `${base}?room=${NetworkManager.normalizeCode(code)}`;
   }
 
-  function updateManualOffsetUI() {
-    const val = audio.manualOffsetMs;
-    const sign = val > 0 ? '+' : '';
-    ui.manualOffsetVal.textContent = `${sign}${val} мс`;
-  }
-
   function setStatusMetric(text, cls = '') {
     ui.metricStatus.textContent = text;
     ui.metricStatus.className = `metric-value ${cls}`;
+  }
+
+  function updateTransportBadge(type, label) {
+    const textEl = ui.transportBadge.querySelector('.pill-text');
+    textEl.textContent = label || '—';
+    if (type === 'p2p-lan' || type === 'p2p-udp' || type === 'p2p' || type === 'host') {
+      ui.transportBadge.className = 'pill pill-active';
+    } else if (type === 'relay' || type === 'turn') {
+      ui.transportBadge.className = 'pill pill-warn';
+    } else {
+      ui.transportBadge.className = 'pill pill-muted';
+    }
   }
 
   function updateDriftMetric(driftMs, mode) {
@@ -243,7 +308,7 @@
     const abs = Math.abs(rounded);
     let cls = 'metric-good';
     if (abs > 45 || mode === 'resynced') cls = 'metric-bad';
-    else if (abs > 15 || mode === 'nudging') cls = 'metric-warn';
+    else if (abs > 12 || mode === 'nudging') cls = 'metric-warn';
     ui.metricDrift.className = `metric-value mono ${cls}`;
   }
 
@@ -269,6 +334,71 @@
     ui.qrCanvasWrap.innerHTML = qr.createSvgTag({ scalable: true, margin: 2 });
   }
 
+  /* ==================== ГЛОБАЛЬНАЯ СИНХРОНИЗАЦИЯ BLUETOOTH ==================== */
+
+  function sendLocalLatencyToHost() {
+    const profile = audio.getLatencyProfile();
+    if (state.role === 'host') {
+      network.updateHostLatency(profile);
+    } else if (state.role === 'listener') {
+      network.sendToHost({
+        type: 'DEVICE_LATENCY',
+        totalLatencyMs: profile.totalLatencyMs,
+        systemLatencyMs: profile.systemLatencyMs,
+        extraLatencyMs: profile.extraLatencyMs,
+        isBluetooth: profile.isBluetooth,
+        outputDeviceLabel: profile.outputDeviceLabel,
+      });
+    }
+  }
+
+  function handleLocalLatencyChanged(profile) {
+    renderLatencyUI(profile);
+    if (state.role) {
+      sendLocalLatencyToHost();
+    }
+  }
+
+  function renderLatencyUI(profile) {
+    ui.metricSysLatency.textContent = `${profile.systemLatencyMs} мс`;
+    ui.metricTotalLatency.textContent = `${profile.totalLatencyMs} мс`;
+
+    const roomMax = Math.max(profile.totalLatencyMs, state.roomLatency.roomMaxLatencyMs || 0);
+    const waitMs = Math.max(0, roomMax - profile.totalLatencyMs);
+
+    ui.metricRoomMaxLatency.textContent = `${roomMax} мс`;
+    ui.metricWaitDelay.textContent = `+${waitMs} мс`;
+
+    const sign = profile.extraLatencyMs > 0 ? '+' : '';
+    ui.manualOffsetVal.textContent = `${sign}${profile.extraLatencyMs} мс`;
+    ui.chkAutoSysLatency.checked = profile.autoSystemLatency;
+
+    // Обновляем подсветку пресетов
+    document.querySelectorAll('[data-bt-preset]').forEach((btn) => {
+      const val = Number(btn.dataset.btPreset);
+      btn.classList.toggle('active', val === profile.extraLatencyMs);
+    });
+
+    // Бейдж типа вывода (Bluetooth или Динамик)
+    if (profile.isBluetooth) {
+      const label = profile.outputDeviceLabel ? `BT: ${profile.outputDeviceLabel}` : 'Bluetooth аудио';
+      ui.btDeviceBadge.textContent = label;
+      ui.btDeviceBadge.className = 'bt-badge bt-active';
+    } else {
+      ui.btDeviceBadge.textContent = profile.outputDeviceLabel || 'Динамик / провод';
+      ui.btDeviceBadge.className = 'bt-badge';
+    }
+
+    // Понятное описание глобального выравнивания
+    if (roomMax > 0 && waitMs > 5) {
+      ui.btSyncSummary.textContent = `Вся сеть выровнена под «${state.roomLatency.slowestLabel}» (${roomMax} мс). Это устройство автоматически придерживает звук на +${waitMs} мс, чтобы по всему зданию всё звучало в унисон.`;
+    } else if (profile.isBluetooth) {
+      ui.btSyncSummary.textContent = `Это устройство задаёт опорную Bluetooth-задержку (${profile.totalLatencyMs} мс) — остальные телефоны в здании автоматически подстраиваются под него.`;
+    } else {
+      ui.btSyncSummary.textContent = `Системная задержка: ${profile.systemLatencyMs} мс (output ${profile.outputLatencyMs} + base ${profile.baseLatencyMs} мс). При подключении Bluetooth к любому телефону вся сеть автоматически выровняется.`;
+    }
+  }
+
   /* ==================== ЗАПУСК ХОСТА ==================== */
 
   async function enterAsHost() {
@@ -276,18 +406,17 @@
     ui.btnCreateRoom.textContent = 'Создание комнаты...';
 
     try {
-      // 1. Разблокируем Web Audio и Wake Lock прямо в клике
       await audio.unlock();
       wakeLock.acquire();
 
-      // 2. Поднимаем PeerJS-хост
       const code = await network.startHost();
       state.role = 'host';
       state.roomCode = code;
+      state.playlist = [];
+      state.activeTrackId = null;
 
       clock = new ClockSync({ isHost: true });
 
-      // 3. Обновляем URL (без перезагрузки) и интерфейс
       const shareUrl = buildShareUrl(code);
       window.history.replaceState({}, '', `?room=${code}`);
       renderQR(shareUrl);
@@ -300,14 +429,19 @@
       ui.hostTrackSection.classList.remove('hidden');
       ui.hostPlaybackControls.classList.remove('hidden');
       ui.hostPeersSection.classList.remove('hidden');
+      ui.loopToggleWrap.classList.remove('hidden');
       ui.listenerPlaybackBanner.classList.add('hidden');
-      ui.qrPanel.classList.remove('hidden'); // Показываем QR сразу для удобства
+      ui.qrPanel.classList.remove('hidden');
 
       setStatusMetric('Комната активна', 'metric-good');
+      updateTransportBadge('host', 'Хост (P2P)');
       ui.metricRtt.textContent = '0 мс (Хост)';
       ui.metricOffset.textContent = '0 мс';
       ui.metricDrift.textContent = '0 мс';
 
+      // Регистрируем локальную задержку Хоста в расчёте комнаты
+      sendLocalLatencyToHost();
+      renderPlaylist();
       showView('room');
       startRenderLoop();
       showToast(`Комната ${NetworkManager.formatCode(code)} создана!`, 'success');
@@ -349,9 +483,7 @@
       clearTimeout(state.reconnectTimer);
       state.reconnectTimer = null;
     }
-    if (!isAutoReconnect) {
-      state.reconnectAttempts = 0;
-    }
+    if (!isAutoReconnect) state.reconnectAttempts = 0;
 
     ui.btnJoinRoom.disabled = true;
     ui.btnUnlockAndJoin.disabled = true;
@@ -360,22 +492,11 @@
     setConnectStatus('Разблокировка звука...');
 
     try {
-      // 1. КРИТИЧНО: Разблокируем AudioContext строго внутри обработчика клика!
       if (!isAutoReconnect) {
         await audio.unlock();
         wakeLock.acquire();
       }
 
-      // Если скрипт PeerJS ещё догружается с резервного CDN — подождём до 3 сек
-      if (typeof Peer === 'undefined') {
-        setConnectStatus('Загрузка PeerJS...');
-        const startWait = Date.now();
-        while (typeof Peer === 'undefined' && Date.now() - startWait < 3000) {
-          await new Promise((r) => setTimeout(r, 150));
-        }
-      }
-
-      // 2. Подключаемся к Хосту по WebRTC DataChannel с отображением шагов
       await network.joinAsListener(code, (progressText) => {
         setConnectStatus(progressText, false);
       });
@@ -383,37 +504,35 @@
       state.role = 'listener';
       state.roomCode = code;
 
-      // 3. Запускаем NTP-калибровку часов
       clock = new ClockSync({
         isHost: false,
-        sendPing: (payload) => network.sendToHost(payload),
+        mode: network.hostTransport === 'relay' ? 'relay' : 'p2p',
+        sendPing: (payload) => network.sendToHost(payload, 'ntp'),
         onUpdate: ({ offsetMs, rttMs }) => {
           const rttRound = Math.round(rttMs);
           ui.metricRtt.textContent = `${rttRound} мс`;
           ui.metricRtt.className = `metric-value mono ${
-            rttRound < 40 ? 'metric-good' : rttRound < 100 ? 'metric-warn' : 'metric-bad'
+            rttRound < 45 ? 'metric-good' : rttRound < 120 ? 'metric-warn' : 'metric-bad'
           }`;
 
           const offRound = Math.round(offsetMs);
           ui.metricOffset.textContent = `${offRound > 0 ? '+' : ''}${offRound} мс`;
           setStatusMetric('Синхронизирован', 'metric-good');
 
-          network.sendToHost({ type: 'CLIENT_METRICS', rttMs: rttRound });
+          network.sendToHost({ type: 'CLIENT_METRICS', rttMs: rttRound }, 'ctrl');
 
-          // Если команда PLAY пришла раньше завершения первичной сверки часов
-          if (state.pendingPlayCmd && audio.buffer && state.currentTrackId === state.pendingPlayCmd.trackId) {
+          if (state.pendingPlayCmd && audio.buffer && state.activeTrackId === state.pendingPlayCmd.trackId) {
             const cmd = state.pendingPlayCmd;
             state.pendingPlayCmd = null;
             executeScheduledPlay(cmd);
           } else if (audio.isScheduled) {
-            // Уточняем запланированный старт, пока идёт обратный отсчёт
             audio.refineScheduledStart();
           }
         },
       });
       clock.start();
+      sendLocalLatencyToHost();
 
-      // 4. Настраиваем UI слушателя
       ui.roleBadge.textContent = 'СЛУШАТЕЛЬ';
       ui.roleBadge.className = 'role-badge listener';
       ui.displayRoomCode.textContent = NetworkManager.formatCode(code);
@@ -423,13 +542,15 @@
       ui.hostTrackSection.classList.add('hidden');
       ui.hostPlaybackControls.classList.add('hidden');
       ui.hostPeersSection.classList.add('hidden');
+      ui.loopToggleWrap.classList.add('hidden');
       ui.listenerPlaybackBanner.classList.remove('hidden');
       ui.seekSlider.disabled = true;
 
-      ui.trackTitle.textContent = 'Ожидание трека от Хоста';
-      ui.trackSub.textContent = 'Как только Хост выберет музыку, она загрузится автоматически';
+      ui.trackTitle.textContent = 'Ожидание плейлиста от Хоста';
+      ui.trackSub.textContent = 'Как только Хост добавит треки, они загрузятся автоматически';
       ui.listenerBannerText.textContent = 'Калибровка часов с Хостом...';
 
+      renderPlaylist();
       showView('room');
       startRenderLoop();
       showToast(`Подключено к комнате ${NetworkManager.formatCode(code)}`, 'success');
@@ -445,160 +566,331 @@
     }
   }
 
-  /* ==================== ЗАГРУЗКА ТРЕКОВ (ХОСТ) ==================== */
+  /* ==================== ПЛЕЙЛИСТ (ХОСТ) ==================== */
 
-  async function hostLoadFile(file) {
-    if (!file) return;
-    if (file.size > 40 * 1024 * 1024) {
-      showToast('Файл больше 40 МБ может долго передаваться по P2P. Рекомендуем MP3 до 15 МБ.', 'error');
+  async function hostAddFiles(fileList) {
+    const files = Array.from(fileList || []).filter((f) => f && f.size > 0);
+    if (files.length === 0) return;
+
+    let added = 0;
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      if (file.size > 40 * 1024 * 1024) {
+        showToast(`Файл «${file.name}» > 40 МБ. Рекомендуем MP3 до 15 МБ.`, 'error');
+      }
+      showTransfer(true, `Декодирование (${i + 1}/${files.length}): ${file.name}`, Math.round(((i + 0.5) / files.length) * 100));
+
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const trackId = `file-${file.name}-${file.size}-${file.lastModified}`;
+        const decoded = await audio.decodeToCache(trackId, arrayBuffer);
+
+        if (!state.playlist.some((t) => t.id === trackId)) {
+          state.playlist.push({
+            id: trackId,
+            type: 'file',
+            name: file.name.replace(/\.[^.]+$/, '') || file.name,
+            duration: decoded.duration,
+            size: file.size,
+            mime: file.type || 'audio/mpeg',
+            buffer: arrayBuffer,
+          });
+          added++;
+        }
+      } catch (err) {
+        console.error('[App] File decode failed:', file.name, err);
+        showToast(`Не удалось декодировать ${file.name}`, 'error');
+      }
     }
 
-    audio.pause(0);
-    network.broadcastPause({ trackOffset: 0 });
-    showTransfer(true, 'Декодирование аудиофайла...', 50);
+    showTransfer(false);
 
-    try {
-      const arrayBuffer = await file.arrayBuffer();
-      const decoded = await audio.decodeArrayBuffer(arrayBuffer);
-
-      const trackId = `file-${file.name}-${file.size}-${file.lastModified}`;
-      state.currentTrackId = trackId;
-
-      onTrackReadyUI(file.name, `${formatTime(decoded.duration)} • ${(file.size / 1024 / 1024).toFixed(1)} МБ • Локальный файл`, decoded.duration);
-      showTransfer(false);
-
-      network.setHostTrack({
-        id: trackId,
-        type: 'file',
-        name: file.name,
-        mime: file.type || 'audio/mpeg',
-        size: file.size,
-        buffer: arrayBuffer,
-      });
-
-      showToast('Трек готов и отправляется слушателям', 'success');
-    } catch (err) {
-      showTransfer(false);
-      showToast('Не удалось декодировать аудиофайл. Попробуйте MP3/WAV/M4A.', 'error');
-      console.error(err);
+    if (added > 0) {
+      if (!state.activeTrackId) {
+        await hostSelectTrack(state.playlist[0].id, false);
+      } else {
+        network.setHostPlaylist(state.playlist, state.activeTrackId);
+        renderPlaylist();
+      }
+      showToast(added === 1 ? 'Трек добавлен в плейлист' : `Добавлено треков: ${added}`, 'success');
     }
   }
 
-  async function hostLoadDemoTrack() {
-    audio.pause(0);
-    network.broadcastPause({ trackOffset: 0 });
-    showTransfer(true, 'Генерация 120 BPM тест-бита...', 60);
+  async function hostAddSynthTrack(type) {
+    const isPulse = type === 'pulse';
+    const trackId = isPulse ? 'demo-pulse-60bpm-v2' : 'demo-120bpm-v2';
+    const name = isPulse ? 'Калибровочный метроном (1 Гц)' : 'Встроенный тест-бит (120 BPM)';
 
+    showTransfer(true, `Генерация: ${name}...`, 65);
     try {
-      const decoded = await audio.generateDemoTrack();
-      const trackId = 'demo-120bpm-v1';
-      state.currentTrackId = trackId;
+      const decoded = isPulse
+        ? await audio.generatePulseTrack(trackId, false)
+        : await audio.generateDemoTrack(trackId, false);
 
-      onTrackReadyUI('Встроенный тест-бит (120 BPM)', '32 сек • Синтез без трафика • Идеально для проверки синхрона', decoded.duration);
+      if (!state.playlist.some((t) => t.id === trackId)) {
+        state.playlist.push({
+          id: trackId,
+          type,
+          name,
+          duration: decoded.duration,
+          size: 0,
+        });
+      }
       showTransfer(false);
 
-      network.setHostTrack({
-        id: trackId,
-        type: 'demo',
-        name: 'Встроенный тест-бит (120 BPM)',
-      });
-
-      showToast('Тест-бит готов! Жмите «Старт» для проверки синхронности.', 'success');
-    } catch (err) {
+      await hostSelectTrack(trackId, false);
+      showToast(`«${name}» готов!`, 'success');
+    } catch (_) {
       showTransfer(false);
       showToast('Ошибка генерации тест-трека', 'error');
     }
   }
 
-  async function hostLoadUrlTrack(url) {
-    audio.pause(0);
-    network.broadcastPause({ trackOffset: 0 });
-    showTransfer(true, 'Загрузка аудио по URL...', 35);
-
+  async function hostAddUrlTrack(url) {
+    showTransfer(true, 'Загрузка аудио по URL...', 40);
     try {
       const resp = await fetch(url, { mode: 'cors' });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const arrayBuffer = await resp.arrayBuffer();
-      showTransfer(true, 'Декодирование аудио...', 80);
-      const decoded = await audio.decodeArrayBuffer(arrayBuffer);
-
-      const cleanName = decodeURIComponent(url.split('/').pop().split('?')[0] || 'Аудио по ссылке');
       const trackId = `url-${url}`;
-      state.currentTrackId = trackId;
+      showTransfer(true, 'Декодирование аудио...', 85);
+      const decoded = await audio.decodeToCache(trackId, arrayBuffer);
+      const cleanName = decodeURIComponent(url.split('/').pop().split('?')[0] || 'Аудио по ссылке');
 
-      onTrackReadyUI(cleanName, `${formatTime(decoded.duration)} • Прямая ссылка (CORS)`, decoded.duration);
+      if (!state.playlist.some((t) => t.id === trackId)) {
+        state.playlist.push({
+          id: trackId,
+          type: 'url',
+          name: cleanName,
+          duration: decoded.duration,
+          url,
+        });
+      }
       showTransfer(false);
+      ui.inputAudioUrl.value = '';
+      ui.urlTrackForm.classList.add('hidden');
 
-      network.setHostTrack({
-        id: trackId,
-        type: 'url',
-        name: cleanName,
-        url,
-      });
-
-      showToast('Аудио по URL загружено!', 'success');
-    } catch (err) {
+      if (!state.activeTrackId) {
+        await hostSelectTrack(trackId, false);
+      } else {
+        network.setHostPlaylist(state.playlist, state.activeTrackId);
+        renderPlaylist();
+      }
+      showToast('URL-трек добавлен в плейлист!', 'success');
+    } catch (_) {
       showTransfer(false);
-      showToast('Не удалось загрузить URL (проверьте CORS-заголовки или выберите локальный файл)', 'error');
+      showToast('Не удалось загрузить URL (проверьте CORS или выберите локальные файлы)', 'error');
     }
   }
 
-  /* ==================== ЗАГРУЗКА ТРЕКОВ (СЛУШАТЕЛЬ) ==================== */
+  async function hostSelectTrack(trackId, autoPlay = false) {
+    const track = state.playlist.find((t) => t.id === trackId);
+    if (!track) return;
 
-  async function handleListenerDemoTrack(trackId, name) {
     audio.pause(0);
-    showTransfer(true, 'Локальный синтез тест-бита...', 60);
+    network.broadcastPause({ trackOffset: 0 });
+
+    // Убеждаемся, что буфер декодирован в кэше
+    let decoded = audio.activateTrack(trackId);
+    if (!decoded) {
+      if (track.type === 'demo') decoded = await audio.generateDemoTrack(trackId, true);
+      else if (track.type === 'pulse') decoded = await audio.generatePulseTrack(trackId, true);
+      else if (track.type === 'file' && track.buffer) decoded = await audio.decodeArrayBuffer(track.buffer, trackId);
+      else if (track.type === 'url' && track.url) {
+        const resp = await fetch(track.url, { mode: 'cors' });
+        decoded = await audio.decodeArrayBuffer(await resp.arrayBuffer(), trackId);
+      }
+    }
+    if (!decoded) return;
+
+    state.activeTrackId = trackId;
+    const sub =
+      track.type === 'file'
+        ? `${formatTime(decoded.duration)} • ${(track.size / 1024 / 1024).toFixed(1)} МБ • P2P бинарный`
+        : track.type === 'url'
+        ? `${formatTime(decoded.duration)} • Прямая ссылка`
+        : `${formatTime(decoded.duration)} • Синтез без трафика`;
+
+    onTrackReadyUI(track.name, sub, decoded.duration);
+    network.setHostPlaylist(state.playlist, trackId);
+    renderPlaylist();
+
+    if (autoPlay) {
+      hostSchedulePlay(0);
+    }
+  }
+
+  function hostRemoveTrack(trackId) {
+    const idx = state.playlist.findIndex((t) => t.id === trackId);
+    if (idx < 0) return;
+    const wasActive = state.activeTrackId === trackId;
+    state.playlist.splice(idx, 1);
+
+    if (wasActive) {
+      audio.pause(0);
+      network.broadcastPause({ trackOffset: 0 });
+      const next = state.playlist[idx] || state.playlist[0] || null;
+      if (next) {
+        hostSelectTrack(next.id, false);
+        return;
+      } else {
+        state.activeTrackId = null;
+        audio.buffer = null;
+        resetPlayerNoTrackUI();
+      }
+    }
+
+    network.setHostPlaylist(state.playlist, state.activeTrackId);
+    renderPlaylist();
+  }
+
+  function hostMoveTrack(trackId, dir) {
+    const idx = state.playlist.findIndex((t) => t.id === trackId);
+    const target = idx + dir;
+    if (idx < 0 || target < 0 || target >= state.playlist.length) return;
+    const [item] = state.playlist.splice(idx, 1);
+    state.playlist.splice(target, 0, item);
+    network.setHostPlaylist(state.playlist, state.activeTrackId);
+    renderPlaylist();
+  }
+
+  function hostSwitchAdjacent(delta, autoPlay = true) {
+    if (state.playlist.length === 0) return;
+    const idx = state.playlist.findIndex((t) => t.id === state.activeTrackId);
+    let nextIdx = idx + delta;
+    if (nextIdx >= state.playlist.length) {
+      if (!state.loopPlaylist) return;
+      nextIdx = 0;
+    } else if (nextIdx < 0) {
+      nextIdx = state.playlist.length - 1;
+    }
+    hostSelectTrack(state.playlist[nextIdx].id, autoPlay);
+  }
+
+  function handleTrackEnded() {
+    updatePlaybackUI(false);
+    if (state.role !== 'host') return;
+
+    if (state.playlist.length > 1) {
+      const idx = state.playlist.findIndex((t) => t.id === state.activeTrackId);
+      const hasNext = idx >= 0 && idx < state.playlist.length - 1;
+      if (hasNext || state.loopPlaylist) {
+        hostSwitchAdjacent(1, true);
+        return;
+      }
+    } else if (state.playlist.length === 1 && state.loopPlaylist) {
+      hostSchedulePlay(0);
+      return;
+    }
+
+    network.broadcastPause({ trackOffset: 0 });
+  }
+
+  /* ==================== ПЛЕЙЛИСТ (СЛУШАТЕЛЬ) ==================== */
+
+  function handleListenerPlaylistState(tracks, activeTrackId) {
+    state.playlist = tracks;
+    const prevActive = state.activeTrackId;
+    state.activeTrackId = activeTrackId;
+    renderPlaylist();
+
+    if (!activeTrackId) {
+      audio.pause(0);
+      resetPlayerNoTrackUI();
+      return;
+    }
+
+    // Если новый активный трек УЖЕ предзагружен в кэше — мгновенно активируем его!
+    if (activeTrackId !== prevActive && audio.hasCachedTrack(activeTrackId)) {
+      const decoded = audio.activateTrack(activeTrackId);
+      const meta = state.playlist.find((t) => t.id === activeTrackId);
+      if (decoded && meta) {
+        onTrackReadyUI(meta.name, `${formatTime(decoded.duration)} • Из кэша (мгновенно)`, decoded.duration);
+        showTransfer(false);
+        ui.listenerBannerText.textContent = 'Трек готов. Ожидание старта от Хоста...';
+        network.sendToHost({ type: 'TRACK_READY', trackId: activeTrackId });
+        tryApplyPendingPlay();
+      }
+    }
+  }
+
+  async function handleListenerSynthTrack(trackId, synthType, name, isActive) {
+    const activateNow = isActive || trackId === state.activeTrackId;
+    if (activateNow) {
+      audio.pause(0);
+      showTransfer(true, `Локальный синтез: ${name}...`, 65);
+    }
     try {
-      const decoded = await audio.generateDemoTrack();
-      state.currentTrackId = trackId;
-      onTrackReadyUI(name, `${formatTime(decoded.duration)} • Локальный синтез (0 КБ трафика)`, decoded.duration);
-      showTransfer(false);
-      ui.listenerBannerText.textContent = 'Трек готов. Ожидание старта от Хоста...';
+      const decoded =
+        synthType === 'pulse'
+          ? await audio.generatePulseTrack(trackId, activateNow)
+          : await audio.generateDemoTrack(trackId, activateNow);
+
+      if (activateNow) {
+        state.activeTrackId = trackId;
+        onTrackReadyUI(name, `${formatTime(decoded.duration)} • Локальный синтез (0 КБ)`, decoded.duration);
+        showTransfer(false);
+        ui.listenerBannerText.textContent = 'Трек готов. Ожидание старта от Хоста...';
+      }
       network.sendToHost({ type: 'TRACK_READY', trackId });
-      tryApplyPendingPlay();
-    } catch (err) {
-      showTransfer(false);
+      renderPlaylist();
+      if (activateNow) tryApplyPendingPlay();
+    } catch (_) {
+      if (activateNow) showTransfer(false);
       network.sendToHost({ type: 'TRACK_ERROR', trackId });
-      showToast('Ошибка синтеза тест-трека', 'error');
     }
   }
 
-  async function handleListenerUrlTrack(trackId, name, url) {
-    audio.pause(0);
-    showTransfer(true, 'Загрузка трека по URL...', 35);
+  async function handleListenerUrlTrack(trackId, name, url, isActive) {
+    const activateNow = isActive || trackId === state.activeTrackId;
+    if (activateNow) {
+      audio.pause(0);
+      showTransfer(true, 'Загрузка трека по URL...', 35);
+    }
     try {
       const resp = await fetch(url, { mode: 'cors' });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const buf = await resp.arrayBuffer();
-      showTransfer(true, 'Декодирование аудио...', 85);
-      const decoded = await audio.decodeArrayBuffer(buf);
-      state.currentTrackId = trackId;
-      onTrackReadyUI(name, `${formatTime(decoded.duration)} • Загружено по URL`, decoded.duration);
-      showTransfer(false);
-      ui.listenerBannerText.textContent = 'Трек готов. Ожидание старта от Хоста...';
+      if (activateNow) showTransfer(true, 'Декодирование аудио...', 85);
+      const decoded = await audio.decodeToCache(trackId, buf);
+      if (activateNow) {
+        audio.activateTrack(trackId);
+        state.activeTrackId = trackId;
+        onTrackReadyUI(name, `${formatTime(decoded.duration)} • Загружено по URL`, decoded.duration);
+        showTransfer(false);
+        ui.listenerBannerText.textContent = 'Трек готов. Ожидание старта от Хоста...';
+      }
       network.sendToHost({ type: 'TRACK_READY', trackId });
-      tryApplyPendingPlay();
-    } catch (err) {
-      showTransfer(false);
+      renderPlaylist();
+      if (activateNow) tryApplyPendingPlay();
+    } catch (_) {
+      if (activateNow) showTransfer(false);
       network.sendToHost({ type: 'TRACK_ERROR', trackId });
-      showToast('Не удалось загрузить трек по ссылке', 'error');
     }
   }
 
-  async function handleListenerFileComplete(trackId, name, buffer) {
-    showTransfer(true, 'Декодирование аудио (Web Audio API)...', 100);
+  async function handleListenerFileComplete(trackId, name, buffer, isActive) {
+    const activateNow = isActive || trackId === state.activeTrackId;
+    if (activateNow) {
+      showTransfer(true, 'Декодирование аудио...', 100);
+    }
     try {
-      const decoded = await audio.decodeArrayBuffer(buffer);
-      state.currentTrackId = trackId;
-      onTrackReadyUI(name, `${formatTime(decoded.duration)} • Получено от Хоста`, decoded.duration);
-      showTransfer(false);
-      ui.listenerBannerText.textContent = 'Трек готов. Ожидание старта от Хоста...';
+      const decoded = await audio.decodeToCache(trackId, buffer);
+      if (activateNow) {
+        audio.activateTrack(trackId);
+        state.activeTrackId = trackId;
+        onTrackReadyUI(name, `${formatTime(decoded.duration)} • Получено от Хоста`, decoded.duration);
+        showTransfer(false);
+        ui.listenerBannerText.textContent = 'Трек готов. Ожидание старта от Хоста...';
+      }
       network.sendToHost({ type: 'TRACK_READY', trackId });
-      tryApplyPendingPlay();
+      renderPlaylist();
+      if (activateNow) tryApplyPendingPlay();
     } catch (err) {
-      showTransfer(false);
+      console.error('[App/Listener] Decode error:', err);
+      if (activateNow) showTransfer(false);
       network.sendToHost({ type: 'TRACK_ERROR', trackId });
-      showToast('Ошибка декодирования полученного файла', 'error');
+      if (activateNow) showToast('Ошибка декодирования полученного файла', 'error');
     }
   }
 
@@ -613,27 +905,97 @@
     if (state.role === 'host') {
       ui.seekSlider.disabled = false;
       ui.btnPlayPause.disabled = false;
-      ui.btnRestart.disabled = false;
+      ui.btnPrevTrack.disabled = state.playlist.length === 0;
+      ui.btnNextTrack.disabled = state.playlist.length === 0;
       ui.btnForceResync.disabled = false;
     }
   }
 
+  function resetPlayerNoTrackUI() {
+    ui.trackTitle.textContent = 'Плейлист пуст';
+    ui.trackSub.textContent = state.role === 'host' ? 'Добавьте файлы или тест-бит ниже' : 'Ожидание треков от Хоста...';
+    ui.timeCurrent.textContent = '0:00';
+    ui.timeDuration.textContent = '0:00';
+    ui.seekSlider.value = '0';
+    ui.seekSlider.disabled = true;
+    ui.btnPlayPause.disabled = true;
+    ui.btnPrevTrack.disabled = true;
+    ui.btnNextTrack.disabled = true;
+    ui.btnForceResync.disabled = true;
+  }
+
+  function renderPlaylist() {
+    ui.playlistCount.textContent = String(state.playlist.length);
+    if (state.role === 'host') {
+      ui.btnPrevTrack.disabled = state.playlist.length === 0;
+      ui.btnNextTrack.disabled = state.playlist.length === 0;
+    }
+
+    if (state.playlist.length === 0) {
+      ui.playlistList.innerHTML =
+        state.role === 'host'
+          ? '<li class="peer-empty">Добавьте один или несколько аудиофайлов, либо нажмите «Тест-бит 120 BPM».</li>'
+          : '<li class="peer-empty">Ожидание плейлиста от Хоста...</li>';
+      return;
+    }
+
+    ui.playlistList.innerHTML = state.playlist
+      .map((t, idx) => {
+        const isActive = t.id === state.activeTrackId;
+        const cached = audio.hasCachedTrack(t.id);
+        const badge =
+          state.role === 'listener'
+            ? cached
+              ? '<span class="track-pill ready">Кэш ✓</span>'
+              : '<span class="track-pill">Ожидание</span>'
+            : '';
+
+        const controls =
+          state.role === 'host'
+            ? `<div class="playlist-actions">
+                <button class="mini-btn" data-pl-up="${escapeHtml(t.id)}" title="Выше" ${idx === 0 ? 'disabled' : ''}>↑</button>
+                <button class="mini-btn" data-pl-down="${escapeHtml(t.id)}" title="Ниже" ${idx === state.playlist.length - 1 ? 'disabled' : ''}>↓</button>
+                <button class="mini-btn mini-btn-danger" data-pl-del="${escapeHtml(t.id)}" title="Удалить">✕</button>
+              </div>`
+            : '';
+
+        return `
+          <li class="playlist-item ${isActive ? 'active' : ''}" data-pl-select="${escapeHtml(t.id)}">
+            <div class="playlist-item-main">
+              <span class="playlist-num mono">${isActive ? '▶' : idx + 1}</span>
+              <div class="playlist-item-text">
+                <div class="playlist-item-name">${escapeHtml(t.name)}</div>
+                <div class="playlist-item-meta mono">${formatTime(t.duration)} ${badge}</div>
+              </div>
+            </div>
+            ${controls}
+          </li>`;
+      })
+      .join('');
+  }
+
   /* ==================== ВОСПРОИЗВЕДЕНИЕ И СИНХРОНИЗАЦИЯ ==================== */
 
-  function hostSchedulePlay(trackOffset = audio.getCurrentPosition()) {
-    if (!audio.buffer || !clock) return;
+  function getEffectiveStartBufferMs() {
+    // Гарантируем, что буфера старта хватит даже для самой медленной Bluetooth-колонки в здании!
+    const roomMax = Math.max(audio.getTotalOutputLatencyMs(), state.roomLatency.roomMaxLatencyMs || 0);
+    return Math.max(MIN_START_BUFFER_MS, roomMax + 1100);
+  }
 
-    const hostStartTime = clock.hostNow() + START_BUFFER_MS;
-    const clampedOffset = Math.max(0, Math.min(trackOffset, audio.getDuration() - 0.1));
+  function hostSchedulePlay(trackOffset = audio.getAcousticPosition()) {
+    if (!audio.buffer || !clock || !state.activeTrackId) return;
 
-    // Отправляем всем слушателям точное время старта в часах Хоста
+    const bufferMs = getEffectiveStartBufferMs();
+    // hostStartTime = T_acoustic (когда звук должен выйти в воздух со всех динамиков и BT-колонок!)
+    const hostStartTime = clock.hostNow() + bufferMs;
+    const clampedOffset = Math.max(0, Math.min(trackOffset, Math.max(0, audio.getDuration() - 0.1)));
+
     network.broadcastPlay({
       hostStartTime,
       trackOffset: clampedOffset,
-      trackId: state.currentTrackId,
+      trackId: state.activeTrackId,
     });
 
-    // И запускаем самого Хоста через тот же планировщик
     audio.schedulePlay({
       hostStartTime,
       trackOffset: clampedOffset,
@@ -642,14 +1004,24 @@
   }
 
   function hostPause() {
-    const pos = audio.getCurrentPosition();
+    const pos = audio.getAcousticPosition();
     audio.pause(pos);
     network.broadcastPause({ trackOffset: pos });
   }
 
   function handleListenerPlayCmd(cmd) {
-    // Если трек ещё декодируется или часы не откалиброваны — отложим команду до готовности
-    if (!audio.buffer || state.currentTrackId !== cmd.trackId || !clock || !clock.synced) {
+    // Если этот трек уже в кэше, но ещё не активирован — активируем мгновенно!
+    if (cmd.trackId && cmd.trackId !== state.activeTrackId && audio.hasCachedTrack(cmd.trackId)) {
+      const decoded = audio.activateTrack(cmd.trackId);
+      const meta = state.playlist.find((t) => t.id === cmd.trackId);
+      if (decoded && meta) {
+        state.activeTrackId = cmd.trackId;
+        onTrackReadyUI(meta.name, `${formatTime(decoded.duration)} • Из кэша`, decoded.duration);
+        renderPlaylist();
+      }
+    }
+
+    if (!audio.buffer || state.activeTrackId !== cmd.trackId || !clock || !clock.synced) {
       state.pendingPlayCmd = cmd;
       return;
     }
@@ -657,7 +1029,7 @@
   }
 
   function tryApplyPendingPlay() {
-    if (state.pendingPlayCmd && clock && clock.synced && state.currentTrackId === state.pendingPlayCmd.trackId) {
+    if (state.pendingPlayCmd && clock && clock.synced && state.activeTrackId === state.pendingPlayCmd.trackId) {
       const cmd = state.pendingPlayCmd;
       state.pendingPlayCmd = null;
       executeScheduledPlay(cmd);
@@ -674,9 +1046,10 @@
   }
 
   function updatePlaybackUI(isPlaying) {
+    const bufSec = (getEffectiveStartBufferMs() / 1000).toFixed(1);
     ui.iconPlay.classList.toggle('hidden', isPlaying);
     ui.iconPause.classList.toggle('hidden', !isPlaying);
-    ui.playPauseLabel.textContent = isPlaying ? 'Пауза' : `Старт (+${(START_BUFFER_MS / 1000).toFixed(1)}с)`;
+    ui.playPauseLabel.textContent = isPlaying ? 'Пауза' : `Старт (+${bufSec}с)`;
     ui.listenerPulse.classList.toggle('playing', isPlaying);
     if (!isPlaying) {
       ui.countdownBadge.classList.add('hidden');
@@ -687,28 +1060,39 @@
     ui.peerCount.textContent = String(peers.length);
     if (peers.length === 0) {
       ui.peerList.innerHTML =
-        '<li class="peer-empty">Пока никто не подключился. Покажите QR-код или отправьте ссылку друзьям.</li>';
+        '<li class="peer-empty">Пока никто не подключился. Покажите QR-код или отправьте ссылку устройствам в здании.</li>';
       return;
     }
 
+    const roomMax = state.roomLatency.roomMaxLatencyMs || 0;
+
     ui.peerList.innerHTML = peers
-      .map(
-        (p) => `
-      <li class="peer-item">
-        <div class="peer-main">
-          <span class="peer-status-dot ${p.ready ? 'ready' : ''}"></span>
-          <strong>${p.label}</strong>
-        </div>
-        <div class="peer-meta">
-          <span>${p.status}</span>
-          <span class="mono">${p.rttMs !== null ? `${p.rttMs} мс` : '—'}</span>
-        </div>
-      </li>`
-      )
+      .map((p) => {
+        const isSlowest = roomMax > 30 && p.latencyMs === roomMax;
+        const btTag = p.isBluetooth
+          ? `<span class="peer-chip peer-chip-bt ${isSlowest ? 'slowest' : ''}">BT ${p.latencyMs} мс</span>`
+          : `<span class="peer-chip">${p.latencyMs} мс</span>`;
+        const trTag = `<span class="peer-chip peer-chip-net">${escapeHtml(p.transportLabel || 'P2P')}</span>`;
+
+        return `
+          <li class="peer-item">
+            <div class="peer-main">
+              <span class="peer-status-dot ${p.ready ? 'ready' : ''}"></span>
+              <div class="peer-name-wrap">
+                <strong>${escapeHtml(p.label)}</strong>
+                <div class="peer-chips">${trTag} ${btTag}</div>
+              </div>
+            </div>
+            <div class="peer-meta">
+              <span>${escapeHtml(p.status)}</span>
+              <span class="mono">${p.rttMs !== null ? `${p.rttMs} мс` : '—'}</span>
+            </div>
+          </li>`;
+      })
       .join('');
   }
 
-  /* ==================== ЦИКЛ ОТРИСОВКИ (ПРОГРЕСС + ВИЗУАЛИЗАТОР) ==================== */
+  /* ==================== ЦИКЛ ОТРИСОВКИ ==================== */
 
   const freqBins = new Uint8Array(64);
 
@@ -719,13 +1103,12 @@
     const ctx2d = canvas.getContext('2d');
 
     const tick = () => {
-      // 1. Обратный отсчёт перед стартом
       const countdown = audio.getCountdownSec();
       if (countdown > 0.02) {
         ui.countdownBadge.classList.remove('hidden');
         ui.countdownBadge.textContent = `Старт: ${countdown.toFixed(1)}с`;
         if (state.role === 'listener') {
-          ui.listenerBannerText.textContent = `Запланированный старт через ${countdown.toFixed(1)} с...`;
+          ui.listenerBannerText.textContent = `Общий акустический старт через ${countdown.toFixed(1)} с...`;
         }
       } else {
         ui.countdownBadge.classList.add('hidden');
@@ -734,14 +1117,12 @@
         }
       }
 
-      // 2. Обновление бегунка времени
       if (audio.buffer && !state.isSeeking) {
-        const pos = audio.getCurrentPosition();
+        const pos = audio.getAcousticPosition();
         ui.timeCurrent.textContent = formatTime(pos);
         ui.seekSlider.value = String(pos);
       }
 
-      // 3. Отрисовка частотного визуализатора
       const w = canvas.width;
       const h = canvas.height;
       ctx2d.clearRect(0, 0, w, h);
@@ -792,25 +1173,21 @@
     }
     audio.stopInternal();
     audio.buffer = null;
+    audio.currentTrackId = null;
     network.destroy();
     wakeLock.release();
 
     state.role = null;
     state.roomCode = null;
-    state.currentTrackId = null;
+    state.playlist = [];
+    state.activeTrackId = null;
     state.pendingPlayCmd = null;
+    state.roomLatency = { roomMaxLatencyMs: 0, slowestLabel: 'Хост', bluetoothCount: 0, deviceCount: 1 };
 
-    ui.btnPlayPause.disabled = true;
-    ui.btnRestart.disabled = true;
-    ui.btnForceResync.disabled = true;
-    ui.seekSlider.disabled = true;
-    ui.seekSlider.value = '0';
-    ui.timeCurrent.textContent = '0:00';
-    ui.timeDuration.textContent = '0:00';
-    ui.trackTitle.textContent = 'Трек не выбран';
-    ui.trackSub.textContent = 'Ожидание загрузки аудио...';
+    resetPlayerNoTrackUI();
     showTransfer(false);
     renderPeerList([]);
+    renderPlaylist();
 
     window.history.replaceState({}, '', window.location.pathname);
     showView('landing');
@@ -839,7 +1216,6 @@
     if (state.role) leaveRoom();
   });
 
-  // Копирование ссылки и QR
   ui.btnToggleQR.addEventListener('click', () => {
     ui.qrPanel.classList.toggle('hidden');
   });
@@ -863,8 +1239,8 @@
     if (navigator.share) {
       try {
         await navigator.share({
-          title: 'Orpheus Sync — Слушаем вместе',
-          text: `Подключайся к моей комнате ${NetworkManager.formatCode(state.roomCode)} для синхронного прослушивания!`,
+          title: 'Orpheus Sync — Синхронная музыка',
+          text: `Подключайся к комнате ${NetworkManager.formatCode(state.roomCode)}!`,
           url,
         });
         return;
@@ -873,10 +1249,9 @@
     copyShareLink();
   });
 
-  // Загрузка файлов (клик + Drag & Drop)
+  // Добавление файлов (множественный выбор + Drag & Drop)
   ui.audioFileInput.addEventListener('change', (e) => {
-    const file = e.target.files?.[0];
-    if (file) hostLoadFile(file);
+    if (e.target.files?.length) hostAddFiles(e.target.files);
     e.target.value = '';
   });
 
@@ -890,11 +1265,11 @@
   ui.fileDropzone.addEventListener('drop', (e) => {
     e.preventDefault();
     ui.fileDropzone.classList.remove('dragover');
-    const file = e.dataTransfer?.files?.[0];
-    if (file) hostLoadFile(file);
+    if (e.dataTransfer?.files?.length) hostAddFiles(e.dataTransfer.files);
   });
 
-  ui.btnLoadDemoTrack.addEventListener('click', hostLoadDemoTrack);
+  ui.btnLoadDemoTrack.addEventListener('click', () => hostAddSynthTrack('demo'));
+  ui.btnLoadPulseTrack.addEventListener('click', () => hostAddSynthTrack('pulse'));
 
   ui.btnToggleUrlInput.addEventListener('click', () => {
     ui.urlTrackForm.classList.toggle('hidden');
@@ -903,42 +1278,86 @@
   ui.urlTrackForm.addEventListener('submit', (e) => {
     e.preventDefault();
     const url = ui.inputAudioUrl.value.trim();
-    if (url) hostLoadUrlTrack(url);
+    if (url) hostAddUrlTrack(url);
   });
 
-  // Кнопки управления плеером Хоста
-  ui.btnPlayPause.addEventListener('click', () => {
-    if (!audio.buffer) return;
-    if (audio.isPlaying) {
-      hostPause();
-    } else {
-      hostSchedulePlay(audio.getCurrentPosition());
+  ui.chkLoopPlaylist.addEventListener('change', () => {
+    state.loopPlaylist = ui.chkLoopPlaylist.checked;
+  });
+
+  // Делегирование кликов по плейлисту (Хост)
+  ui.playlistList.addEventListener('click', (e) => {
+    if (state.role !== 'host') return;
+    const upBtn = e.target.closest('[data-pl-up]');
+    if (upBtn) {
+      e.stopPropagation();
+      hostMoveTrack(upBtn.dataset.plUp, -1);
+      return;
+    }
+    const downBtn = e.target.closest('[data-pl-down]');
+    if (downBtn) {
+      e.stopPropagation();
+      hostMoveTrack(downBtn.dataset.plDown, 1);
+      return;
+    }
+    const delBtn = e.target.closest('[data-pl-del]');
+    if (delBtn) {
+      e.stopPropagation();
+      hostRemoveTrack(delBtn.dataset.plDel);
+      return;
+    }
+    const item = e.target.closest('[data-pl-select]');
+    if (item) {
+      const id = item.dataset.plSelect;
+      if (id === state.activeTrackId) {
+        if (audio.isPlaying) hostPause();
+        else hostSchedulePlay(audio.getAcousticPosition());
+      } else {
+        hostSelectTrack(id, audio.isPlaying);
+      }
     }
   });
 
-  ui.btnRestart.addEventListener('click', () => {
+  // Управление плеером (Хост)
+  ui.btnPlayPause.addEventListener('click', () => {
     if (!audio.buffer) return;
-    if (audio.isPlaying) {
-      hostSchedulePlay(0);
+    if (audio.isPlaying) hostPause();
+    else hostSchedulePlay(audio.getAcousticPosition());
+  });
+
+  ui.btnPrevTrack.addEventListener('click', () => {
+    if (!audio.buffer) return;
+    // Если прошло > 3 сек — перезапуск текущего трека, иначе предыдущий в плейлисте
+    if (audio.getAcousticPosition() > 3 || state.playlist.length <= 1) {
+      if (audio.isPlaying) hostSchedulePlay(0);
+      else {
+        audio.pause(0);
+        ui.seekSlider.value = '0';
+        ui.timeCurrent.textContent = '0:00';
+        network.broadcastPause({ trackOffset: 0 });
+      }
     } else {
-      audio.pause(0);
-      ui.seekSlider.value = '0';
-      ui.timeCurrent.textContent = '0:00';
-      network.broadcastPause({ trackOffset: 0 });
+      hostSwitchAdjacent(-1, audio.isPlaying);
+    }
+  });
+
+  ui.btnNextTrack.addEventListener('click', () => {
+    if (state.playlist.length > 1) {
+      hostSwitchAdjacent(1, audio.isPlaying);
     }
   });
 
   ui.btnForceResync.addEventListener('click', () => {
     if (!audio.buffer) return;
     if (audio.isPlaying) {
-      hostSchedulePlay(audio.getCurrentPosition());
+      hostSchedulePlay(audio.getAcousticPosition());
       showToast('Команда пересинхронизации отправлена всем', 'success');
     } else {
       showToast('Сначала нажмите Старт');
     }
   });
 
-  // Перемотка (Seek) на Хосте
+  // Перемотка
   ui.seekSlider.addEventListener('input', () => {
     state.isSeeking = true;
     ui.timeCurrent.textContent = formatTime(Number(ui.seekSlider.value));
@@ -949,20 +1368,18 @@
     const targetSec = Number(ui.seekSlider.value);
     if (state.role !== 'host' || !audio.buffer) return;
 
-    if (audio.isPlaying) {
-      hostSchedulePlay(targetSec);
-    } else {
+    if (audio.isPlaying) hostSchedulePlay(targetSec);
+    else {
       audio.pause(targetSec);
       network.broadcastPause({ trackOffset: targetSec });
     }
   });
 
-  // Переподключение слушателя
   ui.btnListenerReconnect.addEventListener('click', () => {
     if (state.roomCode) enterAsListener(state.roomCode);
   });
 
-  // Локальная громкость
+  // Громкость
   ui.volumeSlider.addEventListener('input', () => {
     const val = Number(ui.volumeSlider.value);
     audio.setVolume(val);
@@ -980,38 +1397,67 @@
     ui.iconVolOff.classList.toggle('hidden', !audio.muted);
   });
 
-  // Ручная микро-коррекция (-50 / -10 / 0 / +10 / +50 мс)
+  // Настройки Bluetooth и глобальной задержки
+  ui.chkAutoSysLatency.addEventListener('change', () => {
+    audio.setAutoSystemLatency(ui.chkAutoSysLatency.checked);
+  });
+
+  ui.btnDetectDevices.addEventListener('click', async () => {
+    const ok = await audio.requestDeviceLabelsAccess();
+    if (ok) {
+      showToast('Аудиоустройства и локальный IP определены!', 'success');
+    } else {
+      showToast('Доступ отклонён — используется системный outputLatency', 'info');
+    }
+  });
+
+  document.querySelectorAll('[data-bt-preset]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const ms = Number(btn.dataset.btPreset);
+      audio.setExtraLatency(ms);
+    });
+  });
+
   document.querySelectorAll('[data-nudge]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const delta = Number(btn.dataset.nudge);
-      audio.nudgeManualOffset(delta);
-      updateManualOffsetUI();
+      audio.nudgeExtraLatency(delta);
     });
   });
 
   ui.btnResetOffset.addEventListener('click', () => {
-    audio.setManualOffset(0);
-    updateManualOffsetUI();
+    audio.setExtraLatency(0);
   });
 
-  // Авто-ресинк и восстановление AudioContext при возврате из фона (актуально для мобильных)
   document.addEventListener('visibilitychange', async () => {
     if (document.visibilityState === 'visible' && state.role) {
       await audio.ensureResumed();
-      if (audio.isPlaying) {
-        audio.checkDrift();
-      }
+      audio.measureSystemLatency(true);
+      if (clock && !clock.isHost) clock.reburst();
+      if (audio.isPlaying) audio.checkDrift();
     }
   });
 
-  // Автоформат ввода кода комнаты
   ui.inputRoomCode.addEventListener('input', () => {
     const clean = NetworkManager.normalizeCode(ui.inputRoomCode.value);
     ui.inputRoomCode.value = clean.length > 3 ? `${clean.slice(0, 3)}-${clean.slice(3)}` : clean;
   });
 
-  // Старт приложения: проверяем, есть ли ?room=CODE в адресной строке
-  updateManualOffsetUI();
+  // Диагностический хук для автотестов
+  window.__orpheus = {
+    state,
+    audio,
+    network,
+    getClock: () => clock,
+    enterAsHost,
+    enterAsListener,
+    hostAddSynthTrack,
+    hostSchedulePlay,
+    hostPause,
+  };
+
+  // Инициализация стартового экрана
+  renderLatencyUI(audio.getLatencyProfile());
   const params = new URLSearchParams(window.location.search);
   const urlRoom = NetworkManager.normalizeCode(params.get('room') || window.location.hash.replace('#room=', ''));
   if (urlRoom.length >= 4) {
