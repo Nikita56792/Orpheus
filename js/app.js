@@ -80,6 +80,7 @@
     listenerPlaybackBanner: $('listenerPlaybackBanner'),
     listenerPulse: $('listenerPulse'),
     listenerBannerText: $('listenerBannerText'),
+    btnCalibrateBt: $('btnCalibrateBt'),
     btnListenerReconnect: $('btnListenerReconnect'),
 
     btnMute: $('btnMute'),
@@ -120,7 +121,8 @@
     onDrift: (driftMs, mode) => updateDriftMetric(driftMs, mode),
     onEnded: () => handleTrackEnded(),
     onStateChange: ({ playing }) => updatePlaybackUI(playing),
-    onLatencyChange: () => {
+    onLatencyChange: (profile) => {
+      updateBluetoothCalibrateUI(profile);
       if (state.role) sendLocalLatencyToHost();
     },
     onNeedNextSegment: ({ trackId, fromSec }) => {
@@ -373,6 +375,58 @@
     ui.qrCanvasWrap.innerHTML = qr.createSvgTag({ scalable: true, margin: 2 });
   }
 
+  function updateBluetoothCalibrateUI(profile) {
+    if (!ui.btnCalibrateBt) return;
+    const show = state.role === 'listener' && Boolean(profile && profile.isBluetooth);
+    ui.btnCalibrateBt.classList.toggle('hidden', !show);
+    if (!show || audio.isCalibrating) return;
+    ui.btnCalibrateBt.textContent = profile.isCalibrated
+      ? `BT ${profile.totalLatencyMs} мс ✓`
+      : 'Калибровать BT';
+
+    // Если микрофон уже разрешён в браузере, а эта колонка ещё не калибровалась — делаем авто-калибровку сами!
+    if (!profile.isCalibrated && !audio._autoCalAttempted && navigator.permissions && navigator.permissions.query) {
+      audio._autoCalAttempted = true;
+      navigator.permissions
+        .query({ name: 'microphone' })
+        .then((st) => {
+          if (st.state === 'granted' && state.role === 'listener' && !audio.isCalibrating && audio.calibratedLatencyMs === null) {
+            runBluetoothAcousticCalibration(true);
+          }
+        })
+        .catch(() => {});
+    }
+  }
+
+  async function runBluetoothAcousticCalibration(isSilentAuto = false) {
+    if (!ui.btnCalibrateBt || audio.isCalibrating) return;
+    ui.btnCalibrateBt.disabled = true;
+    ui.btnCalibrateBt.textContent = 'Замер...';
+    try {
+      const res = await audio.autoCalibrateAcousticLatency({
+        onProgress: (txt) => {
+          if (ui.btnCalibrateBt) ui.btnCalibrateBt.textContent = txt.includes('Замер') ? 'Замер...' : 'Микрофон...';
+        },
+      });
+      if (res) {
+        updateBluetoothCalibrateUI(audio.getLatencyProfile());
+        showToast(
+          `Колонка откалибрована: ${res.calibratedMs} мс${res.deviceLabel ? ` (${res.deviceLabel})` : ''}`,
+          'success'
+        );
+      }
+    } catch (err) {
+      if (!isSilentAuto) {
+        showToast(err.message || 'Не удалось откалибровать Bluetooth', 'error');
+      }
+    } finally {
+      if (ui.btnCalibrateBt) {
+        ui.btnCalibrateBt.disabled = false;
+        updateBluetoothCalibrateUI(audio.getLatencyProfile());
+      }
+    }
+  }
+
   function sendLocalLatencyToHost() {
     const profile = audio.getLatencyProfile();
     if (state.role === 'host') {
@@ -528,6 +582,7 @@
 
       ensureListenerClockStarted(network.hostTransport === 'relay' ? 'relay' : 'p2p');
       sendLocalLatencyToHost();
+      updateBluetoothCalibrateUI(audio.getLatencyProfile());
 
       renderPlaylist();
       showView('room');
@@ -1441,6 +1496,10 @@
   ui.btnListenerReconnect.addEventListener('click', () => {
     if (state.roomCode) enterAsListener(state.roomCode);
   });
+
+  if (ui.btnCalibrateBt) {
+    ui.btnCalibrateBt.addEventListener('click', () => runBluetoothAcousticCalibration(false));
+  }
 
   ui.volumeSlider.addEventListener('input', () => {
     const val = Number(ui.volumeSlider.value);

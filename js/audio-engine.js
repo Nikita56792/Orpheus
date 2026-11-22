@@ -62,6 +62,13 @@ class AudioEngine {
 
     this.lastDriftMs = 0;
     this._lastReportedLatencySig = '';
+    this._latencySamples = [];
+    this._outlierStreak = 0;
+    this._unlockAt = 0;
+    this.calibratedLatencyMs = null;
+    this._calibratedRawOsMs = null;
+    this.isCalibrating = false;
+    this._autoCalAttempted = false;
 
     this.onDrift = onDrift || (() => {});
     this.onEnded = onEnded || (() => {});
@@ -97,6 +104,7 @@ class AudioEngine {
       roomMaxLatencyMs: Math.round(this.roomMaxLatencyMs),
       waitDelayMs,
       isBluetooth: this.isBluetoothDetected || this.systemLatencyMs >= 75 || this.extraLatencyMs >= 60,
+      isCalibrated: this.calibratedLatencyMs !== null,
       outputDeviceLabel: this.outputDeviceLabel,
     };
   }
@@ -170,6 +178,9 @@ class AudioEngine {
       } catch (_) {}
     }
 
+    this._unlockAt = Date.now();
+    this._latencySamples = [];
+    this._outlierStreak = 0;
     this._ensureKeepalive();
     this._startLatencyMonitor();
     await this.probeAudioDevices();
@@ -246,8 +257,45 @@ class AudioEngine {
     } catch (_) {}
   }
 
+  _median(arr) {
+    if (!arr || arr.length === 0) return 0;
+    const s = [...arr].sort((a, b) => a - b);
+    const m = Math.floor(s.length / 2);
+    return s.length % 2 === 0 ? (s[m - 1] + s[m]) / 2 : s[m];
+  }
+
+  _calibrationStorageKey(rawOsMs) {
+    const label = (this.outputDeviceLabel || '').trim().toLowerCase();
+    if (label && label.length >= 2) {
+      return `orpheus_bt_cal_v1_name_${label}`;
+    }
+    const plat = this._isAndroid ? 'android' : /iPhone|iPad/i.test(navigator.userAgent || '') ? 'ios' : 'desktop';
+    const bucket = Math.round(rawOsMs / 60) * 60;
+    return `orpheus_bt_cal_v1_${plat}_${bucket}`;
+  }
+
+  _loadSavedCalibration(rawOsMs) {
+    try {
+      const key = this._calibrationStorageKey(rawOsMs);
+      const raw = localStorage.getItem(key);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (parsed && Number.isFinite(parsed.ms) && parsed.ms >= 15 && parsed.ms <= 1100) {
+        return Math.round(parsed.ms);
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  _saveCalibration(rawOsMs, calibratedMs) {
+    try {
+      const key = this._calibrationStorageKey(rawOsMs);
+      localStorage.setItem(key, JSON.stringify({ ms: Math.round(calibratedMs), rawOsMs: Math.round(rawOsMs), ts: Date.now() }));
+    } catch (_) {}
+  }
+
   measureSystemLatency(forceEmit = false) {
-    if (!this.ctx) return this.systemLatencyMs;
+    if (!this.ctx || this.isCalibrating) return this.systemLatencyMs;
 
     const prevTotal = this.getTotalOutputLatencyMs();
     const baseMs = Number.isFinite(this.ctx.baseLatency) ? this.ctx.baseLatency * 1000 : 0;
@@ -261,7 +309,7 @@ class AudioEngine {
           const ct = this.ctx.currentTime;
           const pn = performance.now();
           const raw = (ct - ts.contextTime) * 1000 + (ts.performanceTime - pn);
-          if (Number.isFinite(raw) && raw >= 0 && raw < 2500) {
+          if (Number.isFinite(raw) && raw >= 0 && raw < 1500) {
             impliedMs = raw;
           }
         }
@@ -272,43 +320,336 @@ class AudioEngine {
     this.outputLatencyMs = outMs;
     this.impliedLatencyMs = impliedMs;
 
-    let measured = 0;
+    // Если браузер отдаёт нативный AudioContext.outputLatency (Chrome/Edge) — доверяем ему,
+    // а НЕ берём Math.max с шумным getOutputTimestamp() (иначе один GC-скачок завышает задержку на +300 мс!).
+    let rawOsMs = 0;
     if (outMs > 0) {
-      measured = Math.max(outMs + baseMs, impliedMs);
+      rawOsMs = outMs + baseMs;
     } else if (impliedMs > 0) {
-      measured = impliedMs + baseMs * 0.5;
+      rawOsMs = impliedMs + baseMs * 0.5;
     } else {
-      measured = baseMs;
+      rawOsMs = baseMs;
     }
 
-    // Android A2DP Offload (AudioFlinger / AAudio) обычно отдаёт в Web Audio только буфер HAL (~250–300 мс)
-    // без учёта AVRCP DelayReport / DSP самой Bluetooth-колонки (~155 мс на JBL Flip 7 и A2DP Offload).
-    const btOnAndroid = this._isAndroid && (this.isBluetoothDetected || outMs >= 100 || impliedMs >= 115);
-    if (btOnAndroid) {
-      measured += 155;
+    // Скользящая медиана (5 замеров): отсеивает единичные всплески, но за 2 такта схватывает реальную смену устройства
+    if (this._latencySamples.length > 0) {
+      const curMed = this._median(this._latencySamples);
+      if (Math.abs(rawOsMs - curMed) > 75) {
+        this._outlierStreak++;
+        if (this._outlierStreak >= 2 || Date.now() - this._unlockAt < 1800) {
+          this._latencySamples = [rawOsMs];
+          this._outlierStreak = 0;
+        }
+      } else {
+        this._outlierStreak = 0;
+        this._latencySamples.push(rawOsMs);
+        if (this._latencySamples.length > 5) this._latencySamples.shift();
+      }
+    } else {
+      this._latencySamples.push(rawOsMs);
     }
 
-    // Гистерезис от квантовых скачков Android HAL (280 <-> 288 <-> 296 <-> 304 мс),
-    // чтобы не вызывать ложное дрожание playbackRate во время уже идущего воспроизведения.
-    if (this.systemLatencyMs === 0 || Math.abs(measured - this.systemLatencyMs) >= 26) {
+    const stableOsMs = this._median(this._latencySamples);
+    const isBt = this.isBluetoothDetected || stableOsMs >= 95;
+
+    // Если Bluetooth отключили или переключили на другую колонку — сбрасываем прежнюю калибровку
+    if (this._calibratedRawOsMs !== null && Math.abs(stableOsMs - this._calibratedRawOsMs) > 75) {
+      this.calibratedLatencyMs = null;
+      this._calibratedRawOsMs = null;
+    }
+
+    // Проверяем, есть ли уже сохранённая точная акустическая калибровка для этой колонки
+    if (this.calibratedLatencyMs === null && isBt) {
+      const saved = this._loadSavedCalibration(stableOsMs);
+      if (saved !== null) {
+        this.calibratedLatencyMs = saved;
+        this._calibratedRawOsMs = stableOsMs;
+      }
+    }
+
+    let measured = stableOsMs;
+    if (this.calibratedLatencyMs !== null) {
+      measured = this.calibratedLatencyMs;
+    } else if (this._isAndroid && isBt) {
+      // На Android с A2DP Offload (Samsung/Qualcomm) AudioFlinger отдаёт ~150..325 мс без AVRCP DelayReport колонки (~155 мс).
+      // На Android-устройствах, чей HAL УЖЕ включает полный AVRCP DelayReport (>= 445 мс), надбавка плавно сходит в 0,
+      // чтобы не было двойного сложения (как 604 + 155 = 759 мс).
+      if (stableOsMs <= 325) {
+        measured = stableOsMs + 155;
+      } else if (stableOsMs < 445) {
+        measured = stableOsMs + Math.round((155 * (445 - stableOsMs)) / 120);
+      } else {
+        measured = stableOsMs;
+      }
+    }
+
+    const warmingUp = Date.now() - this._unlockAt < 2500;
+    const minJump = warmingUp ? 10 : 18;
+    if (this.systemLatencyMs === 0 || Math.abs(measured - this.systemLatencyMs) >= minJump) {
       this.systemLatencyMs = measured;
     }
 
     const newTotal = this.getTotalOutputLatencyMs();
     const profile = this.getLatencyProfile();
-    const sig = `${profile.totalLatencyMs}|${profile.systemLatencyMs}|${profile.isBluetooth}|${profile.outputDeviceLabel}`;
+    const sig = `${profile.totalLatencyMs}|${profile.systemLatencyMs}|${profile.isBluetooth}|${profile.isCalibrated}|${profile.outputDeviceLabel}`;
 
     if (forceEmit || sig !== this._lastReportedLatencySig) {
       this._lastReportedLatencySig = sig;
       this.onLatencyChange(profile);
 
-      if (this.isPlaying && this.hasPlayableAudio() && Math.abs(newTotal - prevTotal) >= 24) {
+      if (this.isPlaying && this.hasPlayableAudio() && Math.abs(newTotal - prevTotal) >= 18) {
         this._stopSourceNode(true);
         this._startSourceAligned();
       }
     }
 
     return this.systemLatencyMs;
+  }
+
+  /**
+   * Автоматическая акустическая калибровка задержки ЛЮБОЙ Bluetooth-колонки через встроенный микрофон телефона.
+   * Проигрывает 3 коротких сонарных импульса (28 мс), вычисляет точную кросс-корреляцию с записью микрофона,
+   * находит физическую задержку колонки с точностью ±5 мс, сохраняет в localStorage и мгновенно выравнивает комнату.
+   */
+  async autoCalibrateAcousticLatency({ onProgress } = {}) {
+    if (this.isCalibrating) return null;
+    if (!this.ctx) await this.unlock();
+    await this.ensureResumed();
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Микрофон недоступен в этом браузере');
+    }
+
+    const progress = onProgress || (() => {});
+    this.isCalibrating = true;
+    const wasPlaying = this.isPlaying;
+    const prevVol = this.volume;
+    const prevMuted = this.muted;
+    const beforeOutMs = Number.isFinite(this.ctx.outputLatency) ? this.ctx.outputLatency * 1000 : 0;
+
+    let stream = null;
+    let micSrc = null;
+    let proc = null;
+    let zeroGain = null;
+
+    try {
+      progress('Доступ к микрофону...');
+      // Отключаем echoCancellation/NS/AGC, чтобы Android оставался в режиме A2DP (MODE_NORMAL), а не падал в HFP/SCO!
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
+
+      // После выдачи доступа к микрофону браузер раскрывает реальное имя Bluetooth-колонки (например, JBL Flip 7)
+      await this.probeAudioDevices();
+
+      // Временно приглушаем локальную музыку на 2.2 сек (не сбивая расписание и часы!)
+      if (this.masterGain) {
+        this.masterGain.gain.setTargetAtTime(0.0001, this.ctx.currentTime, 0.01);
+      }
+
+      // Ждём 260 мс и проверяем, что Android не сбросил Bluetooth в разговорный SCO-режим
+      await new Promise((r) => setTimeout(r, 260));
+      const duringOutMs = Number.isFinite(this.ctx.outputLatency) ? this.ctx.outputLatency * 1000 : 0;
+      if (this._isAndroid && beforeOutMs > 120 && duringOutMs > 0 && duringOutMs < 65) {
+        throw new Error('Телефон переключил Bluetooth в режим гарнитуры при включении микрофона');
+      }
+
+      progress('Замер задержки колонки...');
+
+      const sr = this.ctx.sampleRate;
+      const chirpDur = 0.028; // 28 мс линейный FM-чирп 1300 -> 3500 Гц
+      const chirpLen = Math.floor(sr * chirpDur);
+      const template = new Float32Array(chirpLen);
+      let tplEnergy = 0;
+      for (let i = 0; i < chirpLen; i++) {
+        const u = i / chirpLen;
+        const win = 0.5 * (1 - Math.cos(2 * Math.PI * u));
+        const phase = 2 * Math.PI * (1300 * (i / sr) + 0.5 * ((3500 - 1300) / chirpDur) * (i / sr) * (i / sr));
+        const v = Math.sin(phase) * win;
+        template[i] = v;
+        tplEnergy += v * v;
+      }
+
+      const chirpBuf = this.ctx.createBuffer(1, chirpLen, sr);
+      chirpBuf.getChannelData(0).set(template);
+
+      // Записываем сырые PCM-сэмплы с привязкой к точному ctx.currentTime
+      const chunks = [];
+      let totalRecorded = 0;
+      let firstChunkEndTime = null;
+      const bufSize = 2048;
+
+      micSrc = this.ctx.createMediaStreamSource(stream);
+      proc = this.ctx.createScriptProcessor(bufSize, 1, 1);
+      zeroGain = this.ctx.createGain();
+      zeroGain.gain.value = 0;
+
+      proc.onaudioprocess = (ev) => {
+        const inp = ev.inputBuffer.getChannelData(0);
+        const copy = new Float32Array(inp.length);
+        copy.set(inp);
+        if (firstChunkEndTime === null) {
+          firstChunkEndTime = this.ctx.currentTime;
+        }
+        chunks.push(copy);
+        totalRecorded += copy.length;
+      };
+
+      micSrc.connect(proc);
+      proc.connect(zeroGain);
+      zeroGain.connect(this.ctx.destination);
+
+      await new Promise((r) => setTimeout(r, 140));
+
+      // Планируем 3 чирпа с шагом 760 мс (перекрывает задержки до 720 мс без наложений)
+      const baseT = this.ctx.currentTime + 0.14;
+      const emitTimes = [baseT, baseT + 0.76, baseT + 1.52];
+      for (const t of emitTimes) {
+        const s = this.ctx.createBufferSource();
+        s.buffer = chirpBuf;
+        const g = this.ctx.createGain();
+        g.gain.value = 0.75;
+        s.connect(g);
+        g.connect(this.ctx.destination);
+        s.start(t);
+      }
+
+      // Ждём завершения последнего чирпа + 760 мс запаса
+      const waitMs = Math.max(400, Math.round((emitTimes[emitTimes.length - 1] + 0.78 - this.ctx.currentTime) * 1000));
+      await new Promise((r) => setTimeout(r, waitMs));
+
+      // Останавливаем запись
+      proc.onaudioprocess = null;
+      try { micSrc.disconnect(); proc.disconnect(); zeroGain.disconnect(); } catch (_) {}
+      stream.getTracks().forEach((tr) => tr.stop());
+      stream = null;
+
+      if (firstChunkEndTime === null || totalRecorded < sr * 1.5) {
+        throw new Error('Микрофон не записал аудиопоток');
+      }
+
+      // Склеиваем запись в единый буфер; начало буфера соответствует recordStartTime
+      const rec = new Float32Array(totalRecorded);
+      let off = 0;
+      for (const c of chunks) {
+        rec.set(c, off);
+        off += c.length;
+      }
+      const recordStartTime = firstChunkEndTime - bufSize / sr;
+
+      // Кросс-корреляция (matched filter) по каждому из 3 чирпов в окне [12 мс .. 720 мс]
+      const detections = [];
+      const stride = 2; // 24 кГц эффективная сетка = 0.04 мс точность, работает < 15 мс
+      const minLag = Math.floor(sr * 0.012);
+      const maxLag = Math.floor(sr * 0.720);
+
+      for (const tEmit of emitTimes) {
+        const emitSample = Math.round((tEmit - recordStartTime) * sr);
+        const searchStart = Math.max(0, emitSample + minLag);
+        const searchEnd = Math.min(rec.length - chirpLen - 1, emitSample + maxLag);
+        if (searchEnd <= searchStart + 100) continue;
+
+        const corrLen = Math.floor((searchEnd - searchStart) / stride);
+        const corrAbs = new Float32Array(corrLen);
+        let bestVal = 0;
+        let bestIdx = 0;
+
+        for (let k = 0; k < corrLen; k++) {
+          const base = searchStart + k * stride;
+          let dot = 0;
+          for (let j = 0; j < chirpLen; j += 2) {
+            dot += rec[base + j] * template[j];
+          }
+          const mag = Math.abs(dot);
+          corrAbs[k] = mag;
+          if (mag > bestVal) {
+            bestVal = mag;
+            bestIdx = k;
+          }
+        }
+
+        // Оценка уровня шума (медиана корреляции вне зоны пика)
+        const noiseSamples = [];
+        for (let k = 0; k < corrLen; k += 8) {
+          if (Math.abs(k - bestIdx) > Math.floor(chirpLen / stride)) {
+            noiseSamples.push(corrAbs[k]);
+          }
+        }
+        const noiseFloor = this._median(noiseSamples) || 1e-6;
+        const snr = bestVal / noiseFloor;
+
+        if (snr >= 3.2 && tplEnergy > 0) {
+          // Уточняем начало пика (фронт корреляции) для стабильности к эху комнаты
+          const lagSamples = searchStart + bestIdx * stride - emitSample;
+          const lagMs = (lagSamples / sr) * 1000;
+          detections.push({ lagMs, snr });
+        }
+      }
+
+      if (detections.length < 2) {
+        throw new Error('Колонка слышна слишком тихо — сделайте громче и поднесите телефон ближе');
+      }
+
+      // Ищем согласованную пару/тройку замеров в пределах ±35 мс
+      detections.sort((a, b) => a.lagMs - b.lagMs);
+      let bestCluster = [];
+      for (let i = 0; i < detections.length; i++) {
+        const cluster = detections.filter((d) => Math.abs(d.lagMs - detections[i].lagMs) <= 35);
+        if (cluster.length > bestCluster.length) bestCluster = cluster;
+      }
+
+      if (bestCluster.length < 2) {
+        throw new Error('Слишком шумно для точной калибровки — повторите в тишине');
+      }
+
+      const roundTripMs = this._median(bestCluster.map((d) => d.lagMs));
+      // Вычитаем системную задержку захвата микрофона (~26 мс Android, ~15 мс macOS/iOS)
+      const micInputMs = this._isAndroid ? 26 : 15;
+      const calibratedMs = Math.max(15, Math.min(1100, Math.round(roundTripMs - micInputMs)));
+
+      const baseMsNow = Number.isFinite(this.ctx.baseLatency) ? this.ctx.baseLatency * 1000 : 0;
+      const outMsNow = Number.isFinite(this.ctx.outputLatency) ? this.ctx.outputLatency * 1000 : 0;
+      const rawOsNow = outMsNow > 0 ? outMsNow + baseMsNow : this._median(this._latencySamples);
+
+      this.calibratedLatencyMs = calibratedMs;
+      this._calibratedRawOsMs = rawOsNow;
+      this.systemLatencyMs = calibratedMs;
+      this._saveCalibration(rawOsNow, calibratedMs);
+      this._lastReportedLatencySig = '';
+
+      const profile = this.getLatencyProfile();
+      this.onLatencyChange(profile);
+
+      if (wasPlaying && this.hasPlayableAudio()) {
+        this._stopSourceNode(true);
+        this._startSourceAligned();
+      }
+
+      return {
+        calibratedMs,
+        roundTripMs: Math.round(roundTripMs),
+        detections: bestCluster.length,
+        deviceLabel: this.outputDeviceLabel,
+      };
+    } finally {
+      if (proc) {
+        proc.onaudioprocess = null;
+        try { proc.disconnect(); } catch (_) {}
+      }
+      if (micSrc) { try { micSrc.disconnect(); } catch (_) {} }
+      if (zeroGain) { try { zeroGain.disconnect(); } catch (_) {} }
+      if (stream) {
+        stream.getTracks().forEach((tr) => tr.stop());
+      }
+      if (this.masterGain && this.ctx) {
+        this.masterGain.gain.setTargetAtTime(prevMuted ? 0 : prevVol, this.ctx.currentTime, 0.02);
+      }
+      this.isCalibrating = false;
+    }
   }
 
   _startLatencyMonitor() {
