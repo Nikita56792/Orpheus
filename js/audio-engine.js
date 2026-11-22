@@ -1,29 +1,33 @@
 /**
- * AudioEngine — полностью автоматический аудиодвижок (Web Audio API)
- * с глобальным выравниванием системных и Bluetooth-задержек по всему зданию.
+ * AudioEngine v2.2 — полностью автоматический аудиодвижок (Web Audio API)
+ * с прогрессивным стримингом во время кэширования (как при просмотре фильмов)
+ * и глобальным выравниванием системных и Bluetooth-задержек.
  *
- * Всё работает автоматически без ручных настроек:
- * 1. Неслышимый keepalive-узел держит аппаратный тракт активным, чтобы
- *    AudioContext.outputLatency / baseLatency / getOutputTimestamp() всегда отдавали
- *    точную системную задержку динамика или подключённого Bluetooth-устройства.
- * 2. Событие devicechange + фоновый мониторинг мгновенно замечают подключение/отключение
- *    Bluetooth на любом устройстве и автоматически пересинхронизируют сеть.
- * 3. Все устройства синхронизируются по единому акустическому времени T_acoustic:
- *    T_feed_i = T_acoustic - totalLatencyMs_i
- *    — Bluetooth-устройства подают звук заранее, а обычные телефоны ждут разницу.
- *    — При подключении новых устройств прямо во время воспроизведения (Late Join)
- *      они мгновенно встраиваются в акустическую шкалу времени с учётом своей задержки.
+ * Ключевые возможности:
+ * 1. Прогрессивный стриминг: воспроизведение начинается по первому короткому
+ *    аудиосегменту (~6 сек, передаётся за < 0.5 сек), пока полный файл ещё
+ *    кэшируется в фоне. По завершении кэширования происходит бесшовная
+ *    подмена на полный декодированный AudioBuffer с микро-кроссфейдом 12 мс.
+ * 2. Поддержка Late Join: при подключении во время воспроизведения сегмент
+ *    нарезается ровно с текущей позиции трека — звук включается сразу в такт.
+ * 3. Полностью автоматическая компенсация Bluetooth/динамика по всему зданию.
  */
 class AudioEngine {
   static MAX_CACHED_BUFFERS = 12;
 
-  constructor({ onDrift, onEnded, onStateChange, onLatencyChange } = {}) {
+  constructor({ onDrift, onEnded, onStateChange, onLatencyChange, onNeedNextSegment } = {}) {
     this.ctx = null;
     this.masterGain = null;
     this.analyser = null;
-    this.buffer = null;
+    this.buffer = null; // Полный декодированный AudioBuffer активного трека (если уже закэширован)
     this.currentTrackId = null;
-    this.bufferCache = new Map();
+    this.currentTrackDuration = 0;
+
+    this.bufferCache = new Map();    // trackId -> AudioBuffer (полные треки)
+    this.streamSegments = new Map(); // trackId -> [{ startSec, endSec, buffer }] (прогрессивные сегменты)
+    this.playingFromSegment = false;
+    this.activeSegmentEndSec = 0;
+    this._requestedNextSegAt = -1;
 
     this.source = null;
     this.sourceGain = null;
@@ -37,16 +41,15 @@ class AudioEngine {
     // Состояние воспроизведения относительно единого акустического времени Хоста (T_acoustic)
     this.isPlaying = false;
     this.isScheduled = false;
-    this.hostStartTime = 0;    // T_acoustic (ms) по часам Хоста
-    this.startTrackOffset = 0; // Позиция трека (sec) в момент T_acoustic
+    this.hostStartTime = 0;
+    this.startTrackOffset = 0;
     this.pausedPosition = 0;
 
-    // Точный трекинг текущей позиции с учётом переменного playbackRate
     this.anchorAudioTime = 0;
     this.anchorTrackPos = 0;
     this.currentRate = 1.0;
 
-    // Автоматически измеряемые задержки аудиовывода и Bluetooth
+    // Автоматические системные и Bluetooth-задержки
     this.autoSystemLatency = true;
     this.extraLatencyMs = 0;
     this.baseLatencyMs = 0;
@@ -64,6 +67,7 @@ class AudioEngine {
     this.onEnded = onEnded || (() => {});
     this.onStateChange = onStateChange || (() => {});
     this.onLatencyChange = onLatencyChange || (() => {});
+    this.onNeedNextSegment = onNeedNextSegment || (() => {});
 
     this._iosSilentAudio = null;
     this._driftTimer = null;
@@ -100,12 +104,11 @@ class AudioEngine {
     this.onLatencyChange(this.getLatencyProfile());
   }
 
-  /** Программная подстройка (для тестов/диагностики) */
   setExtraLatency(ms) {
     this.extraLatencyMs = Math.max(-500, Math.min(1200, Math.round(ms)));
     this._lastReportedLatencySig = '';
     this.onLatencyChange(this.getLatencyProfile());
-    if (this.isPlaying && this.buffer) {
+    if (this.isPlaying && this.hasPlayableAudio()) {
       this._stopSourceNode(true);
       this._startSourceAligned();
     }
@@ -136,7 +139,6 @@ class AudioEngine {
       this.analyser.connect(this.ctx.destination);
     }
 
-    // 1) Синхронный прогрев 1-сэмпловым буфером (iOS Safari)
     try {
       const silentBuf = this.ctx.createBuffer(1, 1, 22050);
       const src = this.ctx.createBufferSource();
@@ -145,7 +147,6 @@ class AudioEngine {
       src.start(0);
     } catch (_) {}
 
-    // 2) Тихий WAV для активации Media Playback режима на iOS
     if (!this._iosSilentAudio) {
       try {
         const silentWav =
@@ -167,13 +168,10 @@ class AudioEngine {
       } catch (_) {}
     }
 
-    // 3) Неслышимый keepalive-узел — держит outputLatency и getOutputTimestamp() живыми
     this._ensureKeepalive();
     this._startLatencyMonitor();
     await this.probeAudioDevices();
     this.measureSystemLatency(true);
-
-    // Повторное быстрое измерение через 300 мс после старта keepalive (когда ОС прогрела A2DP/DAC)
     setTimeout(() => this.measureSystemLatency(false), 300);
 
     this.unlocked = true;
@@ -242,7 +240,6 @@ class AudioEngine {
     if (!this.ctx) return this.systemLatencyMs;
 
     const prevTotal = this.getTotalOutputLatencyMs();
-
     const baseMs = Number.isFinite(this.ctx.baseLatency) ? this.ctx.baseLatency * 1000 : 0;
     const outMs = Number.isFinite(this.ctx.outputLatency) ? this.ctx.outputLatency * 1000 : 0;
 
@@ -288,8 +285,7 @@ class AudioEngine {
       this._lastReportedLatencySig = sig;
       this.onLatencyChange(profile);
 
-      // Если во время игры подключился/отключился Bluetooth — мгновенно перестраиваемся
-      if (this.isPlaying && this.buffer && Math.abs(newTotal - prevTotal) >= 12) {
+      if (this.isPlaying && this.hasPlayableAudio() && Math.abs(newTotal - prevTotal) >= 12) {
         this._stopSourceNode(true);
         this._startSourceAligned();
       }
@@ -316,10 +312,137 @@ class AudioEngine {
     }
   }
 
-  /* ==================== КЭШ И ДЕКОДИРОВАНИЕ ==================== */
+  /* ==================== ПРОГРЕССИВНЫЙ СТРИМИНГ (НАРЕЗКА И ПРИЁМ СЕГМЕНТОВ) ==================== */
+
+  /**
+   * На Хосте: быстро нарезает компактный WAV-сегмент (32 кГц, 16-бит стерео, ~128 КБ/сек)
+   * из уже декодированного AudioBuffer для мгновенного старта воспроизведения,
+   * пока основной файл ещё скачивается/кэшируется на телефоны!
+   */
+  encodeStreamSegmentWav(trackId, startSec = 0, durationSec = 5) {
+    const srcBuf = this.bufferCache.get(trackId);
+    if (!srcBuf) return null;
+
+    const clampedStart = Math.max(0, Math.min(startSec, Math.max(0, srcBuf.duration - 0.2)));
+    const actualDur = Math.min(durationSec, srcBuf.duration - clampedStart);
+    if (actualDur <= 0.15) return null;
+
+    const targetRate = Math.min(24000, srcBuf.sampleRate);
+    const outFrames = Math.floor(actualDur * targetRate);
+    const numCh = Math.min(2, srcBuf.numberOfChannels);
+    const ratio = srcBuf.sampleRate / targetRate;
+    const startSample = Math.floor(clampedStart * srcBuf.sampleRate);
+
+    const ch0 = srcBuf.getChannelData(0);
+    const ch1 = numCh > 1 ? srcBuf.getChannelData(1) : ch0;
+
+    const dataBytes = outFrames * 2 * 2; // Всегда 16-bit stereo
+    const wav = new ArrayBuffer(44 + dataBytes);
+    const dv = new DataView(wav);
+    const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+
+    writeStr(0, 'RIFF');
+    dv.setUint32(4, 36 + dataBytes, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    dv.setUint32(16, 16, true);
+    dv.setUint16(20, 1, true);
+    dv.setUint16(22, 2, true);
+    dv.setUint32(24, targetRate, true);
+    dv.setUint32(28, targetRate * 4, true);
+    dv.setUint16(32, 4, true);
+    dv.setUint16(34, 16, true);
+    writeStr(36, 'data');
+    dv.setUint32(40, dataBytes, true);
+
+    const maxIdx = ch0.length - 1;
+    let byteOff = 44;
+    for (let i = 0; i < outFrames; i++) {
+      const pos = startSample + i * ratio;
+      const idx = Math.min(maxIdx, pos | 0);
+      const frac = pos - idx;
+      const idx2 = Math.min(maxIdx, idx + 1);
+
+      const sL = ch0[idx] + (ch0[idx2] - ch0[idx]) * frac;
+      const sR = ch1[idx] + (ch1[idx2] - ch1[idx]) * frac;
+
+      dv.setInt16(byteOff, Math.max(-32768, Math.min(32767, (sL * 32767) | 0)), true);
+      dv.setInt16(byteOff + 2, Math.max(-32768, Math.min(32767, (sR * 32767) | 0)), true);
+      byteOff += 4;
+    }
+
+    return {
+      trackId,
+      startSec: clampedStart,
+      endSec: clampedStart + actualDur,
+      totalDuration: srcBuf.duration,
+      buffer: wav,
+    };
+  }
+
+  /**
+   * На Слушателе: декодирует полученный потоковый сегмент и делает его сразу доступным
+   * для воспроизведения, не дожидаясь 100% загрузки основного файла!
+   */
+  async addStreamSegment(trackId, startSec, totalDuration, wavArrayBuffer) {
+    if (!this.ctx) await this.unlock();
+    const copy = wavArrayBuffer.slice(0);
+    const decoded = await new Promise((resolve, reject) => {
+      const res = this.ctx.decodeAudioData(copy, resolve, reject);
+      if (res && typeof res.then === 'function') res.then(resolve).catch(reject);
+    });
+
+    const seg = {
+      startSec,
+      endSec: startSec + decoded.duration,
+      buffer: decoded,
+    };
+
+    if (!this.streamSegments.has(trackId)) {
+      this.streamSegments.set(trackId, []);
+    }
+    const list = this.streamSegments.get(trackId);
+    // Заменяем перекрывающийся дубликат или добавляем
+    const existingIdx = list.findIndex((s) => Math.abs(s.startSec - startSec) < 0.25);
+    if (existingIdx >= 0) list[existingIdx] = seg;
+    else list.push(seg);
+    list.sort((a, b) => a.startSec - b.startSec);
+
+    if (totalDuration > 0 && trackId === this.currentTrackId) {
+      this.currentTrackDuration = totalDuration;
+    }
+
+    // Если сейчас ждём продолжения потока во время воспроизведения — сразу подхватываем новый сегмент!
+    if (this.isPlaying && this.currentTrackId === trackId && !this.buffer && !this.source) {
+      this._startSourceAligned();
+    }
+
+    return seg;
+  }
 
   hasCachedTrack(trackId) {
     return this.bufferCache.has(trackId);
+  }
+
+  hasStreamOrCachedTrack(trackId) {
+    if (this.bufferCache.has(trackId)) return true;
+    const segs = this.streamSegments.get(trackId);
+    return Boolean(segs && segs.length > 0);
+  }
+
+  hasPlayableAudio() {
+    return Boolean(this.buffer || (this.currentTrackId && this.hasStreamOrCachedTrack(this.currentTrackId)));
+  }
+
+  _findSegmentForPosition(trackId, posSec) {
+    const segs = this.streamSegments.get(trackId);
+    if (!segs || segs.length === 0) return null;
+    for (const s of segs) {
+      if (posSec >= s.startSec - 0.05 && posSec < s.endSec - 0.05) {
+        return s;
+      }
+    }
+    return null;
   }
 
   _putCache(trackId, audioBuffer) {
@@ -338,18 +461,53 @@ class AudioEngine {
     if (this.bufferCache.has(trackId)) {
       return this.bufferCache.get(trackId);
     }
-    if (!this.ctx) {
-      await this.unlock();
-    }
+    if (!this.ctx) await this.unlock();
     const copy = arrayBuffer.slice(0);
     const decoded = await new Promise((resolve, reject) => {
       const res = this.ctx.decodeAudioData(copy, resolve, reject);
-      if (res && typeof res.then === 'function') {
-        res.then(resolve).catch(reject);
-      }
+      if (res && typeof res.then === 'function') res.then(resolve).catch(reject);
     });
     this._putCache(trackId, decoded);
+    // Очищаем временные потоковые сегменты для этого трека (полный буфер готов)
+    this.streamSegments.delete(trackId);
     return decoded;
+  }
+
+  /**
+   * Бесшовная подмена потокового сегмента на полный закэшированный AudioBuffer
+   * прямо во время воспроизведения (с микро-кроссфейдом 12 мс, без паузы и щелчка!).
+   */
+  promoteFullBuffer(trackId, decodedBuffer) {
+    this._putCache(trackId, decodedBuffer);
+    this.streamSegments.delete(trackId);
+
+    if (this.currentTrackId === trackId) {
+      const wasStreaming = this.isPlaying && this.playingFromSegment;
+      this.buffer = decodedBuffer;
+      this.currentTrackDuration = decodedBuffer.duration;
+      this.playingFromSegment = false;
+      this._requestedNextSegAt = -1;
+
+      if (wasStreaming) {
+        // Бесшовно переключаем активный AudioBufferSourceNode на полный файл!
+        this._stopSourceNode(true);
+        this._startSourceAligned();
+      }
+    }
+  }
+
+  /** Активация трека в режиме стриминга (до завершения загрузки полного файла) */
+  activateStreamTrack(trackId, totalDuration) {
+    if (this.currentTrackId === trackId && this.isPlaying) {
+      this.currentTrackDuration = totalDuration || this.currentTrackDuration;
+      return;
+    }
+    this.stopInternal();
+    this.currentTrackId = trackId;
+    this.buffer = this.bufferCache.get(trackId) || null;
+    this.currentTrackDuration = this.buffer ? this.buffer.duration : (totalDuration || 0);
+    this.pausedPosition = 0;
+    this._requestedNextSegAt = -1;
   }
 
   activateTrack(trackId) {
@@ -358,7 +516,10 @@ class AudioEngine {
     this.stopInternal();
     this.currentTrackId = trackId;
     this.buffer = buf;
+    this.currentTrackDuration = buf.duration;
+    this.playingFromSegment = false;
     this.pausedPosition = 0;
+    this._requestedNextSegAt = -1;
     return buf;
   }
 
@@ -534,23 +695,26 @@ class AudioEngine {
   }
 
   getDuration() {
-    return this.buffer ? this.buffer.duration : 0;
+    if (this.buffer) return this.buffer.duration;
+    return this.currentTrackDuration || 0;
   }
 
-  /* ==================== АКУСТИЧЕСКОЕ ПЛАНИРОВАНИЕ ==================== */
+  /* ==================== АКУСТИЧЕСКОЕ ПЛАНИРОВАНИЕ (ПОЛНЫЙ БУФЕР + ПОТОКОВЫЕ СЕГМЕНТЫ) ==================== */
 
   async schedulePlay({ hostStartTime, trackOffset, getHostTime }) {
-    if (!this.buffer) return;
+    if (!this.hasPlayableAudio()) return;
     await this.ensureResumed();
     this.measureSystemLatency(false);
 
     this._stopSourceNode(true);
 
     this.hostStartTime = hostStartTime;
-    this.startTrackOffset = Math.max(0, Math.min(trackOffset, this.buffer.duration));
+    const dur = this.getDuration();
+    this.startTrackOffset = Math.max(0, dur > 0 ? Math.min(trackOffset, dur) : trackOffset);
     this._getHostTimeFn = getHostTime;
     this.isPlaying = true;
     this.lastDriftMs = 0;
+    this._requestedNextSegAt = -1;
 
     this._startSourceAligned();
     this._startDriftMonitor();
@@ -558,7 +722,7 @@ class AudioEngine {
   }
 
   _startSourceAligned() {
-    if (!this.buffer || !this.ctx || !this._getHostTimeFn) return;
+    if (!this.ctx || !this._getHostTimeFn) return;
 
     const hostNow = this._getHostTimeFn();
     const audioNow = this.ctx.currentTime;
@@ -575,21 +739,44 @@ class AudioEngine {
       offsetInTrack = Math.max(0, this.startTrackOffset);
       this.isScheduled = true;
     } else {
-      // Поздний вход (Late Join) или мгновенный ресинк
       const lookahead = 0.025;
       whenAudioTime = audioNow + lookahead;
       offsetInTrack = Math.max(0, this.startTrackOffset + -delaySec + lookahead);
       this.isScheduled = false;
     }
 
-    if (offsetInTrack >= this.buffer.duration) {
-      this.pause(this.buffer.duration);
+    const totalDur = this.getDuration();
+    if (totalDur > 0 && offsetInTrack >= totalDur) {
+      this.pause(totalDur);
       this.onEnded();
       return;
     }
 
+    // Выбираем источник: либо полный AudioBuffer, либо потоковый сегмент!
+    let targetBuffer = this.buffer;
+    let bufferLocalOffset = offsetInTrack;
+    let usingSegment = false;
+    let segEndSec = totalDur;
+
+    if (!targetBuffer && this.currentTrackId) {
+      const seg = this._findSegmentForPosition(this.currentTrackId, offsetInTrack);
+      if (!seg) {
+        // Сегмент для этой позиции ещё в пути — запрашиваем его у Хоста!
+        this.playingFromSegment = true;
+        this.activeSegmentEndSec = 0;
+        this._requestNextSegmentIfNeeded(offsetInTrack);
+        return;
+      }
+      targetBuffer = seg.buffer;
+      bufferLocalOffset = Math.max(0, offsetInTrack - seg.startSec);
+      usingSegment = true;
+      segEndSec = seg.endSec;
+    }
+
+    if (!targetBuffer) return;
+
     const src = this.ctx.createBufferSource();
-    src.buffer = this.buffer;
+    src.buffer = targetBuffer;
     src.playbackRate.value = 1.0;
 
     const gain = this.ctx.createGain();
@@ -601,25 +788,52 @@ class AudioEngine {
 
     src.onended = () => {
       if (this.source !== src) return;
-      if (this.isPlaying && this.getCurrentPosition() >= this.buffer.duration - 0.18) {
+      this.source = null;
+      this.sourceGain = null;
+
+      if (!this.isPlaying) return;
+
+      if (usingSegment && totalDur > 0 && segEndSec < totalDur - 0.2) {
+        // Сегмент закончился — бесшовно переходим на следующий сегмент или полный буфер!
+        this._startSourceAligned();
+        return;
+      }
+
+      if (totalDur > 0 && this.getCurrentPosition() >= totalDur - 0.2) {
         this.pause(0);
         this.onEnded();
       }
     };
 
-    src.start(whenAudioTime, offsetInTrack);
+    src.start(whenAudioTime, bufferLocalOffset);
 
     this.source = src;
     this.sourceGain = gain;
+    this.playingFromSegment = usingSegment;
+    this.activeSegmentEndSec = segEndSec;
     this.anchorAudioTime = whenAudioTime;
     this.anchorTrackPos = offsetInTrack;
     this.currentRate = 1.0;
   }
 
+  _requestNextSegmentIfNeeded(fromSec) {
+    if (!this.currentTrackId || this.buffer) return;
+    const totalDur = this.getDuration();
+    if (totalDur > 0 && fromSec >= totalDur - 0.25) return;
+
+    // Уже есть сегмент на эту позицию?
+    if (this._findSegmentForPosition(this.currentTrackId, fromSec + 0.1)) return;
+
+    const bucket = Math.floor(fromSec);
+    if (Math.abs(bucket - this._requestedNextSegAt) < 2) return;
+    this._requestedNextSegAt = bucket;
+    this.onNeedNextSegment({ trackId: this.currentTrackId, fromSec: Math.max(0, fromSec) });
+  }
+
   pause(explicitPos = null) {
     const pos = explicitPos !== null ? explicitPos : this.getCurrentPosition();
     this.stopInternal();
-    this.pausedPosition = Math.max(0, Math.min(pos, this.getDuration()));
+    this.pausedPosition = Math.max(0, this.getDuration() > 0 ? Math.min(pos, this.getDuration()) : pos);
     this.onStateChange({ playing: false, scheduled: false });
   }
 
@@ -628,6 +842,7 @@ class AudioEngine {
     this._stopSourceNode(true);
     this.isPlaying = false;
     this.isScheduled = false;
+    this.playingFromSegment = false;
     this.lastDriftMs = 0;
   }
 
@@ -653,7 +868,7 @@ class AudioEngine {
   }
 
   getCurrentPosition() {
-    if (!this.buffer) return 0;
+    if (!this.hasPlayableAudio()) return 0;
     if (!this.isPlaying || !this.ctx) return this.pausedPosition;
 
     const audioNow = this.ctx.currentTime;
@@ -662,15 +877,19 @@ class AudioEngine {
     }
 
     const elapsed = (audioNow - this.anchorAudioTime) * this.currentRate;
-    return Math.max(0, Math.min(this.anchorTrackPos + elapsed, this.buffer.duration));
+    const dur = this.getDuration();
+    const pos = this.anchorTrackPos + elapsed;
+    return Math.max(0, dur > 0 ? Math.min(pos, dur) : pos);
   }
 
   getAcousticPosition() {
-    if (!this.buffer) return 0;
+    if (!this.hasPlayableAudio()) return 0;
     if (!this.isPlaying || !this._getHostTimeFn) return this.pausedPosition;
     const hostNow = this._getHostTimeFn();
     if (hostNow < this.hostStartTime) return this.startTrackOffset;
-    return Math.max(0, Math.min(this.startTrackOffset + (hostNow - this.hostStartTime) / 1000, this.buffer.duration));
+    const dur = this.getDuration();
+    const pos = this.startTrackOffset + (hostNow - this.hostStartTime) / 1000;
+    return Math.max(0, dur > 0 ? Math.min(pos, dur) : pos);
   }
 
   getCountdownSec() {
@@ -703,7 +922,7 @@ class AudioEngine {
 
   _startDriftMonitor() {
     this._stopDriftMonitor();
-    this._driftTimer = setInterval(() => this.checkDrift(), 600);
+    this._driftTimer = setInterval(() => this.checkDrift(), 550);
   }
 
   _stopDriftMonitor() {
@@ -714,7 +933,17 @@ class AudioEngine {
   }
 
   checkDrift() {
-    if (!this.isPlaying || !this.ctx || !this.source || !this._getHostTimeFn) return;
+    if (!this.isPlaying || !this.ctx || !this._getHostTimeFn) return;
+
+    // Если играем из потокового сегмента и до его конца осталось < 3 сек — заранее запрашиваем следующий сегмент!
+    if (this.playingFromSegment && !this.buffer && this.activeSegmentEndSec > 0) {
+      const curPos = this.getCurrentPosition();
+      if (this.activeSegmentEndSec - curPos < 3.2) {
+        this._requestNextSegmentIfNeeded(Math.max(0, this.activeSegmentEndSec - 0.15));
+      }
+    }
+
+    if (!this.source) return;
 
     if (this.ctx.currentTime < this.anchorAudioTime + 0.05) {
       this.lastDriftMs = 0;

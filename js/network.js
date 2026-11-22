@@ -1,12 +1,20 @@
 /**
- * NetworkManager v2.1 — Нативный многоканальный WebRTC + WSS Relay Fallback
- * с живыми процентами загрузки для каждого устройства и бесшовным Late Join во время игры.
+ * NetworkManager v2.2 — Мгновенная синхронизация + прогрессивный стриминг аудио
+ * во время фонового кэширования + надёжный многоканальный WebRTC / WSS Relay.
+ *
+ * Исправлено в v2.2:
+ * - Не сбрасывает NTP-пинги, если канал orpheus-ntp ещё открывается (мгновенный fallback на orpheus-ctrl).
+ * - Ожидает готовности бинарного канала orpheus-data перед передачей файлов (не отменяет загрузку молча!).
+ * - Прогрессивный стриминг: для файлов > 700 КБ первым делом отправляется лёгкий стартовый
+ *   сегмент (~6 сек, < 0.5 сек передачи), чтобы музыка заиграла СРАЗУ, пока полный файл
+ *   продолжает кэшироваться с отображением процентов 0%..100% на главном устройстве.
  */
 class NetworkManager {
   static CHUNK_SIZE = 16000;
-  static MAX_BUFFERED_AMOUNT = 128 * 1024;
-  static ICE_GATHER_WAIT_MS = 2400;
-  static P2P_TIMEOUT_MS = 10000;
+  static MAX_BUFFERED_AMOUNT = 512 * 1024; // 512 КБ окно буфера — высокая скорость передачи по Wi-Fi P2P
+  static STREAM_THRESHOLD_BYTES = 600 * 1024; // Файлы > 600 КБ стартуют мгновенно через потоковый сегмент!
+  static ICE_GATHER_WAIT_MS = 1600;
+  static P2P_TIMEOUT_MS = 7000;
   static NTFY_BASE = 'https://ntfy.sh';
   static NTFY_WS_BASE = 'wss://ntfy.sh';
 
@@ -61,7 +69,8 @@ class NetworkManager {
     this._listenerConnected = false;
     this._listenerPendingIce = [];
 
-    this.incomingFiles = new Map();
+    this.incomingTransfers = new Map(); // transferHash -> { kind: 'file'|'seg', ... }
+    this.earlyChunks = new Map();       // transferHash -> Map(index -> Uint8Array) если бинарный пакет опередил META
   }
 
   static generatePeerId() {
@@ -91,9 +100,9 @@ class NetworkManager {
     return c.length > 3 ? `${c.slice(0, 3)}-${c.slice(3)}` : c;
   }
 
-  static hashTrackId(trackId) {
+  static hashKey(key) {
     let h = 2166136261;
-    const s = String(trackId);
+    const s = String(key);
     for (let i = 0; i < s.length; i++) {
       h ^= s.charCodeAt(i);
       h = Math.imul(h, 16777619);
@@ -173,7 +182,7 @@ class NetworkManager {
 
           ws.onclose = () => {
             if (this._sigAlive && this._sigWs === ws) {
-              this._sigReconnectTimer = setTimeout(connectWs, 1800);
+              this._sigReconnectTimer = setTimeout(connectWs, 1500);
             }
           };
 
@@ -206,24 +215,28 @@ class NetworkManager {
     }
   }
 
-  async _sendSignal(payload) {
+  async _sendSignal(payload, attempt = 0) {
     if (!this._sigTopic) return;
     const msg = {
       ...payload,
       from: this.selfId,
-      mid: `${this.selfId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      mid: payload.mid || `${this.selfId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     };
     this._seenMsgIds.add(msg.mid);
 
-    if (this._bc) {
+    if (this._bc && attempt === 0) {
       try { this._bc.postMessage(msg); } catch (_) {}
     }
 
     try {
-      await fetch(`${NetworkManager.NTFY_BASE}/${this._sigTopic}`, {
+      const resp = await fetch(`${NetworkManager.NTFY_BASE}/${this._sigTopic}`, {
         method: 'POST',
         body: JSON.stringify(msg),
       });
+      if (resp.status === 429 && attempt < 2) {
+        await new Promise((r) => setTimeout(r, 450 + attempt * 500));
+        return this._sendSignal(msg, attempt + 1);
+      }
     } catch (err) {
       console.warn('[Network] Signal POST error:', err);
     }
@@ -329,6 +342,8 @@ class NetworkManager {
       phase: 'connecting',
       progress: 0,
       readyTracks: new Set(),
+      streamReadyTracks: new Set(),
+      urgentSegments: [], // Приоритетные потоковые сегменты (вставляются поверх фонового кэша!)
       transferQueue: [],
       isSendingFile: false,
       latency: { totalLatencyMs: 0, systemLatencyMs: 0, isBluetooth: false, outputDeviceLabel: '' },
@@ -358,7 +373,7 @@ class NetworkManager {
                 lateCandidates = [];
                 this._sendSignal({ sig: 'ICE_BATCH', to: peerId, candidates: batch });
               }
-            }, 300);
+            }, 250);
           }
         }
       }
@@ -389,6 +404,9 @@ class NetworkManager {
             });
             this._emitPeers();
             this._hostSyncNewClient(client);
+          } else if (ch.label === 'orpheus-data' && !client.isSendingFile && client.transferQueue.length > 0) {
+            // Если data-канал открылся на пару миллисекунд позже ctrl — сразу запускаем очередь!
+            this._processClientTransferQueue(client);
           }
         }
       };
@@ -466,21 +484,18 @@ class NetworkManager {
   }
 
   _hostSyncNewClient(client) {
-    // 1. Текущее глобальное выравнивание задержек (в т.ч. Bluetooth)
     this._recomputeRoomLatency();
     this._sendToClient(client, 'ctrl', {
       type: 'ROOM_LATENCY',
       ...this.roomLatencyState,
     });
 
-    // 2. Плейлист
     this._sendToClient(client, 'ctrl', {
       type: 'PLAYLIST_STATE',
       activeTrackId: this.activeTrackId,
       tracks: this._serializePlaylistMeta(),
     });
 
-    // 3. Активный трек + предзагрузка следующего
     if (this.activeTrackId) {
       const active = this.playlist.find((t) => t.id === this.activeTrackId);
       if (active) {
@@ -544,8 +559,6 @@ class NetworkManager {
         this._recomputeRoomLatency();
         const newMax = this.roomLatencyState.roomMaxLatencyMs;
 
-        // Если во время предстартового отсчёта подключилось устройство с большей BT-задержкой,
-        // сдвигаем T_acoustic чуть вперёд, чтобы все (включая нового BT-слушателя) стартовали с 0:00 ровно!
         if (
           this.playbackState.playing &&
           newMax > prevMax &&
@@ -573,22 +586,64 @@ class NetworkManager {
         if (msg.trackId === this.activeTrackId) {
           const p = Math.max(0, Math.min(99, Math.round(msg.progress || 0)));
           client.progress = Math.max(client.progress, p);
-          client.phase = msg.phase === 'decoding' ? 'decoding' : 'loading';
-          client.status = msg.phase === 'decoding' ? `Декодирование ${client.progress}%` : `Загрузка ${client.progress}%`;
+          const streaming = client.streamReadyTracks.has(msg.trackId);
+          client.phase = msg.phase === 'decoding' ? 'decoding' : streaming ? 'streaming' : 'loading';
+          client.status =
+            msg.phase === 'decoding'
+              ? `Обработка ${client.progress}%`
+              : streaming
+              ? `Играет · кэш ${client.progress}%`
+              : `Загрузка ${client.progress}%`;
           this._emitPeers();
+        }
+        break;
+      }
+
+      case 'TRACK_STREAM_READY': {
+        // Слушатель получил стартовый потоковый сегмент — можно СРАЗУ запускать звук,
+        // не дожидаясь 100% скачивания полного файла!
+        client.streamReadyTracks.add(msg.trackId);
+        if (msg.trackId === this.activeTrackId && !client.readyTracks.has(msg.trackId)) {
+          client.phase = 'streaming';
+          client.progress = Math.max(client.progress, 12);
+          client.status = `Поток · кэш ${client.progress}%`;
+          this._emitPeers();
+
+          if (this.playbackState.playing && this.playbackState.trackId === msg.trackId) {
+            this._sendToClient(client, 'ctrl', {
+              type: 'CMD_PLAY',
+              trackId: this.playbackState.trackId,
+              hostStartTime: this.playbackState.hostStartTime,
+              trackOffset: this.playbackState.trackOffset,
+              roomMaxLatencyMs: this.roomLatencyState.roomMaxLatencyMs,
+              isLateJoin: true,
+            });
+          }
+        }
+        break;
+      }
+
+      case 'NEED_STREAM_SEG': {
+        // Слушателю нужен следующий потоковый сегмент, пока полный файл ещё докачивается
+        if (msg.trackId && typeof msg.fromSec === 'number' && !client.readyTracks.has(msg.trackId)) {
+          client.urgentSegments.push({ trackId: msg.trackId, fromSec: msg.fromSec, durationSec: 8 });
+          if (!client.isSendingFile) {
+            this._processClientTransferQueue(client);
+          }
         }
         break;
       }
 
       case 'TRACK_READY': {
         client.readyTracks.add(msg.trackId);
+        client.streamReadyTracks.add(msg.trackId);
         if (msg.trackId === this.activeTrackId) {
           client.progress = 100;
           client.phase = 'ready';
           client.status = 'Готово';
           this._emitPeers();
 
-          // Late Join: если Хост прямо сейчас играет этот трек — синхронизируем нового слушателя!
+          // Если ещё не отправили CMD_PLAY на этапе STREAM_READY — отправляем сейчас
           if (this.playbackState.playing && this.playbackState.trackId === msg.trackId) {
             this._sendToClient(client, 'ctrl', {
               type: 'CMD_PLAY',
@@ -672,7 +727,7 @@ class NetworkManager {
     }
   }
 
-  /* ==================== ПЛЕЙЛИСТ И ПЕРЕДАЧА ==================== */
+  /* ==================== ПЛЕЙЛИСТ И ПРОГРЕССИВНАЯ ПЕРЕДАЧА ==================== */
 
   _serializePlaylistMeta() {
     return this.playlist.map((t) => ({
@@ -769,7 +824,12 @@ class NetworkManager {
     client.isSendingFile = true;
 
     try {
-      while (client.open && client.transferQueue.length > 0) {
+      while (client.open && (client.urgentSegments.length > 0 || client.transferQueue.length > 0)) {
+        if (client.urgentSegments.length > 0) {
+          const req = client.urgentSegments.shift();
+          await this._sendStreamSegmentToClient(client, req.trackId, req.fromSec, req.durationSec);
+          continue;
+        }
         const { track } = client.transferQueue.shift();
         if (client.readyTracks.has(track.id)) continue;
         await this._sendTrackToClient(client, track);
@@ -779,15 +839,81 @@ class NetworkManager {
     }
   }
 
+  async _waitChannelOpen(client, chName, timeoutMs = 4500) {
+    const start = Date.now();
+    while (client.open && client.transport !== 'relay') {
+      const ch = client.channels[chName];
+      if (ch && ch.readyState === 'open') return ch;
+      if (Date.now() - start > timeoutMs) return null;
+      await new Promise((r) => setTimeout(r, 35));
+    }
+    return null;
+  }
+
+  async _sendStreamSegmentToClient(client, trackId, fromSec, durationSec = 7) {
+    if (!client.open || client.transport === 'relay' || !this.cb.onBuildStreamSegment) return false;
+    const dataCh = await this._waitChannelOpen(client, 'data', 4000);
+    if (!dataCh) return false;
+
+    const seg = this.cb.onBuildStreamSegment(trackId, fromSec, durationSec);
+    if (!seg || !seg.buffer) return false;
+
+    const track = this.playlist.find((t) => t.id === trackId);
+    const totalBytes = seg.buffer.byteLength;
+    const chunkSize = NetworkManager.CHUNK_SIZE;
+    const totalChunks = Math.ceil(totalBytes / chunkSize);
+    const segKey = `seg:${trackId}:${Math.round(seg.startSec * 10)}`;
+    const transferHash = NetworkManager.hashKey(segKey);
+
+    this._sendToClient(client, 'ctrl', {
+      type: 'STREAM_SEG_META',
+      trackId,
+      name: track?.name || 'Аудио',
+      transferHash,
+      startSec: seg.startSec,
+      endSec: seg.endSec,
+      totalDuration: seg.totalDuration,
+      totalBytes,
+      totalChunks,
+    });
+
+    await new Promise((r) => setTimeout(r, 12));
+
+    const rawBytes = new Uint8Array(seg.buffer);
+    for (let i = 0; i < totalChunks; i++) {
+      if (!client.open || dataCh.readyState !== 'open') return false;
+      if (dataCh.bufferedAmount > NetworkManager.MAX_BUFFERED_AMOUNT) {
+        await this._waitForDrain(dataCh);
+        if (!client.open || dataCh.readyState !== 'open') return false;
+      }
+
+      const start = i * chunkSize;
+      const end = Math.min(start + chunkSize, totalBytes);
+      const packet = new ArrayBuffer(12 + (end - start));
+      const view = new DataView(packet);
+      view.setUint32(0, transferHash, false);
+      view.setUint32(4, i, false);
+      view.setUint32(8, totalChunks, false);
+      new Uint8Array(packet, 12).set(rawBytes.subarray(start, end));
+
+      try {
+        dataCh.send(packet);
+      } catch (_) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   async _sendTrackToClient(client, track) {
     if (!client.open) return;
     const isActive = track.id === this.activeTrackId;
 
     if (track.type === 'demo' || track.type === 'pulse') {
       if (isActive) {
-        client.progress = 20;
+        client.progress = 25;
         client.phase = 'loading';
-        client.status = 'Подготовка 20%';
+        client.status = 'Подготовка 25%';
         this._emitPeers();
       }
       this._sendToClient(client, 'ctrl', {
@@ -823,25 +949,48 @@ class NetworkManager {
         return;
       }
 
-      const dataCh = client.channels.data;
-      if (!dataCh || dataCh.readyState !== 'open') return;
+      // Ждём открытия бинарного канала orpheus-data (устраняет зависание при раннем старте!)
+      const dataCh = await this._waitChannelOpen(client, 'data', 5000);
+      if (!dataCh) return;
 
       const totalBytes = track.buffer.byteLength;
+
+      // ПРОГРЕССИВНЫЙ СТРИМИНГ: для активного файла > 700 КБ СНАЧАЛА шлём 6-секундный стартовый сегмент
+      // с текущей позиции воспроизведения, чтобы музыка заиграла СРАЗУ во время кэширования полного файла!
+      if (isActive && totalBytes > NetworkManager.STREAM_THRESHOLD_BYTES && this.cb.onBuildStreamSegment) {
+        let startSec = 0;
+        if (this.playbackState.playing && this.playbackState.trackId === track.id) {
+          const elapsed = Math.max(0, (performance.now() - this.playbackState.hostStartTime) / 1000);
+          startSec = Math.max(0, Math.floor(this.playbackState.trackOffset + elapsed + 0.7));
+        } else {
+          startSec = Math.max(0, Math.floor(this.playbackState.trackOffset || 0));
+        }
+
+        client.progress = 5;
+        client.phase = 'loading';
+        client.status = 'Буфер потока...';
+        this._emitPeers();
+
+        await this._sendStreamSegmentToClient(client, track.id, startSec, 5);
+        if (!client.open || dataCh.readyState !== 'open') return;
+      }
+
+      // Далее передаём ПОЛНЫЙ оригинальный файл в фоне для 100% кэша!
       const chunkSize = NetworkManager.CHUNK_SIZE;
       const totalChunks = Math.ceil(totalBytes / chunkSize);
-      const trackHash = NetworkManager.hashTrackId(track.id);
+      const transferHash = NetworkManager.hashKey(`file:${track.id}`);
 
-      if (isActive) {
-        client.progress = 0;
+      if (isActive && !client.streamReadyTracks.has(track.id)) {
+        client.progress = Math.max(client.progress, 10);
         client.phase = 'loading';
-        client.status = 'Загрузка 0%';
+        client.status = `Загрузка ${client.progress}%`;
         this._emitPeers();
       }
 
       this._sendToClient(client, 'ctrl', {
         type: 'FILE_META',
         trackId: track.id,
-        trackHash,
+        transferHash,
         name: track.name,
         mime: track.mime || 'audio/mpeg',
         totalBytes,
@@ -849,13 +998,20 @@ class NetworkManager {
         isActive,
       });
 
-      await new Promise((r) => setTimeout(r, 20));
+      await new Promise((r) => setTimeout(r, 15));
 
       const rawBytes = new Uint8Array(track.buffer);
       let lastUiPct = -1;
 
       for (let i = 0; i < totalChunks; i++) {
         if (!client.open || dataCh.readyState !== 'open') return;
+
+        // Если слушателю срочно нужен следующий потоковый сегмент — вставляем его вне очереди!
+        if (client.urgentSegments.length > 0) {
+          const req = client.urgentSegments.shift();
+          await this._sendStreamSegmentToClient(client, req.trackId, req.fromSec, req.durationSec);
+          if (!client.open || dataCh.readyState !== 'open') return;
+        }
 
         if (!isActive && client.transferQueue.some((q) => q.highPriority)) {
           client.transferQueue.push({ track, highPriority: false });
@@ -869,11 +1025,9 @@ class NetworkManager {
 
         const start = i * chunkSize;
         const end = Math.min(start + chunkSize, totalBytes);
-        const payloadLen = end - start;
-
-        const packet = new ArrayBuffer(12 + payloadLen);
+        const packet = new ArrayBuffer(12 + (end - start));
         const view = new DataView(packet);
-        view.setUint32(0, trackHash, false);
+        view.setUint32(0, transferHash, false);
         view.setUint32(4, i, false);
         view.setUint32(8, totalChunks, false);
         new Uint8Array(packet, 12).set(rawBytes.subarray(start, end));
@@ -886,13 +1040,19 @@ class NetworkManager {
         }
 
         if (isActive) {
-          // 0..92% на передачу, 95% на декодирование, 100% на TRACK_READY
-          const pct = Math.round(((i + 1) / totalChunks) * 92);
+          const baseOffset = totalBytes > NetworkManager.STREAM_THRESHOLD_BYTES ? 12 : 0;
+          const pct = Math.min(94, baseOffset + Math.round(((i + 1) / totalChunks) * (94 - baseOffset)));
           if (pct !== lastUiPct && (pct - lastUiPct >= 2 || i === totalChunks - 1)) {
             lastUiPct = pct;
             client.progress = Math.max(client.progress, pct);
-            client.phase = i === totalChunks - 1 ? 'decoding' : 'loading';
-            client.status = i === totalChunks - 1 ? 'Декодирование 95%' : `Загрузка ${client.progress}%`;
+            const streaming = client.streamReadyTracks.has(track.id);
+            client.phase = i === totalChunks - 1 ? 'decoding' : streaming ? 'streaming' : 'loading';
+            client.status =
+              i === totalChunks - 1
+                ? 'Обработка 95%'
+                : streaming
+                ? `Играет · кэш ${client.progress}%`
+                : `Загрузка ${client.progress}%`;
             this._emitPeers();
           }
         } else if (i % 10 === 0) {
@@ -921,7 +1081,7 @@ class NetworkManager {
 
     try {
       if (!track._relayUrl) {
-        const fileTopic = `${this._sigTopic}-f-${NetworkManager.hashTrackId(track.id)}`;
+        const fileTopic = `${this._sigTopic}-f-${NetworkManager.hashKey(track.id)}`;
         const resp = await fetch(`${NetworkManager.NTFY_BASE}/${fileTopic}`, {
           method: 'PUT',
           headers: { Filename: encodeURIComponent(track.name || 'track.mp3') },
@@ -1005,10 +1165,9 @@ class NetworkManager {
       this._sendSignal({ sig: 'RELAY_MSG', to: client.id, payload });
       return;
     }
-    const ch =
-      channelName === 'ntp'
-        ? client.channels.ntp || client.channels.ctrl
-        : client.channels[channelName] || client.channels.ctrl;
+    // Проверяем readyState === 'open' (если ntp ещё не открылся — шлём через ctrl без потери пакетов!)
+    const preferred = client.channels[channelName];
+    const ch = preferred && preferred.readyState === 'open' ? preferred : client.channels.ctrl;
     if (ch && ch.readyState === 'open') {
       try {
         ch.send(JSON.stringify(payload));
@@ -1038,6 +1197,7 @@ class NetworkManager {
       transport: c.transport,
       transportLabel: c.transportLabel,
       ready: c.phase === 'ready',
+      streaming: c.phase === 'streaming',
       latencyMs: c.latency?.totalLatencyMs || 0,
       isBluetooth: Boolean(c.latency?.isBluetooth),
       outputDeviceLabel: c.latency?.outputDeviceLabel || '',
@@ -1097,7 +1257,7 @@ class NetworkManager {
                   lateCandidates = [];
                   this._sendSignal({ sig: 'ICE_BATCH', to: this.hostPeerId, candidates: batch });
                 }
-              }, 300);
+              }, 250);
             }
           }
         }
@@ -1131,7 +1291,12 @@ class NetworkManager {
       };
 
       ctrlCh.onopen = onDataChannelReady;
-      ntpCh.onopen = onDataChannelReady;
+      ntpCh.onopen = () => {
+        onDataChannelReady();
+        if (this._listenerConnected && this.cb.onNtpChannelReady) {
+          this.cb.onNtpChannelReady();
+        }
+      };
 
       ntpCh.onmessage = (ev) => {
         if (this.hostPc !== pc) return;
@@ -1201,7 +1366,7 @@ class NetworkManager {
       };
 
       sendJoinReq();
-      const retryReqTimer = setTimeout(sendJoinReq, 3000);
+      const retryReqTimer = setTimeout(sendJoinReq, 2800);
 
       this._listenerJoinTimer = setTimeout(() => {
         clearTimeout(retryReqTimer);
@@ -1303,10 +1468,9 @@ class NetworkManager {
       }
       return;
     }
-    const ch =
-      channelName === 'ntp'
-        ? this.hostChannels.ntp || this.hostChannels.ctrl
-        : this.hostChannels[channelName] || this.hostChannels.ctrl;
+    // Проверяем readyState === 'open' (если ntp ещё не открылся — надёжно отправляем через ctrl!)
+    const preferred = this.hostChannels[channelName];
+    const ch = preferred && preferred.readyState === 'open' ? preferred : this.hostChannels.ctrl;
     if (ch && ch.readyState === 'open') {
       try {
         ch.send(JSON.stringify(payload));
@@ -1346,10 +1510,30 @@ class NetworkManager {
         if (this.cb.onTrackUrl) this.cb.onTrackUrl(msg);
         break;
 
-      case 'FILE_META': {
-        const state = {
+      case 'STREAM_SEG_META': {
+        this.incomingTransfers.set(msg.transferHash, {
+          kind: 'seg',
           trackId: msg.trackId,
-          trackHash: msg.trackHash,
+          name: msg.name,
+          transferHash: msg.transferHash,
+          startSec: msg.startSec,
+          endSec: msg.endSec,
+          totalDuration: msg.totalDuration,
+          totalBytes: msg.totalBytes,
+          totalChunks: msg.totalChunks,
+          chunks: new Array(msg.totalChunks),
+          receivedCount: 0,
+        });
+        this._drainEarlyChunks(msg.transferHash);
+        break;
+      }
+
+      case 'FILE_META': {
+        const hash = msg.transferHash ?? msg.trackHash;
+        const state = {
+          kind: 'file',
+          trackId: msg.trackId,
+          transferHash: hash,
           name: msg.name,
           mime: msg.mime,
           totalBytes: msg.totalBytes,
@@ -1359,10 +1543,11 @@ class NetworkManager {
           receivedCount: 0,
           lastReportedPct: -1,
         };
-        this.incomingFiles.set(msg.trackHash, state);
+        this.incomingTransfers.set(hash, state);
         if (state.isActive && this.cb.onFileProgress) {
           this.cb.onFileProgress({ trackId: msg.trackId, name: msg.name, pct: 0, isActive: true });
         }
+        this._drainEarlyChunks(hash);
         break;
       }
 
@@ -1380,48 +1565,86 @@ class NetworkManager {
     }
   }
 
+  _drainEarlyChunks(transferHash) {
+    const early = this.earlyChunks.get(transferHash);
+    if (!early) return;
+    this.earlyChunks.delete(transferHash);
+    for (const [index, bytes] of early.entries()) {
+      this._applyBinaryChunk(transferHash, index, bytes);
+    }
+  }
+
   _listenerHandleBinaryChunk(arrayBuffer) {
     if (arrayBuffer.byteLength < 12) return;
     const view = new DataView(arrayBuffer);
-    const trackHash = view.getUint32(0, false);
+    const transferHash = view.getUint32(0, false);
     const index = view.getUint32(4, false);
-
-    const f = this.incomingFiles.get(trackHash);
-    if (!f || index >= f.totalChunks) return;
-
     const bytes = new Uint8Array(arrayBuffer, 12);
-    if (!f.chunks[index]) {
-      f.chunks[index] = bytes;
-      f.receivedCount++;
+
+    if (!this.incomingTransfers.has(transferHash)) {
+      if (!this.earlyChunks.has(transferHash)) {
+        this.earlyChunks.set(transferHash, new Map());
+      }
+      this.earlyChunks.get(transferHash).set(index, bytes);
+      return;
     }
 
-    const pct = Math.round((f.receivedCount / f.totalChunks) * 94);
-    if (pct !== f.lastReportedPct && (pct - f.lastReportedPct >= 3 || f.receivedCount === f.totalChunks)) {
-      f.lastReportedPct = pct;
-      if (f.isActive && this.cb.onFileProgress) {
-        this.cb.onFileProgress({ trackId: f.trackId, name: f.name, pct, isActive: true });
-      }
-      if (f.isActive) {
-        this.sendToHost({ type: 'TRACK_PROGRESS', trackId: f.trackId, progress: pct, phase: 'loading' });
+    this._applyBinaryChunk(transferHash, index, bytes);
+  }
+
+  _applyBinaryChunk(transferHash, index, bytes) {
+    const t = this.incomingTransfers.get(transferHash);
+    if (!t || index >= t.totalChunks) return;
+
+    if (!t.chunks[index]) {
+      t.chunks[index] = bytes;
+      t.receivedCount++;
+    }
+
+    if (t.kind === 'file') {
+      const pct = Math.round((t.receivedCount / t.totalChunks) * 94);
+      if (pct !== t.lastReportedPct && (pct - t.lastReportedPct >= 3 || t.receivedCount === t.totalChunks)) {
+        t.lastReportedPct = pct;
+        if (t.isActive && this.cb.onFileProgress) {
+          this.cb.onFileProgress({ trackId: t.trackId, name: t.name, pct, isActive: true });
+        }
+        if (t.isActive) {
+          this.sendToHost({ type: 'TRACK_PROGRESS', trackId: t.trackId, progress: pct, phase: 'loading' });
+        }
       }
     }
 
-    if (f.receivedCount === f.totalChunks) {
-      const merged = new Uint8Array(f.totalBytes);
+    if (t.receivedCount === t.totalChunks) {
+      const merged = new Uint8Array(t.totalBytes);
       let offset = 0;
-      for (let i = 0; i < f.totalChunks; i++) {
-        merged.set(f.chunks[i], offset);
-        offset += f.chunks[i].byteLength;
+      for (let i = 0; i < t.totalChunks; i++) {
+        merged.set(t.chunks[i], offset);
+        offset += t.chunks[i].byteLength;
       }
-      const completed = {
-        trackId: f.trackId,
-        name: f.name,
-        mime: f.mime,
-        isActive: f.isActive,
-        buffer: merged.buffer,
-      };
-      this.incomingFiles.delete(trackHash);
-      if (this.cb.onFileComplete) this.cb.onFileComplete(completed);
+      this.incomingTransfers.delete(transferHash);
+
+      if (t.kind === 'seg') {
+        if (this.cb.onStreamSegmentComplete) {
+          this.cb.onStreamSegmentComplete({
+            trackId: t.trackId,
+            name: t.name,
+            startSec: t.startSec,
+            endSec: t.endSec,
+            totalDuration: t.totalDuration,
+            buffer: merged.buffer,
+          });
+        }
+      } else {
+        if (this.cb.onFileComplete) {
+          this.cb.onFileComplete({
+            trackId: t.trackId,
+            name: t.name,
+            mime: t.mime,
+            isActive: t.isActive,
+            buffer: merged.buffer,
+          });
+        }
+      }
     }
   }
 
@@ -1453,7 +1676,7 @@ class NetworkManager {
           return;
         }
         if (ev.candidate.candidate && ev.candidate.candidate.includes('typ srflx') && !earlyTimer) {
-          earlyTimer = setTimeout(done, 250);
+          earlyTimer = setTimeout(done, 120);
         }
       };
       pc.addEventListener('icegatheringstatechange', onState);
@@ -1510,7 +1733,8 @@ class NetworkManager {
     this.hostPeerId = null;
 
     this._closeSignaling();
-    this.incomingFiles.clear();
+    this.incomingTransfers.clear();
+    this.earlyChunks.clear();
     this.playlist = [];
     this.activeTrackId = null;
     this.role = null;

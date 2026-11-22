@@ -61,9 +61,10 @@ class ClockSync {
       }
       this.intervalId = setInterval(() => this._firePing(), 5000);
     } else {
-      // Быстрая серия из 12 пингов (1.1 сек) для субмиллисекундного захвата по LAN/P2P
-      for (let i = 0; i < 12; i++) {
-        const id = setTimeout(() => this._firePing(), i * 95);
+      // Мгновенный первый пинг + быстрая серия (11 пингов за ~0.75 сек) для захвата часов за < 200 мс
+      this._firePing();
+      for (let i = 1; i <= 10; i++) {
+        const id = setTimeout(() => this._firePing(), i * 75);
         this.burstTimeoutIds.push(id);
       }
       // Фоновая подстройка каждые 2.5 секунды
