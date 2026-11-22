@@ -1,9 +1,10 @@
 /**
- * Orpheus Sync v2 — главный контроллер интерфейса, плейлиста и глобальной
- * Bluetooth-синхронизации по всему зданию.
+ * Orpheus Sync v2.1 — минималистичный контроллер интерфейса (Apple HIG),
+ * автоматическая синхронизация при подключении во время воспроизведения (Late Join),
+ * живые проценты загрузки по каждому устройству и полная авто-компенсация Bluetooth.
  */
 (() => {
-  const MIN_START_BUFFER_MS = 2200; // Минимальный буфер старта (увеличивается автоматически под max Bluetooth)
+  const MIN_START_BUFFER_MS = 2200;
 
   const $ = (id) => document.getElementById(id);
 
@@ -14,8 +15,6 @@
 
     btnHome: $('btnHome'),
     btnLeaveRoom: $('btnLeaveRoom'),
-    wakeLockBadge: $('wakeLockBadge'),
-    transportBadge: $('transportBadge'),
 
     btnCreateRoom: $('btnCreateRoom'),
     joinForm: $('joinForm'),
@@ -40,7 +39,6 @@
 
     metricStatus: $('metricStatus'),
     metricRtt: $('metricRtt'),
-    metricOffset: $('metricOffset'),
     metricDrift: $('metricDrift'),
 
     hostTrackSection: $('hostTrackSection'),
@@ -54,7 +52,6 @@
 
     playlistCount: $('playlistCount'),
     playlistList: $('playlistList'),
-    playlistHint: $('playlistHint'),
     loopToggleWrap: $('loopToggleWrap'),
     chkLoopPlaylist: $('chkLoopPlaylist'),
 
@@ -91,20 +88,9 @@
     volumeSlider: $('volumeSlider'),
     volumePct: $('volumePct'),
 
-    // Глобальная BT-синхронизация
-    btDeviceBadge: $('btDeviceBadge'),
-    metricSysLatency: $('metricSysLatency'),
-    metricTotalLatency: $('metricTotalLatency'),
-    metricRoomMaxLatency: $('metricRoomMaxLatency'),
-    metricWaitDelay: $('metricWaitDelay'),
-    btSyncSummary: $('btSyncSummary'),
-    chkAutoSysLatency: $('chkAutoSysLatency'),
-    btnDetectDevices: $('btnDetectDevices'),
-    manualOffsetVal: $('manualOffsetVal'),
-    btnResetOffset: $('btnResetOffset'),
-
     hostPeersSection: $('hostPeersSection'),
     peerCount: $('peerCount'),
+    peersOverallProgress: $('peersOverallProgress'),
     peerList: $('peerList'),
     toastContainer: $('toastContainer'),
   };
@@ -112,38 +98,32 @@
   const state = {
     role: null,
     roomCode: null,
-    playlist: [],          // [{ id, type, name, duration, size, mime, url, buffer }]
+    playlist: [],
     activeTrackId: null,
     loopPlaylist: true,
     isSeeking: false,
     rafId: null,
     pendingPlayCmd: null,
+    pendingPlayTimer: null,
     reconnectAttempts: 0,
     reconnectTimer: null,
     roomLatency: { roomMaxLatencyMs: 0, slowestLabel: 'Хост', bluetoothCount: 0, deviceCount: 1 },
   };
 
+  const darkThemeQuery = window.matchMedia('(prefers-color-scheme: dark)');
+
   /* ==================== ПОДСИСТЕМЫ ==================== */
 
-  const wakeLock = new WakeLockManager(({ active, supported }) => {
-    const textEl = ui.wakeLockBadge.querySelector('.pill-text');
-    if (!supported) {
-      ui.wakeLockBadge.className = 'pill pill-muted';
-      textEl.textContent = 'WakeLock: нет';
-    } else if (active) {
-      ui.wakeLockBadge.className = 'pill pill-active';
-      textEl.textContent = 'Экран активен';
-    } else {
-      ui.wakeLockBadge.className = 'pill pill-muted';
-      textEl.textContent = 'Экран: авто';
-    }
-  });
+  // Wake Lock работает полностью автоматически в фоне без лишних индикаторов
+  const wakeLock = new WakeLockManager(() => {});
 
   const audio = new AudioEngine({
     onDrift: (driftMs, mode) => updateDriftMetric(driftMs, mode),
     onEnded: () => handleTrackEnded(),
     onStateChange: ({ playing }) => updatePlaybackUI(playing),
-    onLatencyChange: (profile) => handleLocalLatencyChanged(profile),
+    onLatencyChange: () => {
+      if (state.role) sendLocalLatencyToHost();
+    },
   });
 
   let clock = null;
@@ -151,45 +131,46 @@
   const network = new NetworkManager({
     onPeersChanged: (peers) => renderPeerList(peers),
 
-    onTransportChanged: (type, label) => {
-      updateTransportBadge(type, label);
-      if (clock) {
-        clock.setMode(type === 'relay' ? 'relay' : 'p2p');
-      }
+    onTransportChanged: (type) => {
+      if (clock) clock.setMode(type === 'relay' ? 'relay' : 'p2p');
     },
 
     onRoomLatencyChanged: (roomLat) => {
       state.roomLatency = roomLat;
       audio.setRoomMaxLatency(roomLat.roomMaxLatencyMs);
-      renderLatencyUI(audio.getLatencyProfile());
-      updatePlaybackUI(audio.isPlaying);
     },
 
-    onHostConnected: (transportType) => {
+    onHostRescheduleNeeded: (pb) => {
+      if (state.role === 'host' && audio.isPlaying && pb.trackId === state.activeTrackId) {
+        audio.schedulePlay({
+          hostStartTime: pb.hostStartTime,
+          trackOffset: pb.trackOffset,
+          getHostTime: () => clock.hostNow(),
+        });
+      }
+    },
+
+    onHostConnected: () => {
       state.reconnectAttempts = 0;
       if (state.reconnectTimer) {
         clearTimeout(state.reconnectTimer);
         state.reconnectTimer = null;
       }
-      setStatusMetric('Калибровка...', 'metric-warn');
+      setStatusMetric('Синхронизация', 'metric-warn');
       ui.btnListenerReconnect.classList.add('hidden');
-      ui.listenerBannerText.textContent = 'Подключено! Сверка часов с Хостом...';
-      updateTransportBadge(transportType, transportType === 'relay' ? 'WSS Relay' : 'P2P');
-
-      // Сразу отправляем нашу измеренную системную/BT задержку Хосту
+      ui.listenerBannerText.textContent = 'Синхронизация с комнатой...';
       sendLocalLatencyToHost();
     },
 
-    onHostDisconnected: (reason = '') => {
+    onHostDisconnected: () => {
       audio.pause();
       if (clock) clock.stop();
-      setStatusMetric('Переподкл...', 'metric-warn');
+      setStatusMetric('Переподкл.', 'metric-warn');
       ui.btnListenerReconnect.classList.remove('hidden');
 
-      const detail = reason && reason !== 'unknown' ? ` (${reason})` : '';
       if (state.role === 'listener' && state.roomCode && state.reconnectAttempts < 3) {
         state.reconnectAttempts++;
-        ui.listenerBannerText.textContent = `Связь прервалась${detail}. Переподключение ${state.reconnectAttempts}/3...`;
+        ui.listenerBannerText.textContent = `Переподключение (${state.reconnectAttempts}/3)...`;
         state.reconnectTimer = setTimeout(() => {
           if (state.role === 'listener' && state.roomCode) {
             enterAsListener(state.roomCode, true);
@@ -197,8 +178,8 @@
         }, 1800);
       } else {
         setStatusMetric('Отключён', 'metric-bad');
-        ui.listenerBannerText.textContent = `Связь с Хостом потеряна${detail}. Нажмите «Переподключиться».`;
-        showToast('Соединение с Хостом разорвано', 'error');
+        ui.listenerBannerText.textContent = 'Связь потеряна. Нажмите «Повторить».';
+        showToast('Соединение с комнатой прервано', 'error');
       }
     },
 
@@ -221,12 +202,12 @@
     onFileProgress: ({ trackId, name, pct, isActive }) => {
       if (!isActive && trackId !== state.activeTrackId) return;
       if (pct === 0 && trackId === state.activeTrackId) {
-        state.pendingPlayCmd = null;
+        clearPendingPlay();
         audio.pause(0);
       }
       ui.trackTitle.textContent = name;
-      ui.trackSub.textContent = 'Приём аудиофайла от Хоста (бинарный P2P)...';
-      showTransfer(true, 'Загрузка от Хоста...', pct);
+      ui.trackSub.textContent = 'Загрузка аудио...';
+      showTransfer(true, 'Загрузка', pct);
     },
 
     onFileComplete: async ({ trackId, name, buffer, isActive }) => {
@@ -236,9 +217,9 @@
     onCmdPlay: (cmd) => handleListenerPlayCmd(cmd),
 
     onCmdPause: ({ trackOffset }) => {
-      state.pendingPlayCmd = null;
+      clearPendingPlay();
       audio.pause(trackOffset);
-      ui.listenerBannerText.textContent = 'Пауза (ожидание Хоста)';
+      ui.listenerBannerText.textContent = 'На паузе';
     },
 
     onError: (err) => {
@@ -253,7 +234,6 @@
     ui.viewInviteUnlock.classList.toggle('hidden', name !== 'invite');
     ui.viewRoom.classList.toggle('hidden', name !== 'room');
     ui.btnLeaveRoom.classList.toggle('hidden', name !== 'room');
-    ui.transportBadge.classList.toggle('hidden', name !== 'room');
   }
 
   function showToast(text, type = 'info') {
@@ -261,7 +241,7 @@
     el.className = `toast ${type === 'error' ? 'toast-error' : type === 'success' ? 'toast-success' : ''}`;
     el.textContent = text;
     ui.toastContainer.appendChild(el);
-    setTimeout(() => el.remove(), 3600);
+    setTimeout(() => el.remove(), 3400);
   }
 
   function formatTime(sec) {
@@ -287,18 +267,6 @@
   function setStatusMetric(text, cls = '') {
     ui.metricStatus.textContent = text;
     ui.metricStatus.className = `metric-value ${cls}`;
-  }
-
-  function updateTransportBadge(type, label) {
-    const textEl = ui.transportBadge.querySelector('.pill-text');
-    textEl.textContent = label || '—';
-    if (type === 'p2p-lan' || type === 'p2p-udp' || type === 'p2p' || type === 'host') {
-      ui.transportBadge.className = 'pill pill-active';
-    } else if (type === 'relay' || type === 'turn') {
-      ui.transportBadge.className = 'pill pill-warn';
-    } else {
-      ui.transportBadge.className = 'pill pill-muted';
-    }
   }
 
   function updateDriftMetric(driftMs, mode) {
@@ -334,8 +302,6 @@
     ui.qrCanvasWrap.innerHTML = qr.createSvgTag({ scalable: true, margin: 2 });
   }
 
-  /* ==================== ГЛОБАЛЬНАЯ СИНХРОНИЗАЦИЯ BLUETOOTH ==================== */
-
   function sendLocalLatencyToHost() {
     const profile = audio.getLatencyProfile();
     if (state.role === 'host') {
@@ -352,50 +318,11 @@
     }
   }
 
-  function handleLocalLatencyChanged(profile) {
-    renderLatencyUI(profile);
-    if (state.role) {
-      sendLocalLatencyToHost();
-    }
-  }
-
-  function renderLatencyUI(profile) {
-    ui.metricSysLatency.textContent = `${profile.systemLatencyMs} мс`;
-    ui.metricTotalLatency.textContent = `${profile.totalLatencyMs} мс`;
-
-    const roomMax = Math.max(profile.totalLatencyMs, state.roomLatency.roomMaxLatencyMs || 0);
-    const waitMs = Math.max(0, roomMax - profile.totalLatencyMs);
-
-    ui.metricRoomMaxLatency.textContent = `${roomMax} мс`;
-    ui.metricWaitDelay.textContent = `+${waitMs} мс`;
-
-    const sign = profile.extraLatencyMs > 0 ? '+' : '';
-    ui.manualOffsetVal.textContent = `${sign}${profile.extraLatencyMs} мс`;
-    ui.chkAutoSysLatency.checked = profile.autoSystemLatency;
-
-    // Обновляем подсветку пресетов
-    document.querySelectorAll('[data-bt-preset]').forEach((btn) => {
-      const val = Number(btn.dataset.btPreset);
-      btn.classList.toggle('active', val === profile.extraLatencyMs);
-    });
-
-    // Бейдж типа вывода (Bluetooth или Динамик)
-    if (profile.isBluetooth) {
-      const label = profile.outputDeviceLabel ? `BT: ${profile.outputDeviceLabel}` : 'Bluetooth аудио';
-      ui.btDeviceBadge.textContent = label;
-      ui.btDeviceBadge.className = 'bt-badge bt-active';
-    } else {
-      ui.btDeviceBadge.textContent = profile.outputDeviceLabel || 'Динамик / провод';
-      ui.btDeviceBadge.className = 'bt-badge';
-    }
-
-    // Понятное описание глобального выравнивания
-    if (roomMax > 0 && waitMs > 5) {
-      ui.btSyncSummary.textContent = `Вся сеть выровнена под «${state.roomLatency.slowestLabel}» (${roomMax} мс). Это устройство автоматически придерживает звук на +${waitMs} мс, чтобы по всему зданию всё звучало в унисон.`;
-    } else if (profile.isBluetooth) {
-      ui.btSyncSummary.textContent = `Это устройство задаёт опорную Bluetooth-задержку (${profile.totalLatencyMs} мс) — остальные телефоны в здании автоматически подстраиваются под него.`;
-    } else {
-      ui.btSyncSummary.textContent = `Системная задержка: ${profile.systemLatencyMs} мс (output ${profile.outputLatencyMs} + base ${profile.baseLatencyMs} мс). При подключении Bluetooth к любому телефону вся сеть автоматически выровняется.`;
+  function clearPendingPlay() {
+    state.pendingPlayCmd = null;
+    if (state.pendingPlayTimer) {
+      clearTimeout(state.pendingPlayTimer);
+      state.pendingPlayTimer = null;
     }
   }
 
@@ -403,7 +330,7 @@
 
   async function enterAsHost() {
     ui.btnCreateRoom.disabled = true;
-    ui.btnCreateRoom.textContent = 'Создание комнаты...';
+    ui.btnCreateRoom.textContent = 'Создание...';
 
     try {
       await audio.unlock();
@@ -433,18 +360,16 @@
       ui.listenerPlaybackBanner.classList.add('hidden');
       ui.qrPanel.classList.remove('hidden');
 
-      setStatusMetric('Комната активна', 'metric-good');
-      updateTransportBadge('host', 'Хост (P2P)');
-      ui.metricRtt.textContent = '0 мс (Хост)';
-      ui.metricOffset.textContent = '0 мс';
+      setStatusMetric('Активна', 'metric-good');
+      ui.metricRtt.textContent = '0 мс';
       ui.metricDrift.textContent = '0 мс';
 
-      // Регистрируем локальную задержку Хоста в расчёте комнаты
       sendLocalLatencyToHost();
       renderPlaylist();
+      renderPeerList([]);
       showView('room');
       startRenderLoop();
-      showToast(`Комната ${NetworkManager.formatCode(code)} создана!`, 'success');
+      showToast(`Комната ${NetworkManager.formatCode(code)} создана`, 'success');
     } catch (err) {
       showToast(err.message || 'Не удалось создать комнату', 'error');
     } finally {
@@ -473,7 +398,7 @@
   async function enterAsListener(rawCode, isAutoReconnect = false) {
     const code = NetworkManager.normalizeCode(rawCode);
     if (code.length < 4) {
-      const msg = 'Введите 6-значный код комнаты (например, K7M-4PX)';
+      const msg = 'Введите 6-значный код комнаты';
       setConnectStatus(msg, true);
       showToast(msg, 'error');
       return;
@@ -489,7 +414,7 @@
     ui.btnUnlockAndJoin.disabled = true;
     ui.btnJoinRoom.textContent = 'Подключение...';
     ui.btnUnlockAndJoin.textContent = 'Подключение...';
-    setConnectStatus('Разблокировка звука...');
+    setConnectStatus('Включение звука...');
 
     try {
       if (!isAutoReconnect) {
@@ -508,25 +433,32 @@
         isHost: false,
         mode: network.hostTransport === 'relay' ? 'relay' : 'p2p',
         sendPing: (payload) => network.sendToHost(payload, 'ntp'),
-        onUpdate: ({ offsetMs, rttMs }) => {
+        onUpdate: ({ rttMs, sampleCount }) => {
           const rttRound = Math.round(rttMs);
           ui.metricRtt.textContent = `${rttRound} мс`;
           ui.metricRtt.className = `metric-value mono ${
-            rttRound < 45 ? 'metric-good' : rttRound < 120 ? 'metric-warn' : 'metric-bad'
+            rttRound < 50 ? 'metric-good' : rttRound < 130 ? 'metric-warn' : 'metric-bad'
           }`;
-
-          const offRound = Math.round(offsetMs);
-          ui.metricOffset.textContent = `${offRound > 0 ? '+' : ''}${offRound} мс`;
           setStatusMetric('Синхронизирован', 'metric-good');
 
           network.sendToHost({ type: 'CLIENT_METRICS', rttMs: rttRound }, 'ctrl');
 
-          if (state.pendingPlayCmd && audio.buffer && state.activeTrackId === state.pendingPlayCmd.trackId) {
+          // Запускаем отложенный Late Join как только часы надёжно откалиброваны
+          const minSamples = network.hostTransport === 'relay' ? 2 : 4;
+          if (
+            state.pendingPlayCmd &&
+            audio.buffer &&
+            state.activeTrackId === state.pendingPlayCmd.trackId &&
+            sampleCount >= minSamples
+          ) {
             const cmd = state.pendingPlayCmd;
-            state.pendingPlayCmd = null;
+            clearPendingPlay();
             executeScheduledPlay(cmd);
           } else if (audio.isScheduled) {
             audio.refineScheduledStart();
+          } else if (audio.isPlaying && sampleCount <= 12) {
+            // При раннем уточнении NTP во время Late Join сразу поджимаем дрейф
+            audio.checkDrift();
           }
         },
       });
@@ -546,14 +478,14 @@
       ui.listenerPlaybackBanner.classList.remove('hidden');
       ui.seekSlider.disabled = true;
 
-      ui.trackTitle.textContent = 'Ожидание плейлиста от Хоста';
-      ui.trackSub.textContent = 'Как только Хост добавит треки, они загрузятся автоматически';
-      ui.listenerBannerText.textContent = 'Калибровка часов с Хостом...';
+      ui.trackTitle.textContent = 'Ожидание трека';
+      ui.trackSub.textContent = 'Подключено к комнате';
+      ui.listenerBannerText.textContent = 'Синхронизация часов...';
 
       renderPlaylist();
       showView('room');
       startRenderLoop();
-      showToast(`Подключено к комнате ${NetworkManager.formatCode(code)}`, 'success');
+      showToast(`Подключено к ${NetworkManager.formatCode(code)}`, 'success');
     } catch (err) {
       const msg = err.message || 'Не удалось подключиться';
       setConnectStatus(msg, true);
@@ -561,8 +493,8 @@
     } finally {
       ui.btnJoinRoom.disabled = false;
       ui.btnUnlockAndJoin.disabled = false;
-      ui.btnJoinRoom.textContent = 'Подключиться и включить звук';
-      ui.btnUnlockAndJoin.textContent = 'Подключиться и разблокировать звук';
+      ui.btnJoinRoom.textContent = 'Подключиться';
+      ui.btnUnlockAndJoin.textContent = 'Подключиться и включить звук';
     }
   }
 
@@ -576,9 +508,9 @@
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       if (file.size > 40 * 1024 * 1024) {
-        showToast(`Файл «${file.name}» > 40 МБ. Рекомендуем MP3 до 15 МБ.`, 'error');
+        showToast(`Файл «${file.name}» больше 40 МБ — загрузка займёт больше времени`, 'error');
       }
-      showTransfer(true, `Декодирование (${i + 1}/${files.length}): ${file.name}`, Math.round(((i + 0.5) / files.length) * 100));
+      showTransfer(true, `Обработка (${i + 1}/${files.length})`, Math.round(((i + 0.5) / files.length) * 100));
 
       try {
         const arrayBuffer = await file.arrayBuffer();
@@ -598,8 +530,8 @@
           added++;
         }
       } catch (err) {
-        console.error('[App] File decode failed:', file.name, err);
-        showToast(`Не удалось декодировать ${file.name}`, 'error');
+        console.error('[App] Decode failed:', file.name, err);
+        showToast(`Не удалось открыть ${file.name}`, 'error');
       }
     }
 
@@ -612,16 +544,16 @@
         network.setHostPlaylist(state.playlist, state.activeTrackId);
         renderPlaylist();
       }
-      showToast(added === 1 ? 'Трек добавлен в плейлист' : `Добавлено треков: ${added}`, 'success');
+      showToast(added === 1 ? 'Трек добавлен' : `Добавлено треков: ${added}`, 'success');
     }
   }
 
   async function hostAddSynthTrack(type) {
     const isPulse = type === 'pulse';
     const trackId = isPulse ? 'demo-pulse-60bpm-v2' : 'demo-120bpm-v2';
-    const name = isPulse ? 'Калибровочный метроном (1 Гц)' : 'Встроенный тест-бит (120 BPM)';
+    const name = isPulse ? 'Метроном (1 Гц)' : 'Тест-бит (120 BPM)';
 
-    showTransfer(true, `Генерация: ${name}...`, 65);
+    showTransfer(true, 'Подготовка...', 65);
     try {
       const decoded = isPulse
         ? await audio.generatePulseTrack(trackId, false)
@@ -637,9 +569,7 @@
         });
       }
       showTransfer(false);
-
       await hostSelectTrack(trackId, false);
-      showToast(`«${name}» готов!`, 'success');
     } catch (_) {
       showTransfer(false);
       showToast('Ошибка генерации тест-трека', 'error');
@@ -647,13 +577,13 @@
   }
 
   async function hostAddUrlTrack(url) {
-    showTransfer(true, 'Загрузка аудио по URL...', 40);
+    showTransfer(true, 'Загрузка URL...', 40);
     try {
       const resp = await fetch(url, { mode: 'cors' });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const arrayBuffer = await resp.arrayBuffer();
       const trackId = `url-${url}`;
-      showTransfer(true, 'Декодирование аудио...', 85);
+      showTransfer(true, 'Обработка...', 85);
       const decoded = await audio.decodeToCache(trackId, arrayBuffer);
       const cleanName = decodeURIComponent(url.split('/').pop().split('?')[0] || 'Аудио по ссылке');
 
@@ -676,10 +606,10 @@
         network.setHostPlaylist(state.playlist, state.activeTrackId);
         renderPlaylist();
       }
-      showToast('URL-трек добавлен в плейлист!', 'success');
+      showToast('Трек добавлен', 'success');
     } catch (_) {
       showTransfer(false);
-      showToast('Не удалось загрузить URL (проверьте CORS или выберите локальные файлы)', 'error');
+      showToast('Не удалось загрузить ссылку (проверьте CORS)', 'error');
     }
   }
 
@@ -690,7 +620,6 @@
     audio.pause(0);
     network.broadcastPause({ trackOffset: 0 });
 
-    // Убеждаемся, что буфер декодирован в кэше
     let decoded = audio.activateTrack(trackId);
     if (!decoded) {
       if (track.type === 'demo') decoded = await audio.generateDemoTrack(trackId, true);
@@ -706,10 +635,8 @@
     state.activeTrackId = trackId;
     const sub =
       track.type === 'file'
-        ? `${formatTime(decoded.duration)} • ${(track.size / 1024 / 1024).toFixed(1)} МБ • P2P бинарный`
-        : track.type === 'url'
-        ? `${formatTime(decoded.duration)} • Прямая ссылка`
-        : `${formatTime(decoded.duration)} • Синтез без трафика`;
+        ? `${formatTime(decoded.duration)} • ${(track.size / 1024 / 1024).toFixed(1)} МБ`
+        : formatTime(decoded.duration);
 
     onTrackReadyUI(track.name, sub, decoded.duration);
     network.setHostPlaylist(state.playlist, trackId);
@@ -800,14 +727,13 @@
       return;
     }
 
-    // Если новый активный трек УЖЕ предзагружен в кэше — мгновенно активируем его!
     if (activeTrackId !== prevActive && audio.hasCachedTrack(activeTrackId)) {
       const decoded = audio.activateTrack(activeTrackId);
       const meta = state.playlist.find((t) => t.id === activeTrackId);
       if (decoded && meta) {
-        onTrackReadyUI(meta.name, `${formatTime(decoded.duration)} • Из кэша (мгновенно)`, decoded.duration);
+        onTrackReadyUI(meta.name, formatTime(decoded.duration), decoded.duration);
         showTransfer(false);
-        ui.listenerBannerText.textContent = 'Трек готов. Ожидание старта от Хоста...';
+        ui.listenerBannerText.textContent = 'Готово к воспроизведению';
         network.sendToHost({ type: 'TRACK_READY', trackId: activeTrackId });
         tryApplyPendingPlay();
       }
@@ -818,7 +744,8 @@
     const isCurrentlyActive = () => trackId === state.activeTrackId || (!state.activeTrackId && isActive);
     if (isCurrentlyActive()) {
       audio.pause(0);
-      showTransfer(true, `Локальный синтез: ${name}...`, 65);
+      showTransfer(true, 'Подготовка...', 55);
+      network.sendToHost({ type: 'TRACK_PROGRESS', trackId, progress: 55, phase: 'loading' });
     }
     try {
       const decoded =
@@ -829,9 +756,9 @@
       if (isCurrentlyActive()) {
         audio.activateTrack(trackId);
         state.activeTrackId = trackId;
-        onTrackReadyUI(name, `${formatTime(decoded.duration)} • Локальный синтез (0 КБ)`, decoded.duration);
+        onTrackReadyUI(name, formatTime(decoded.duration), decoded.duration);
         showTransfer(false);
-        ui.listenerBannerText.textContent = 'Трек готов. Ожидание старта от Хоста...';
+        ui.listenerBannerText.textContent = 'Готово к воспроизведению';
       }
       network.sendToHost({ type: 'TRACK_READY', trackId });
       renderPlaylist();
@@ -846,20 +773,24 @@
     const isCurrentlyActive = () => trackId === state.activeTrackId || (!state.activeTrackId && isActive);
     if (isCurrentlyActive()) {
       audio.pause(0);
-      showTransfer(true, 'Загрузка трека по URL...', 35);
+      showTransfer(true, 'Загрузка...', 30);
+      network.sendToHost({ type: 'TRACK_PROGRESS', trackId, progress: 30, phase: 'loading' });
     }
     try {
       const resp = await fetch(url, { mode: 'cors' });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const buf = await resp.arrayBuffer();
-      if (isCurrentlyActive()) showTransfer(true, 'Декодирование аудио...', 85);
+      if (isCurrentlyActive()) {
+        showTransfer(true, 'Декодирование...', 90);
+        network.sendToHost({ type: 'TRACK_PROGRESS', trackId, progress: 90, phase: 'decoding' });
+      }
       const decoded = await audio.decodeToCache(trackId, buf);
       if (isCurrentlyActive()) {
         audio.activateTrack(trackId);
         state.activeTrackId = trackId;
-        onTrackReadyUI(name, `${formatTime(decoded.duration)} • Загружено по URL`, decoded.duration);
+        onTrackReadyUI(name, formatTime(decoded.duration), decoded.duration);
         showTransfer(false);
-        ui.listenerBannerText.textContent = 'Трек готов. Ожидание старта от Хоста...';
+        ui.listenerBannerText.textContent = 'Готово к воспроизведению';
       }
       network.sendToHost({ type: 'TRACK_READY', trackId });
       renderPlaylist();
@@ -873,16 +804,17 @@
   async function handleListenerFileComplete(trackId, name, buffer, isActive) {
     const isCurrentlyActive = () => trackId === state.activeTrackId || (!state.activeTrackId && isActive);
     if (isCurrentlyActive()) {
-      showTransfer(true, 'Декодирование аудио...', 100);
+      showTransfer(true, 'Декодирование...', 96);
+      network.sendToHost({ type: 'TRACK_PROGRESS', trackId, progress: 96, phase: 'decoding' });
     }
     try {
       const decoded = await audio.decodeToCache(trackId, buffer);
       if (isCurrentlyActive()) {
         audio.activateTrack(trackId);
         state.activeTrackId = trackId;
-        onTrackReadyUI(name, `${formatTime(decoded.duration)} • Получено от Хоста`, decoded.duration);
+        onTrackReadyUI(name, formatTime(decoded.duration), decoded.duration);
         showTransfer(false);
-        ui.listenerBannerText.textContent = 'Трек готов. Ожидание старта от Хоста...';
+        ui.listenerBannerText.textContent = 'Готово к воспроизведению';
       }
       network.sendToHost({ type: 'TRACK_READY', trackId });
       renderPlaylist();
@@ -891,7 +823,7 @@
       console.error('[App/Listener] Decode error:', err);
       if (isCurrentlyActive()) showTransfer(false);
       network.sendToHost({ type: 'TRACK_ERROR', trackId });
-      if (isCurrentlyActive()) showToast('Ошибка декодирования полученного файла', 'error');
+      if (isCurrentlyActive()) showToast('Ошибка декодирования трека', 'error');
     }
   }
 
@@ -914,7 +846,7 @@
 
   function resetPlayerNoTrackUI() {
     ui.trackTitle.textContent = 'Плейлист пуст';
-    ui.trackSub.textContent = state.role === 'host' ? 'Добавьте файлы или тест-бит ниже' : 'Ожидание треков от Хоста...';
+    ui.trackSub.textContent = state.role === 'host' ? 'Добавьте треки ниже' : 'Ожидание треков...';
     ui.timeCurrent.textContent = '0:00';
     ui.timeDuration.textContent = '0:00';
     ui.seekSlider.value = '0';
@@ -935,8 +867,8 @@
     if (state.playlist.length === 0) {
       ui.playlistList.innerHTML =
         state.role === 'host'
-          ? '<li class="peer-empty">Добавьте один или несколько аудиофайлов, либо нажмите «Тест-бит 120 BPM».</li>'
-          : '<li class="peer-empty">Ожидание плейлиста от Хоста...</li>';
+          ? '<li class="peer-empty">Добавьте аудиофайлы или выберите тест-бит.</li>'
+          : '<li class="peer-empty">Ожидание плейлиста...</li>';
       return;
     }
 
@@ -947,7 +879,7 @@
         const badge =
           state.role === 'listener'
             ? cached
-              ? '<span class="track-pill ready">Кэш ✓</span>'
+              ? '<span class="track-pill ready">Готово</span>'
               : '<span class="track-pill">Ожидание</span>'
             : '';
 
@@ -975,10 +907,9 @@
       .join('');
   }
 
-  /* ==================== ВОСПРОИЗВЕДЕНИЕ И СИНХРОНИЗАЦИЯ ==================== */
+  /* ==================== ВОСПРОИЗВЕДЕНИЕ И LATE JOIN ==================== */
 
   function getEffectiveStartBufferMs() {
-    // Гарантируем, что буфера старта хватит даже для самой медленной Bluetooth-колонки в здании!
     const roomMax = Math.max(audio.getTotalOutputLatencyMs(), state.roomLatency.roomMaxLatencyMs || 0);
     return Math.max(MIN_START_BUFFER_MS, roomMax + 1100);
   }
@@ -987,7 +918,6 @@
     if (!audio.buffer || !clock || !state.activeTrackId) return;
 
     const bufferMs = getEffectiveStartBufferMs();
-    // hostStartTime = T_acoustic (когда звук должен выйти в воздух со всех динамиков и BT-колонок!)
     const hostStartTime = clock.hostNow() + bufferMs;
     const clampedOffset = Math.max(0, Math.min(trackOffset, Math.max(0, audio.getDuration() - 0.1)));
 
@@ -1011,89 +941,125 @@
   }
 
   function handleListenerPlayCmd(cmd) {
-    // Если этот трек уже в кэше, но ещё не активирован — активируем мгновенно!
     if (cmd.trackId && cmd.trackId !== state.activeTrackId && audio.hasCachedTrack(cmd.trackId)) {
       const decoded = audio.activateTrack(cmd.trackId);
       const meta = state.playlist.find((t) => t.id === cmd.trackId);
       if (decoded && meta) {
         state.activeTrackId = cmd.trackId;
-        onTrackReadyUI(meta.name, `${formatTime(decoded.duration)} • Из кэша`, decoded.duration);
+        onTrackReadyUI(meta.name, formatTime(decoded.duration), decoded.duration);
         renderPlaylist();
       }
     }
 
-    if (!audio.buffer || state.activeTrackId !== cmd.trackId || !clock || !clock.synced) {
+    const minSamples = network.hostTransport === 'relay' ? 2 : 4;
+    const clockReady = clock && clock.synced && (clock.samples.length >= minSamples || !cmd.isLateJoin);
+
+    if (!audio.buffer || state.activeTrackId !== cmd.trackId || !clockReady) {
+      clearPendingPlay();
       state.pendingPlayCmd = cmd;
+      // Страховка для Late Join: если 4 пинга не успели прийти за 1.1 с, стартуем по текущему NTP
+      if (cmd.isLateJoin) {
+        state.pendingPlayTimer = setTimeout(() => {
+          if (state.pendingPlayCmd && audio.buffer && state.activeTrackId === state.pendingPlayCmd.trackId && clock && clock.synced) {
+            const c = state.pendingPlayCmd;
+            clearPendingPlay();
+            executeScheduledPlay(c);
+          }
+        }, 1100);
+      }
       return;
     }
+
+    clearPendingPlay();
     executeScheduledPlay(cmd);
   }
 
   function tryApplyPendingPlay() {
-    if (state.pendingPlayCmd && clock && clock.synced && state.activeTrackId === state.pendingPlayCmd.trackId) {
-      const cmd = state.pendingPlayCmd;
-      state.pendingPlayCmd = null;
-      executeScheduledPlay(cmd);
+    if (!state.pendingPlayCmd || !clock || !clock.synced || state.activeTrackId !== state.pendingPlayCmd.trackId) {
+      return;
     }
+    const minSamples = network.hostTransport === 'relay' ? 2 : 4;
+    if (state.pendingPlayCmd.isLateJoin && clock.samples.length < minSamples) {
+      return;
+    }
+    const cmd = state.pendingPlayCmd;
+    clearPendingPlay();
+    executeScheduledPlay(cmd);
   }
 
   function executeScheduledPlay(cmd) {
+    audio.measureSystemLatency(false);
+    sendLocalLatencyToHost();
     audio.schedulePlay({
       hostStartTime: cmd.hostStartTime,
       trackOffset: cmd.trackOffset,
       getHostTime: () => clock.hostNow(),
     });
-    ui.listenerBannerText.textContent = 'Синхронное воспроизведение с Хостом';
+    ui.listenerBannerText.textContent = 'Синхронное воспроизведение';
   }
 
   function updatePlaybackUI(isPlaying) {
-    const bufSec = (getEffectiveStartBufferMs() / 1000).toFixed(1);
     ui.iconPlay.classList.toggle('hidden', isPlaying);
     ui.iconPause.classList.toggle('hidden', !isPlaying);
-    ui.playPauseLabel.textContent = isPlaying ? 'Пауза' : `Старт (+${bufSec}с)`;
+    ui.playPauseLabel.textContent = isPlaying ? 'Пауза' : 'Воспроизвести';
     ui.listenerPulse.classList.toggle('playing', isPlaying);
     if (!isPlaying) {
       ui.countdownBadge.classList.add('hidden');
     }
   }
 
+  /* ==================== СПИСОК УСТРОЙСТВ С ПРОЦЕНТАМИ ЗАГРУЗКИ ==================== */
+
   function renderPeerList(peers) {
     ui.peerCount.textContent = String(peers.length);
+
     if (peers.length === 0) {
+      ui.peersOverallProgress.textContent = 'Ожидание';
       ui.peerList.innerHTML =
-        '<li class="peer-empty">Пока никто не подключился. Покажите QR-код или отправьте ссылку устройствам в здании.</li>';
+        '<li class="peer-empty">Пока никто не подключился. Покажите QR-код или отправьте ссылку.</li>';
       return;
     }
 
-    const roomMax = state.roomLatency.roomMaxLatencyMs || 0;
+    const readyCount = peers.filter((p) => p.ready).length;
+    const avgPct = Math.round(peers.reduce((acc, p) => acc + (p.progress || 0), 0) / peers.length);
+    ui.peersOverallProgress.textContent =
+      readyCount === peers.length ? `Готовы все (${readyCount}/${peers.length})` : `Загрузка ${avgPct}% (${readyCount}/${peers.length})`;
 
     ui.peerList.innerHTML = peers
       .map((p) => {
-        const isSlowest = roomMax > 30 && p.latencyMs === roomMax;
-        const btTag = p.isBluetooth
-          ? `<span class="peer-chip peer-chip-bt ${isSlowest ? 'slowest' : ''}">BT ${p.latencyMs} мс</span>`
-          : `<span class="peer-chip">${p.latencyMs} мс</span>`;
-        const trTag = `<span class="peer-chip peer-chip-net">${escapeHtml(p.transportLabel || 'P2P')}</span>`;
+        const pct = Math.max(0, Math.min(100, Math.round(p.progress || 0)));
+        const dotCls = p.phase === 'error' ? 'error' : p.ready ? 'ready' : '';
+        const btChip = p.isBluetooth ? `<span class="peer-chip peer-chip-bt">BT ${p.latencyMs} мс</span>` : '';
+        const netChip = p.transportLabel ? `<span class="peer-chip">${escapeHtml(p.transportLabel)}</span>` : '';
 
         return `
           <li class="peer-item">
-            <div class="peer-main">
-              <span class="peer-status-dot ${p.ready ? 'ready' : ''}"></span>
-              <div class="peer-name-wrap">
-                <strong>${escapeHtml(p.label)}</strong>
-                <div class="peer-chips">${trTag} ${btTag}</div>
+            <div class="peer-top">
+              <div class="peer-main">
+                <span class="peer-status-dot ${dotCls}"></span>
+                <div class="peer-title-row">
+                  <strong>${escapeHtml(p.label)}</strong>
+                  ${netChip}
+                  ${btChip}
+                </div>
+              </div>
+              <div class="peer-right mono">
+                <span>${p.rttMs !== null ? `${p.rttMs} мс` : '—'}</span>
+                <span class="peer-pct ${p.ready ? 'ready' : ''}">${pct}%</span>
               </div>
             </div>
-            <div class="peer-meta">
-              <span>${escapeHtml(p.status)}</span>
-              <span class="mono">${p.rttMs !== null ? `${p.rttMs} мс` : '—'}</span>
+            <div class="peer-progress-row">
+              <div class="peer-progress-track">
+                <div class="peer-progress-fill ${p.ready ? 'ready' : ''}" style="width: ${pct}%"></div>
+              </div>
+              <span class="peer-status-label">${escapeHtml(p.status)}</span>
             </div>
           </li>`;
       })
       .join('');
   }
 
-  /* ==================== ЦИКЛ ОТРИСОВКИ ==================== */
+  /* ==================== ВИЗУАЛИЗАТОР И ОТРИСОВКА ==================== */
 
   const freqBins = new Uint8Array(64);
 
@@ -1107,14 +1073,14 @@
       const countdown = audio.getCountdownSec();
       if (countdown > 0.02) {
         ui.countdownBadge.classList.remove('hidden');
-        ui.countdownBadge.textContent = `Старт: ${countdown.toFixed(1)}с`;
+        ui.countdownBadge.textContent = `${countdown.toFixed(1)}с`;
         if (state.role === 'listener') {
-          ui.listenerBannerText.textContent = `Общий акустический старт через ${countdown.toFixed(1)} с...`;
+          ui.listenerBannerText.textContent = `Старт через ${countdown.toFixed(1)} с`;
         }
       } else {
         ui.countdownBadge.classList.add('hidden');
         if (state.role === 'listener' && audio.isPlaying) {
-          ui.listenerBannerText.textContent = 'Синхронное воспроизведение с Хостом';
+          ui.listenerBannerText.textContent = 'Синхронное воспроизведение';
         }
       }
 
@@ -1128,21 +1094,23 @@
       const h = canvas.height;
       ctx2d.clearRect(0, 0, w, h);
 
+      const isDark = darkThemeQuery.matches;
       const hasAudio = audio.isPlaying && audio.getFrequencyData(freqBins);
-      const barCount = 40;
-      const gap = 4;
+      const barCount = 42;
+      const gap = 5;
       const barWidth = (w - gap * (barCount - 1)) / barCount;
 
       for (let i = 0; i < barCount; i++) {
-        const val = hasAudio ? freqBins[i] / 255 : 0.04;
+        const val = hasAudio ? freqBins[i] / 255 : 0.06;
         const barH = Math.max(4, val * (h - 14));
         const x = i * (barWidth + gap);
-        const y = h - barH;
+        const y = (h - barH) / 2;
 
-        const grad = ctx2d.createLinearGradient(0, y, 0, h);
-        grad.addColorStop(0, '#10b981');
-        grad.addColorStop(1, '#6366f1');
-        ctx2d.fillStyle = hasAudio ? grad : 'rgba(147, 160, 184, 0.2)';
+        if (hasAudio) {
+          ctx2d.fillStyle = isDark ? '#0a84ff' : '#007aff';
+        } else {
+          ctx2d.fillStyle = isDark ? 'rgba(255, 255, 255, 0.14)' : 'rgba(0, 0, 0, 0.12)';
+        }
         ctx2d.beginPath();
         if (typeof ctx2d.roundRect === 'function') {
           ctx2d.roundRect(x, y, barWidth, barH, 3);
@@ -1159,6 +1127,7 @@
   }
 
   function leaveRoom() {
+    clearPendingPlay();
     if (state.reconnectTimer) {
       clearTimeout(state.reconnectTimer);
       state.reconnectTimer = null;
@@ -1182,7 +1151,6 @@
     state.roomCode = null;
     state.playlist = [];
     state.activeTrackId = null;
-    state.pendingPlayCmd = null;
     state.roomLatency = { roomMaxLatencyMs: 0, slowestLabel: 'Хост', bluetoothCount: 0, deviceCount: 1 };
 
     resetPlayerNoTrackUI();
@@ -1225,11 +1193,11 @@
     const url = buildShareUrl(state.roomCode);
     try {
       await navigator.clipboard.writeText(url);
-      showToast('Ссылка на комнату скопирована!', 'success');
+      showToast('Ссылка скопирована', 'success');
     } catch (_) {
       ui.shareLinkInput.select();
       document.execCommand('copy');
-      showToast('Ссылка скопирована!', 'success');
+      showToast('Ссылка скопирована', 'success');
     }
   };
 
@@ -1240,8 +1208,8 @@
     if (navigator.share) {
       try {
         await navigator.share({
-          title: 'Orpheus Sync — Синхронная музыка',
-          text: `Подключайся к комнате ${NetworkManager.formatCode(state.roomCode)}!`,
+          title: 'Orpheus Sync',
+          text: `Комната ${NetworkManager.formatCode(state.roomCode)}`,
           url,
         });
         return;
@@ -1250,7 +1218,6 @@
     copyShareLink();
   });
 
-  // Добавление файлов (множественный выбор + Drag & Drop)
   ui.audioFileInput.addEventListener('change', (e) => {
     if (e.target.files?.length) hostAddFiles(e.target.files);
     e.target.value = '';
@@ -1286,7 +1253,6 @@
     state.loopPlaylist = ui.chkLoopPlaylist.checked;
   });
 
-  // Делегирование кликов по плейлисту (Хост)
   ui.playlistList.addEventListener('click', (e) => {
     if (state.role !== 'host') return;
     const upBtn = e.target.closest('[data-pl-up]');
@@ -1319,7 +1285,6 @@
     }
   });
 
-  // Управление плеером (Хост)
   ui.btnPlayPause.addEventListener('click', () => {
     if (!audio.buffer) return;
     if (audio.isPlaying) hostPause();
@@ -1328,7 +1293,6 @@
 
   ui.btnPrevTrack.addEventListener('click', () => {
     if (!audio.buffer) return;
-    // Если прошло > 3 сек — перезапуск текущего трека, иначе предыдущий в плейлисте
     if (audio.getAcousticPosition() > 3 || state.playlist.length <= 1) {
       if (audio.isPlaying) hostSchedulePlay(0);
       else {
@@ -1352,13 +1316,12 @@
     if (!audio.buffer) return;
     if (audio.isPlaying) {
       hostSchedulePlay(audio.getAcousticPosition());
-      showToast('Команда пересинхронизации отправлена всем', 'success');
+      showToast('Синхронизация обновлена', 'success');
     } else {
-      showToast('Сначала нажмите Старт');
+      showToast('Сначала нажмите «Воспроизвести»');
     }
   });
 
-  // Перемотка
   ui.seekSlider.addEventListener('input', () => {
     state.isSeeking = true;
     ui.timeCurrent.textContent = formatTime(Number(ui.seekSlider.value));
@@ -1380,7 +1343,6 @@
     if (state.roomCode) enterAsListener(state.roomCode);
   });
 
-  // Громкость
   ui.volumeSlider.addEventListener('input', () => {
     const val = Number(ui.volumeSlider.value);
     audio.setVolume(val);
@@ -1398,38 +1360,6 @@
     ui.iconVolOff.classList.toggle('hidden', !audio.muted);
   });
 
-  // Настройки Bluetooth и глобальной задержки
-  ui.chkAutoSysLatency.addEventListener('change', () => {
-    audio.setAutoSystemLatency(ui.chkAutoSysLatency.checked);
-  });
-
-  ui.btnDetectDevices.addEventListener('click', async () => {
-    const ok = await audio.requestDeviceLabelsAccess();
-    if (ok) {
-      showToast('Аудиоустройства и локальный IP определены!', 'success');
-    } else {
-      showToast('Доступ отклонён — используется системный outputLatency', 'info');
-    }
-  });
-
-  document.querySelectorAll('[data-bt-preset]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const ms = Number(btn.dataset.btPreset);
-      audio.setExtraLatency(ms);
-    });
-  });
-
-  document.querySelectorAll('[data-nudge]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const delta = Number(btn.dataset.nudge);
-      audio.nudgeExtraLatency(delta);
-    });
-  });
-
-  ui.btnResetOffset.addEventListener('click', () => {
-    audio.setExtraLatency(0);
-  });
-
   document.addEventListener('visibilitychange', async () => {
     if (document.visibilityState === 'visible' && state.role) {
       await audio.ensureResumed();
@@ -1444,7 +1374,6 @@
     ui.inputRoomCode.value = clean.length > 3 ? `${clean.slice(0, 3)}-${clean.slice(3)}` : clean;
   });
 
-  // Диагностический хук для автотестов
   window.__orpheus = {
     state,
     audio,
@@ -1457,8 +1386,6 @@
     hostPause,
   };
 
-  // Инициализация стартового экрана
-  renderLatencyUI(audio.getLatencyProfile());
   const params = new URLSearchParams(window.location.search);
   const urlRoom = NetworkManager.normalizeCode(params.get('room') || window.location.hash.replace('#room=', ''));
   if (urlRoom.length >= 4) {

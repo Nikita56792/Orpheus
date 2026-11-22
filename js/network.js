@@ -1,35 +1,9 @@
 /**
- * NetworkManager v2 — Надёжный P2P-транспорт без зависимости от PeerJS Cloud.
- *
- * Почему v1 не работал:
- * 1) Публичный сервер 0.peerjs.com заблокирован/отдаёт 403.
- * 2) openrelay.metered.ca недоступен/заглушен на локальных сетях.
- * 3) NTP-пинги шли по одному каналу с передачей MP3 (огромный джиттер).
- *
- * Архитектура v2 (100% статика на GitHub Pages, работает в одной Wi-Fi сети,
- * между разными SSID/VLAN одной точки доступа (School ↔ DOS-WIFI-FREE) и через NAT/VPN):
- *
- * 1. Многоканальный сигналинг по HTTPS/WSS (порт 443, проходит любые школьные/корпоративные файрволы):
- *    - Основной: ntfy.sh WebSocket + HTTPS POST (мгновенный обмен SDP Offer/Answer + ICE).
- *    - Резервный (параллельно): BroadcastChannel (мгновенно для вкладок одного устройства)
- *      + WebTorrent WSS трекеры (tracker.webtorrent.dev, tracker.openwebtorrent.com).
- *
- * 2. Нативный RTCPeerConnection с 3 выделенными DataChannel:
- *    - `orpheus-ntp`  (ordered: false, maxRetransmits: 0) — чистый UDP-NTP без задержек!
- *    - `orpheus-ctrl` (ordered: true) — команды Play/Pause, плейлист, глобальная BT-задержка.
- *    - `orpheus-data` (ordered: true, binary ArrayBuffer) — скоростная бинарная передача аудио
- *      без base64-накладных расходов и с предзагрузкой следующего трека плейлиста!
- *
- * 3. Умная маршрутизация ICE:
- *    - В одной подсети (один Wi-Fi / AP) WebRTC автоматически выбирает локальные LAN host-кандидаты
- *      (трафик не выходит в интернет, RTT 1–5 мс!).
- *    - Между разными подсетями/SSID (School ↔ DOS-WIFI-FREE) WebRTC пробивает NAT напрямую по UDP
- *      через пул быстрых STUN-серверов (вкл. stun.sipnet.ru, Google, Cloudflare).
- *    - Если UDP полностью заблокирован жёстким файрволом — автоматический бесшовный переход
- *      на WSS Relay Fallback (ntfy.sh), включая передачу файлов!
+ * NetworkManager v2.1 — Нативный многоканальный WebRTC + WSS Relay Fallback
+ * с живыми процентами загрузки для каждого устройства и бесшовным Late Join во время игры.
  */
 class NetworkManager {
-  static CHUNK_SIZE = 16000; // 16 КБ чистых байт (безопасно для SCTP iOS/Android, без base64!)
+  static CHUNK_SIZE = 16000;
   static MAX_BUFFERED_AMOUNT = 128 * 1024;
   static ICE_GATHER_WAIT_MS = 2400;
   static P2P_TIMEOUT_MS = 10000;
@@ -48,8 +22,8 @@ class NetworkManager {
 
   constructor(callbacks = {}) {
     this.cb = callbacks;
-    this.role = null;       // 'host' | 'listener'
-    this.roomCode = null;   // 'K7M4PX'
+    this.role = null;
+    this.roomCode = null;
     this.selfId = NetworkManager.generatePeerId();
     this.deviceName = NetworkManager.detectDeviceName();
 
@@ -61,12 +35,10 @@ class NetworkManager {
     this._bc = null;
     this._seenMsgIds = new Set();
 
-    // Хост: список подключённых слушателей
-    this.clients = new Map(); // peerId -> clientObj
+    // Хост
+    this.clients = new Map();
     this.clientCounter = 0;
-
-    // Хост: состояние плейлиста и воспроизведения
-    this.playlist = [];       // [{ id, type, name, duration, size, mime, url, buffer }]
+    this.playlist = [];
     this.activeTrackId = null;
     this.playbackState = {
       playing: false,
@@ -77,22 +49,19 @@ class NetworkManager {
     this.hostLatencyProfile = { totalLatencyMs: 0, systemLatencyMs: 0, isBluetooth: false, outputDeviceLabel: '' };
     this.roomLatencyState = { roomMaxLatencyMs: 0, slowestLabel: 'Хост', bluetoothCount: 0, deviceCount: 1 };
 
-    // Слушатель: соединение с Хостом
+    // Слушатель
     this.hostPeerId = null;
     this.hostPc = null;
     this.hostChannels = { ntp: null, ctrl: null, data: null };
-    this.hostTransport = 'connecting'; // 'p2p-lan' | 'p2p-udp' | 'relay'
+    this.hostTransport = 'connecting';
     this._listenerJoinResolve = null;
     this._listenerJoinReject = null;
     this._listenerJoinTimer = null;
     this._listenerProgressCb = null;
     this._listenerConnected = false;
     this._listenerPendingIce = [];
-    this._listenerHeartbeatTimer = null;
 
-    // Приём бинарных файлов на Слушателе (поддерживает параллельную предзагрузку!)
-    this.incomingFiles = new Map(); // trackHash -> fileRecvState
-    this._trackHashToMeta = new Map(); // trackHash -> { trackId, name, mime, totalBytes, totalChunks }
+    this.incomingFiles = new Map();
   }
 
   static generatePeerId() {
@@ -141,11 +110,11 @@ class NetworkManager {
     if (/iPad/i.test(ua)) return 'iPad';
     if (/Android/i.test(ua)) return 'Android';
     if (/Macintosh|Mac OS/i.test(ua)) return 'Mac';
-    if (/Windows/i.test(ua)) return 'Windows PC';
+    if (/Windows/i.test(ua)) return 'Windows';
     return 'Устройство';
   }
 
-  /* ==================== СИГНАЛИНГ (NTFY.SH WSS + BROADCASTCHANNEL) ==================== */
+  /* ==================== СИГНАЛИНГ ==================== */
 
   _roomTopic(code) {
     return `orpheus-sync-v2-room-${code.toLowerCase()}`;
@@ -156,7 +125,6 @@ class NetworkManager {
     this._sigTopic = this._roomTopic(code);
     this._sigAlive = true;
 
-    // 1. Локальный BroadcastChannel для мгновенной работы вкладок на одном устройстве
     try {
       this._bc = new BroadcastChannel(this._sigTopic);
       this._bc.onmessage = (ev) => {
@@ -164,7 +132,6 @@ class NetworkManager {
       };
     } catch (_) {}
 
-    // 2. Ntfy.sh WebSocket (порт 443 — проходит School, DOS-WIFI-FREE, VPN, сотовые сети)
     return new Promise((resolve, reject) => {
       let settled = false;
       const wsUrl = `${NetworkManager.NTFY_WS_BASE}/${this._sigTopic}/ws`;
@@ -177,7 +144,7 @@ class NetworkManager {
           const openTimeout = setTimeout(() => {
             if (!settled) {
               settled = true;
-              reject(new Error('Не удалось подключиться к сигнальному серверу (WSS 443). Проверьте интернет.'));
+              reject(new Error('Не удалось подключиться к сигнальному серверу (WSS 443).'));
             }
           }, 9000);
 
@@ -210,9 +177,7 @@ class NetworkManager {
             }
           };
 
-          ws.onerror = () => {
-            // onclose вызовет переподключение
-          };
+          ws.onerror = () => {};
         } catch (err) {
           if (!settled) {
             settled = true;
@@ -250,12 +215,10 @@ class NetworkManager {
     };
     this._seenMsgIds.add(msg.mid);
 
-    // 1. Локальный BroadcastChannel
     if (this._bc) {
       try { this._bc.postMessage(msg); } catch (_) {}
     }
 
-    // 2. HTTPS POST на ntfy.sh
     try {
       await fetch(`${NetworkManager.NTFY_BASE}/${this._sigTopic}`, {
         method: 'POST',
@@ -286,7 +249,7 @@ class NetworkManager {
     }
   }
 
-  /* ==================== ЗАПУСК ХОСТА ==================== */
+  /* ==================== ХОСТ ==================== */
 
   async startHost(preferredCode = null) {
     this.destroy();
@@ -304,7 +267,7 @@ class NetworkManager {
   async _hostHandleSignal(msg) {
     switch (msg.sig) {
       case 'JOIN_REQ': {
-        await this._hostAcceptListener(msg.from, msg.deviceName || 'Слушатель', msg.offer, msg.candidates || []);
+        await this._hostAcceptListener(msg.from, msg.deviceName || 'Устройство', msg.offer, msg.candidates || []);
         break;
       }
 
@@ -319,11 +282,10 @@ class NetworkManager {
       }
 
       case 'RELAY_ENABLE': {
-        // Слушатель не смог пробить UDP NAT — переключаем его на WSS Relay Fallback!
         const client = this.clients.get(msg.from);
         if (client) {
           client.transport = 'relay';
-          client.transportLabel = 'WSS Relay';
+          client.transportLabel = 'Relay';
           client.open = true;
           this._emitPeers();
           await this._sendSignal({ sig: 'RELAY_ACK', to: msg.from });
@@ -348,7 +310,6 @@ class NetworkManager {
   }
 
   async _hostAcceptListener(peerId, deviceName, remoteOffer, remoteCandidates) {
-    // Если этот peerId переподключается — аккуратно закрываем старый PC
     if (this.clients.has(peerId)) {
       this._hostRemoveClient(peerId, false);
     }
@@ -360,11 +321,12 @@ class NetworkManager {
       pc,
       channels: { ntp: null, ctrl: null, data: null },
       transport: 'connecting',
-      transportLabel: 'Подкл...',
+      transportLabel: 'Подкл.',
       open: false,
       label,
       rttMs: null,
       status: 'Подключение...',
+      phase: 'connecting',
       progress: 0,
       readyTracks: new Set(),
       transferQueue: [],
@@ -418,7 +380,8 @@ class NetworkManager {
           }
           if (!client.syncedOnce) {
             client.syncedOnce = true;
-            client.status = 'Сверка часов...';
+            client.phase = 'syncing';
+            client.status = 'Синхронизация...';
             this._detectTransportType(pc, (type, text) => {
               client.transport = type;
               client.transportLabel = text;
@@ -455,7 +418,6 @@ class NetworkManager {
         });
       } else if (st === 'disconnected' || st === 'failed' || st === 'closed') {
         if (client.transport !== 'relay') {
-          // Даём 2.5 сек на случай кратковременного роуминга между точками доступа в здании
           setTimeout(() => {
             if (this.clients.get(peerId) === client && client.transport !== 'relay') {
               const cur = pc.iceConnectionState;
@@ -476,9 +438,7 @@ class NetworkManager {
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-
-      // Ждём быстрый сбор локальных LAN и STUN кандидатов
-      await this._waitIceGathering(pc, NetworkManager.ICE_GATHER_WAIT_MS, gatheredCandidates);
+      await this._waitIceGathering(pc, NetworkManager.ICE_GATHER_WAIT_MS);
       trickleSent = true;
 
       await this._sendSignal({
@@ -506,30 +466,39 @@ class NetworkManager {
   }
 
   _hostSyncNewClient(client) {
-    // 1. Отправляем текущее глобальное выравнивание задержек
+    // 1. Текущее глобальное выравнивание задержек (в т.ч. Bluetooth)
     this._recomputeRoomLatency();
     this._sendToClient(client, 'ctrl', {
       type: 'ROOM_LATENCY',
       ...this.roomLatencyState,
     });
 
-    // 2. Отправляем плейлист (метаданные без бинарных буферов)
+    // 2. Плейлист
     this._sendToClient(client, 'ctrl', {
       type: 'PLAYLIST_STATE',
       activeTrackId: this.activeTrackId,
       tracks: this._serializePlaylistMeta(),
     });
 
-    // 3. Отправляем активный трек (и ставим следующий трек в фон на предзагрузку)
+    // 3. Активный трек + предзагрузка следующего
     if (this.activeTrackId) {
       const active = this.playlist.find((t) => t.id === this.activeTrackId);
       if (active) {
+        client.phase = 'loading';
+        client.progress = 0;
+        client.status = 'Загрузка 0%';
+        this._emitPeers();
         this._queueTrackForClient(client, active, true);
       }
       const next = this._getNextPlaylistTrack(this.activeTrackId);
       if (next && next.id !== this.activeTrackId) {
         this._queueTrackForClient(client, next, false);
       }
+    } else {
+      client.phase = 'ready';
+      client.progress = 100;
+      client.status = 'Готово';
+      this._emitPeers();
     }
   }
 
@@ -552,8 +521,12 @@ class NetworkManager {
 
       case 'CLIENT_METRICS': {
         client.rttMs = Math.round(msg.rttMs);
-        if (client.status === 'Сверка часов...' || client.status === 'Подключение...') {
-          client.status = this.activeTrackId ? (client.readyTracks.has(this.activeTrackId) ? 'Готов' : 'Загрузка...') : 'Готов';
+        if (client.phase === 'syncing' || client.phase === 'connecting') {
+          if (!this.activeTrackId || client.readyTracks.has(this.activeTrackId)) {
+            client.phase = 'ready';
+            client.progress = 100;
+            client.status = 'Готово';
+          }
         }
         this._emitPeers();
         break;
@@ -567,15 +540,41 @@ class NetworkManager {
           isBluetooth: Boolean(msg.isBluetooth),
           outputDeviceLabel: String(msg.outputDeviceLabel || ''),
         };
+        const prevMax = this.roomLatencyState.roomMaxLatencyMs;
         this._recomputeRoomLatency();
+        const newMax = this.roomLatencyState.roomMaxLatencyMs;
+
+        // Если во время предстартового отсчёта подключилось устройство с большей BT-задержкой,
+        // сдвигаем T_acoustic чуть вперёд, чтобы все (включая нового BT-слушателя) стартовали с 0:00 ровно!
+        if (
+          this.playbackState.playing &&
+          newMax > prevMax &&
+          this.playbackState.hostStartTime - performance.now() > 150 &&
+          this.playbackState.hostStartTime - newMax < performance.now() + 250
+        ) {
+          const shiftedStart = performance.now() + newMax + 600;
+          this.playbackState.hostStartTime = shiftedStart;
+          this._broadcast('ctrl', {
+            type: 'CMD_PLAY',
+            trackId: this.playbackState.trackId,
+            hostStartTime: shiftedStart,
+            trackOffset: this.playbackState.trackOffset,
+            roomMaxLatencyMs: newMax,
+          });
+          if (this.cb.onHostRescheduleNeeded) {
+            this.cb.onHostRescheduleNeeded(this.playbackState);
+          }
+        }
         this._emitPeers();
         break;
       }
 
       case 'TRACK_PROGRESS': {
         if (msg.trackId === this.activeTrackId) {
-          client.progress = msg.progress;
-          client.status = `Загрузка ${msg.progress}%`;
+          const p = Math.max(0, Math.min(99, Math.round(msg.progress || 0)));
+          client.progress = Math.max(client.progress, p);
+          client.phase = msg.phase === 'decoding' ? 'decoding' : 'loading';
+          client.status = msg.phase === 'decoding' ? `Декодирование ${client.progress}%` : `Загрузка ${client.progress}%`;
           this._emitPeers();
         }
         break;
@@ -585,10 +584,11 @@ class NetworkManager {
         client.readyTracks.add(msg.trackId);
         if (msg.trackId === this.activeTrackId) {
           client.progress = 100;
-          client.status = 'Готов';
+          client.phase = 'ready';
+          client.status = 'Готово';
           this._emitPeers();
 
-          // Late Join: если этот трек прямо сейчас играет — подключаем слушателя на лету!
+          // Late Join: если Хост прямо сейчас играет этот трек — синхронизируем нового слушателя!
           if (this.playbackState.playing && this.playbackState.trackId === msg.trackId) {
             this._sendToClient(client, 'ctrl', {
               type: 'CMD_PLAY',
@@ -596,6 +596,7 @@ class NetworkManager {
               hostStartTime: this.playbackState.hostStartTime,
               trackOffset: this.playbackState.trackOffset,
               roomMaxLatencyMs: this.roomLatencyState.roomMaxLatencyMs,
+              isLateJoin: true,
             });
           }
         }
@@ -604,7 +605,8 @@ class NetworkManager {
 
       case 'TRACK_ERROR': {
         if (msg.trackId === this.activeTrackId) {
-          client.status = 'Ошибка трека';
+          client.phase = 'error';
+          client.status = 'Ошибка';
           this._emitPeers();
         }
         break;
@@ -612,7 +614,7 @@ class NetworkManager {
     }
   }
 
-  /* ==================== ГЛОБАЛЬНАЯ СИНХРОНИЗАЦИЯ ЗАДЕРЖЕК (BLUETOOTH) ==================== */
+  /* ==================== ГЛОБАЛЬНАЯ СИНХРОНИЗАЦИЯ ЗАДЕРЖЕК ==================== */
 
   updateHostLatency(profile) {
     this.hostLatencyProfile = {
@@ -632,7 +634,7 @@ class NetworkManager {
 
     let maxMs = this.hostLatencyProfile.totalLatencyMs || 0;
     let slowestLabel = this.hostLatencyProfile.isBluetooth
-      ? `Хост (BT: ${this.hostLatencyProfile.outputDeviceLabel || this.deviceName})`
+      ? `Хост (${this.hostLatencyProfile.outputDeviceLabel || this.deviceName})`
       : `Хост (${this.deviceName})`;
     let btCount = this.hostLatencyProfile.isBluetooth ? 1 : 0;
     let devCount = 1;
@@ -670,7 +672,7 @@ class NetworkManager {
     }
   }
 
-  /* ==================== УПРАВЛЕНИЕ ПЛЕЙЛИСТОМ (ХОСТ) ==================== */
+  /* ==================== ПЛЕЙЛИСТ И ПЕРЕДАЧА ==================== */
 
   _serializePlaylistMeta() {
     return this.playlist.map((t) => ({
@@ -705,7 +707,6 @@ class NetworkManager {
       };
     }
 
-    // Рассылаем обновлённый плейлист всем слушателям
     this._broadcast('ctrl', {
       type: 'PLAYLIST_STATE',
       activeTrackId: this.activeTrackId,
@@ -717,33 +718,40 @@ class NetworkManager {
 
     for (const client of this.clients.values()) {
       if (activeTrack) {
+        if (client.readyTracks.has(activeTrack.id)) {
+          client.progress = 100;
+          client.phase = 'ready';
+          client.status = 'Готово';
+        } else {
+          client.progress = 0;
+          client.phase = 'loading';
+          client.status = 'Загрузка 0%';
+        }
         this._queueTrackForClient(client, activeTrack, true);
+      } else {
+        client.progress = 100;
+        client.phase = 'ready';
+        client.status = 'Готово';
       }
       if (nextTrack && nextTrack.id !== activeTrackId) {
         this._queueTrackForClient(client, nextTrack, false);
       }
     }
-  }
-
-  /** Фоновая предзагрузка конкретного трека (например, следующего в плейлисте) */
-  preloadTrackForAll(track) {
-    if (!track) return;
-    for (const client of this.clients.values()) {
-      this._queueTrackForClient(client, track, false);
-    }
+    this._emitPeers();
   }
 
   _queueTrackForClient(client, track, highPriority) {
     if (!client.open || !track) return;
     if (client.readyTracks.has(track.id)) {
       if (track.id === this.activeTrackId) {
-        client.status = 'Готов';
+        client.progress = 100;
+        client.phase = 'ready';
+        client.status = 'Готово';
         this._emitPeers();
       }
       return;
     }
 
-    // Убираем дубликат из очереди
     client.transferQueue = client.transferQueue.filter((item) => item.track.id !== track.id);
     if (highPriority) {
       client.transferQueue.unshift({ track, highPriority: true });
@@ -777,7 +785,9 @@ class NetworkManager {
 
     if (track.type === 'demo' || track.type === 'pulse') {
       if (isActive) {
-        client.status = 'Синтез...';
+        client.progress = 20;
+        client.phase = 'loading';
+        client.status = 'Подготовка 20%';
         this._emitPeers();
       }
       this._sendToClient(client, 'ctrl', {
@@ -792,7 +802,9 @@ class NetworkManager {
 
     if (track.type === 'url') {
       if (isActive) {
-        client.status = 'Загрузка URL...';
+        client.progress = 10;
+        client.phase = 'loading';
+        client.status = 'Загрузка 10%';
         this._emitPeers();
       }
       this._sendToClient(client, 'ctrl', {
@@ -806,7 +818,6 @@ class NetworkManager {
     }
 
     if (track.type === 'file' && track.buffer) {
-      // Если клиент на резервном WSS Relay — загружаем файл один раз через ntfy.sh attachment!
       if (client.transport === 'relay') {
         await this._sendFileViaRelay(client, track, isActive);
         return;
@@ -821,8 +832,9 @@ class NetworkManager {
       const trackHash = NetworkManager.hashTrackId(track.id);
 
       if (isActive) {
-        client.status = 'Отправка 0%';
         client.progress = 0;
+        client.phase = 'loading';
+        client.status = 'Загрузка 0%';
         this._emitPeers();
       }
 
@@ -837,8 +849,7 @@ class NetworkManager {
         isActive,
       });
 
-      // Даём метаданным дойти по ctrl раньше первых бинарных чанков
-      await new Promise((r) => setTimeout(r, 25));
+      await new Promise((r) => setTimeout(r, 20));
 
       const rawBytes = new Uint8Array(track.buffer);
       let lastUiPct = -1;
@@ -846,7 +857,6 @@ class NetworkManager {
       for (let i = 0; i < totalChunks; i++) {
         if (!client.open || dataCh.readyState !== 'open') return;
 
-        // Если это фоновая предзагрузка, а Хост переключил активный трек на другой — прерываем фон
         if (!isActive && client.transferQueue.some((q) => q.highPriority)) {
           client.transferQueue.push({ track, highPriority: false });
           return;
@@ -861,7 +871,6 @@ class NetworkManager {
         const end = Math.min(start + chunkSize, totalBytes);
         const payloadLen = end - start;
 
-        // Компактный бинарный пакет: [4B trackHash][4B chunkIndex][4B totalChunks][rawBytes]
         const packet = new ArrayBuffer(12 + payloadLen);
         const view = new DataView(packet);
         view.setUint32(0, trackHash, false);
@@ -877,33 +886,36 @@ class NetworkManager {
         }
 
         if (isActive) {
-          const pct = Math.round(((i + 1) / totalChunks) * 100);
-          if (pct !== lastUiPct && (pct - lastUiPct >= 5 || pct === 100)) {
+          // 0..92% на передачу, 95% на декодирование, 100% на TRACK_READY
+          const pct = Math.round(((i + 1) / totalChunks) * 92);
+          if (pct !== lastUiPct && (pct - lastUiPct >= 2 || i === totalChunks - 1)) {
             lastUiPct = pct;
-            client.progress = pct;
-            client.status = pct < 100 ? `Отправка ${pct}%` : 'Декодирование...';
+            client.progress = Math.max(client.progress, pct);
+            client.phase = i === totalChunks - 1 ? 'decoding' : 'loading';
+            client.status = i === totalChunks - 1 ? 'Декодирование 95%' : `Загрузка ${client.progress}%`;
             this._emitPeers();
           }
         } else if (i % 10 === 0) {
-          // Фоновая предзагрузка не мешает текущему аудио и UI
           await new Promise((r) => setTimeout(r, 8));
         }
       }
     }
   }
 
-  /** Резервная передача файла через ntfy.sh attachment при жёстко заблокированном UDP */
   async _sendFileViaRelay(client, track, isActive) {
     if (track.buffer.byteLength > 14 * 1024 * 1024) {
       if (isActive) {
-        client.status = 'Файл >14 МБ (Relay)';
+        client.phase = 'error';
+        client.status = 'Файл >14 МБ';
         this._emitPeers();
       }
       return;
     }
 
     if (isActive) {
-      client.status = 'Загрузка в Relay...';
+      client.progress = 15;
+      client.phase = 'loading';
+      client.status = 'Отправка 15%';
       this._emitPeers();
     }
 
@@ -923,6 +935,12 @@ class NetworkManager {
         }
       }
 
+      if (isActive) {
+        client.progress = 55;
+        client.status = 'Загрузка 55%';
+        this._emitPeers();
+      }
+
       this._sendToClient(client, 'ctrl', {
         type: 'TRACK_URL',
         trackId: track.id,
@@ -933,7 +951,8 @@ class NetworkManager {
     } catch (err) {
       console.warn('[Network] Relay file upload failed:', err);
       if (isActive) {
-        client.status = 'Ошибка Relay-файла';
+        client.phase = 'error';
+        client.status = 'Ошибка загрузки';
         this._emitPeers();
       }
     }
@@ -1014,9 +1033,11 @@ class NetworkManager {
       label: c.label,
       rttMs: c.rttMs,
       status: c.status,
+      phase: c.phase,
+      progress: c.progress,
       transport: c.transport,
       transportLabel: c.transportLabel,
-      ready: c.status === 'Готов',
+      ready: c.phase === 'ready',
       latencyMs: c.latency?.totalLatencyMs || 0,
       isBluetooth: Boolean(c.latency?.isBluetooth),
       outputDeviceLabel: c.latency?.outputDeviceLabel || '',
@@ -1024,7 +1045,7 @@ class NetworkManager {
     this.cb.onPeersChanged(list);
   }
 
-  /* ==================== ЗАПУСК СЛУШАТЕЛЯ ==================== */
+  /* ==================== СЛУШАТЕЛЬ ==================== */
 
   async joinAsListener(rawCode, onProgress = () => {}) {
     this.destroy();
@@ -1032,12 +1053,12 @@ class NetworkManager {
     this.selfId = NetworkManager.generatePeerId();
     const code = NetworkManager.normalizeCode(rawCode);
     if (code.length < 4) {
-      throw new Error('Введите 6-значный код комнаты (например, K7M-4PX)');
+      throw new Error('Введите 6-значный код комнаты');
     }
     this.roomCode = code;
     this._listenerProgressCb = onProgress;
 
-    onProgress('1/4 Подключение к каналу обнаружения...');
+    onProgress('Подключение...');
     await this._openSignaling(code);
 
     return new Promise(async (resolve, reject) => {
@@ -1048,7 +1069,6 @@ class NetworkManager {
       const pc = new RTCPeerConnection(NetworkManager.ICE_CONFIG);
       this.hostPc = pc;
 
-      // Создаём 3 раздельных WebRTC DataChannel
       const ntpCh = pc.createDataChannel('orpheus-ntp', { ordered: false, maxRetransmits: 0 });
       const ctrlCh = pc.createDataChannel('orpheus-ctrl', { ordered: true });
       const dataCh = pc.createDataChannel('orpheus-data', { ordered: true });
@@ -1148,7 +1168,7 @@ class NetworkManager {
         if (this.hostPc !== pc) return;
         const st = pc.iceConnectionState;
         if (st === 'checking' && !this._listenerConnected) {
-          onProgress('3/4 Установка прямого P2P-канала...');
+          onProgress('Установка соединения...');
         } else if (st === 'connected' || st === 'completed') {
           this._detectTransportType(pc, (type, text) => {
             this.hostTransport = type;
@@ -1156,7 +1176,6 @@ class NetworkManager {
           });
         } else if (st === 'failed') {
           if (!this._listenerConnected && this.hostPeerId) {
-            // Автоматически переходим на WSS Relay Fallback!
             this._activateListenerRelayFallback(onProgress);
           } else if (this._listenerConnected && this.hostTransport !== 'relay') {
             this._listenerConnected = false;
@@ -1165,11 +1184,10 @@ class NetworkManager {
         }
       };
 
-      // Собираем Offer + ICE кандидаты
-      onProgress(`2/4 Поиск комнаты ${NetworkManager.formatCode(code)}...`);
+      onProgress(`Поиск комнаты ${NetworkManager.formatCode(code)}...`);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      await this._waitIceGathering(pc, NetworkManager.ICE_GATHER_WAIT_MS, gatheredCandidates);
+      await this._waitIceGathering(pc, NetworkManager.ICE_GATHER_WAIT_MS);
       offerSent = true;
 
       const sendJoinReq = () => {
@@ -1182,11 +1200,9 @@ class NetworkManager {
         });
       };
 
-      // Отправляем запрос на вход (и повторяем через 3.2 сек, если Хост пропустил первый пакет)
       sendJoinReq();
-      const retryReqTimer = setTimeout(sendJoinReq, 3200);
+      const retryReqTimer = setTimeout(sendJoinReq, 3000);
 
-      // Таймаут прямого P2P: если Хост ответил, но UDP заблокирован — переключаемся на WSS Relay!
       this._listenerJoinTimer = setTimeout(() => {
         clearTimeout(retryReqTimer);
         if (this._listenerConnected) return;
@@ -1197,7 +1213,7 @@ class NetworkManager {
           const rej = this._listenerJoinReject;
           this._listenerJoinResolve = null;
           this._listenerJoinReject = null;
-          rej(new Error(`Комната ${NetworkManager.formatCode(code)} не отвечает. Проверьте код и что вкладка Хоста открыта.`));
+          rej(new Error(`Комната ${NetworkManager.formatCode(code)} не найдена.`));
         }
       }, NetworkManager.P2P_TIMEOUT_MS);
     });
@@ -1206,7 +1222,7 @@ class NetworkManager {
   async _activateListenerRelayFallback(onProgress) {
     if (this._listenerConnected || this.hostTransport === 'relay' || !this.hostPeerId) return;
     this.hostTransport = 'relay';
-    onProgress('4/4 Строгий NAT — включаем WSS Relay...');
+    onProgress('Подключение через резервный канал...');
     await this._sendSignal({ sig: 'RELAY_ENABLE', to: this.hostPeerId });
 
     setTimeout(() => {
@@ -1214,7 +1230,7 @@ class NetworkManager {
         const rej = this._listenerJoinReject;
         this._listenerJoinResolve = null;
         this._listenerJoinReject = null;
-        rej(new Error('Не удалось установить связь с Хостом даже через резервный канал.'));
+        rej(new Error('Не удалось подключиться к комнате.'));
       }
     }, 5500);
   }
@@ -1225,7 +1241,7 @@ class NetworkManager {
         if (!this.hostPc || this.hostPeerId) return;
         this.hostPeerId = msg.from;
         if (this._listenerProgressCb) {
-          this._listenerProgressCb('3/4 Хост найден! Пробиваем P2P-канал...');
+          this._listenerProgressCb('Установка соединения...');
         }
         try {
           await this.hostPc.setRemoteDescription(new RTCSessionDescription(msg.answer));
@@ -1259,7 +1275,7 @@ class NetworkManager {
         this._listenerConnected = true;
         this.hostTransport = 'relay';
         clearTimeout(this._listenerJoinTimer);
-        if (this.cb.onTransportChanged) this.cb.onTransportChanged('relay', 'WSS Relay');
+        if (this.cb.onTransportChanged) this.cb.onTransportChanged('relay', 'Relay');
         if (this._listenerJoinResolve) {
           const res = this._listenerJoinResolve;
           this._listenerJoinResolve = null;
@@ -1379,14 +1395,14 @@ class NetworkManager {
       f.receivedCount++;
     }
 
-    const pct = Math.round((f.receivedCount / f.totalChunks) * 100);
-    if (pct !== f.lastReportedPct && (pct - f.lastReportedPct >= 5 || pct === 100)) {
+    const pct = Math.round((f.receivedCount / f.totalChunks) * 94);
+    if (pct !== f.lastReportedPct && (pct - f.lastReportedPct >= 3 || f.receivedCount === f.totalChunks)) {
       f.lastReportedPct = pct;
       if (f.isActive && this.cb.onFileProgress) {
         this.cb.onFileProgress({ trackId: f.trackId, name: f.name, pct, isActive: true });
       }
       if (f.isActive) {
-        this.sendToHost({ type: 'TRACK_PROGRESS', trackId: f.trackId, progress: pct });
+        this.sendToHost({ type: 'TRACK_PROGRESS', trackId: f.trackId, progress: pct, phase: 'loading' });
       }
     }
 
@@ -1411,7 +1427,7 @@ class NetworkManager {
 
   /* ==================== УТИЛИТЫ WEBRTC ==================== */
 
-  _waitIceGathering(pc, maxWaitMs, gatheredRef = null) {
+  _waitIceGathering(pc, maxWaitMs) {
     return new Promise((resolve) => {
       if (pc.iceGatheringState === 'complete') {
         resolve();
@@ -1436,7 +1452,6 @@ class NetworkManager {
           done();
           return;
         }
-        // Как только получили хотя бы 1 srflx (STUN) кандидат — даём 250 мс добрать остальные и стартуем!
         if (ev.candidate.candidate && ev.candidate.candidate.includes('typ srflx') && !earlyTimer) {
           earlyTimer = setTimeout(done, 250);
         }
@@ -1464,11 +1479,11 @@ class NetworkManager {
       const rt = remote?.candidateType || '';
 
       if (lt === 'relay' || rt === 'relay') {
-        cb('turn', 'TURN Relay');
+        cb('turn', 'Relay');
       } else if (lt === 'host' && rt === 'host') {
-        cb('p2p-lan', 'LAN Прямой');
+        cb('p2p-lan', 'LAN');
       } else {
-        cb('p2p-udp', 'P2P UDP');
+        cb('p2p-udp', 'P2P');
       }
     } catch (_) {}
   }

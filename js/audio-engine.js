@@ -1,25 +1,18 @@
 /**
- * AudioEngine — высокоточный аудиодвижок (Web Audio API) с глобальной компенсацией
- * задержки Bluetooth и системного аудиовывода по всей сети.
+ * AudioEngine — полностью автоматический аудиодвижок (Web Audio API)
+ * с глобальным выравниванием системных и Bluetooth-задержек по всему зданию.
  *
- * Архитектура глобального выравнивания (Building-Wide Acoustic Sync):
- * - Каждое устройство (Хост и каждый Слушатель) непрерывно измеряет собственную
- *   аппаратную/Bluetooth-задержку вывода:
- *     systemLatencyMs = задержка AudioContext (outputLatency / getOutputTimestamp + baseLatency)
- *     totalLatencyMs  = (autoSystemLatency ? systemLatencyMs : 0) + extraLatencyMs
- * - Каждое устройство сообщает totalLatencyMs Хосту.
- * - Хост вычисляет roomMaxLatencyMs = max(всех устройств в комнате) и рассылает всем.
- * - Команда старта задаёт T_acoustic (hostStartTime) — момент времени Хоста, когда
- *   АКУСТИЧЕСКАЯ ВОЛНА должна выйти из динамиков ВСЕХ устройств одновременно.
- * - Каждое устройство i подаёт сигнал в Web Audio в момент:
- *     T_feed_i = T_acoustic - totalLatencyMs_i
- * - В результате:
- *   • Устройство с Bluetooth (например, 260 мс) подаёт звук первым (за 260 мс до T_acoustic)
- *   • Устройство с другим Bluetooth (например, 180 мс) ждёт +80 мс и подаёт за 180 мс
- *   • Обычный телефон без Bluetooth (например, 24 мс) ждёт +236 мс и подаёт за 24 мс
- *   • Акустически звук выходит ИЗ ВСЕХ КОЛОНОК И ТЕЛЕФОНОВ В ЗДАНИИ В ОДНУ МИЛЛИСЕКУНДУ!
- * - При подключении/отключении Bluetooth «на лету» (devicechange / polling) устройство
- *   автоматически пересчитывает задержку, бесшовно пересинхронизируется и обновляет сеть.
+ * Всё работает автоматически без ручных настроек:
+ * 1. Неслышимый keepalive-узел держит аппаратный тракт активным, чтобы
+ *    AudioContext.outputLatency / baseLatency / getOutputTimestamp() всегда отдавали
+ *    точную системную задержку динамика или подключённого Bluetooth-устройства.
+ * 2. Событие devicechange + фоновый мониторинг мгновенно замечают подключение/отключение
+ *    Bluetooth на любом устройстве и автоматически пересинхронизируют сеть.
+ * 3. Все устройства синхронизируются по единому акустическому времени T_acoustic:
+ *    T_feed_i = T_acoustic - totalLatencyMs_i
+ *    — Bluetooth-устройства подают звук заранее, а обычные телефоны ждут разницу.
+ *    — При подключении новых устройств прямо во время воспроизведения (Late Join)
+ *      они мгновенно встраиваются в акустическую шкалу времени с учётом своей задержки.
  */
 class AudioEngine {
   static MAX_CACHED_BUFFERS = 12;
@@ -30,7 +23,7 @@ class AudioEngine {
     this.analyser = null;
     this.buffer = null;
     this.currentTrackId = null;
-    this.bufferCache = new Map(); // trackId -> AudioBuffer (LRU кэш для мгновенного плейлиста)
+    this.bufferCache = new Map();
 
     this.source = null;
     this.sourceGain = null;
@@ -46,23 +39,23 @@ class AudioEngine {
     this.isScheduled = false;
     this.hostStartTime = 0;    // T_acoustic (ms) по часам Хоста
     this.startTrackOffset = 0; // Позиция трека (sec) в момент T_acoustic
-    this.pausedPosition = 0;   // Позиция на паузе (sec)
+    this.pausedPosition = 0;
 
     // Точный трекинг текущей позиции с учётом переменного playbackRate
     this.anchorAudioTime = 0;
     this.anchorTrackPos = 0;
     this.currentRate = 1.0;
 
-    // Задержки аудиовывода и Bluetooth
-    this.autoSystemLatency = this._loadBool('orpheus_auto_sys_latency', true);
-    this.extraLatencyMs = this._loadNumber('orpheus_extra_latency_ms', 0, -500, 1200);
+    // Автоматически измеряемые задержки аудиовывода и Bluetooth
+    this.autoSystemLatency = true;
+    this.extraLatencyMs = 0;
     this.baseLatencyMs = 0;
     this.outputLatencyMs = 0;
     this.impliedLatencyMs = 0;
     this.systemLatencyMs = 0;
     this.isBluetoothDetected = false;
     this.outputDeviceLabel = '';
-    this.roomMaxLatencyMs = 0; // Максимум по всей комнате (от Хоста)
+    this.roomMaxLatencyMs = 0;
 
     this.lastDriftMs = 0;
     this._lastReportedLatencySig = '';
@@ -79,40 +72,11 @@ class AudioEngine {
     this._getHostTimeFn = null;
   }
 
-  _loadNumber(key, fallback, min, max) {
-    try {
-      const raw = localStorage.getItem(key);
-      if (raw === null) return fallback;
-      const val = Number(raw);
-      return Number.isFinite(val) ? Math.max(min, Math.min(max, val)) : fallback;
-    } catch (_) {
-      return fallback;
-    }
-  }
-
-  _loadBool(key, fallback) {
-    try {
-      const raw = localStorage.getItem(key);
-      if (raw === null) return fallback;
-      return raw === '1' || raw === 'true';
-    } catch (_) {
-      return fallback;
-    }
-  }
-
-  _savePref(key, val) {
-    try {
-      localStorage.setItem(key, String(val));
-    } catch (_) {}
-  }
-
-  /** Итоговая полная задержка вывода этого устройства (ms, >= 0) */
   getTotalOutputLatencyMs() {
     const sys = this.autoSystemLatency ? this.systemLatencyMs : 0;
     return Math.max(0, Math.round(sys + this.extraLatencyMs));
   }
 
-  /** Снимок телеметрии задержки устройства для UI и отправки Хосту */
   getLatencyProfile() {
     const totalLatencyMs = this.getTotalOutputLatencyMs();
     const waitDelayMs = Math.max(0, Math.round(this.roomMaxLatencyMs - totalLatencyMs));
@@ -136,13 +100,22 @@ class AudioEngine {
     this.onLatencyChange(this.getLatencyProfile());
   }
 
-  /**
-   * Инициализация и разблокировка Web Audio API строго внутри пользовательского клика.
-   */
+  /** Программная подстройка (для тестов/диагностики) */
+  setExtraLatency(ms) {
+    this.extraLatencyMs = Math.max(-500, Math.min(1200, Math.round(ms)));
+    this._lastReportedLatencySig = '';
+    this.onLatencyChange(this.getLatencyProfile());
+    if (this.isPlaying && this.buffer) {
+      this._stopSourceNode(true);
+      this._startSourceAligned();
+    }
+    return this.getLatencyProfile();
+  }
+
   async unlock() {
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     if (!AudioCtx) {
-      throw new Error('Ваш браузер не поддерживает Web Audio API');
+      throw new Error('Браузер не поддерживает Web Audio API');
     }
 
     if (!this.ctx) {
@@ -163,7 +136,7 @@ class AudioEngine {
       this.analyser.connect(this.ctx.destination);
     }
 
-    // 1) СИНХРОННЫЙ 1-сэмпловый прогрев внутри тапа (iOS Safari)
+    // 1) Синхронный прогрев 1-сэмпловым буфером (iOS Safari)
     try {
       const silentBuf = this.ctx.createBuffer(1, 1, 22050);
       const src = this.ctx.createBufferSource();
@@ -172,7 +145,7 @@ class AudioEngine {
       src.start(0);
     } catch (_) {}
 
-    // 2) Миниатюрный тихий WAV для iOS Media Playback режима
+    // 2) Тихий WAV для активации Media Playback режима на iOS
     if (!this._iosSilentAudio) {
       try {
         const silentWav =
@@ -185,7 +158,6 @@ class AudioEngine {
       } catch (_) {}
     }
 
-    // 3) Не зависаем навечно на resume()
     if (this.ctx.state === 'suspended') {
       try {
         await Promise.race([
@@ -195,15 +167,14 @@ class AudioEngine {
       } catch (_) {}
     }
 
-    // 4) Неслышимый keepalive-узел (gain = 0):
-    //    Держит аппаратный аудиотракт Android/macOS/iOS «живым», чтобы ctx.outputLatency
-    //    и ctx.getOutputTimestamp() ВСЕГДА отдавали реальную задержку Bluetooth/динамика!
+    // 3) Неслышимый keepalive-узел — держит outputLatency и getOutputTimestamp() живыми
     this._ensureKeepalive();
-
-    // 5) Запускаем непрерывный мониторинг аппаратной/Bluetooth задержки
     this._startLatencyMonitor();
     await this.probeAudioDevices();
     this.measureSystemLatency(true);
+
+    // Повторное быстрое измерение через 300 мс после старта keepalive (когда ОС прогрела A2DP/DAC)
+    setTimeout(() => this.measureSystemLatency(false), 300);
 
     this.unlocked = true;
     return true;
@@ -215,7 +186,7 @@ class AudioEngine {
       const osc = this.ctx.createOscillator();
       const gain = this.ctx.createGain();
       osc.frequency.value = 30;
-      gain.gain.value = 0; // Полная тишина
+      gain.gain.value = 0;
       osc.connect(gain);
       gain.connect(this.ctx.destination);
       osc.start();
@@ -233,26 +204,6 @@ class AudioEngine {
     this._ensureKeepalive();
   }
 
-  /**
-   * Запрос опционального доступа к списку аудиоустройств (для показа точного имени
-   * Bluetooth-колонки/наушников и раскрытия локального LAN IP в WebRTC ICE).
-   */
-  async requestDeviceLabelsAccess() {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      return false;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach((t) => t.stop());
-      await this.probeAudioDevices();
-      this.measureSystemLatency(true);
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  /** Сканирование подключённых аудиовыходов (выявление Bluetooth/A2DP/гарнитур) */
   async probeAudioDevices() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
     try {
@@ -263,7 +214,6 @@ class AudioEngine {
       let detectedLabel = '';
       let detectedBt = false;
 
-      // Проверяем default / communications / все доступные выходы с метками
       const defaultOut = outputs.find((d) => d.deviceId === 'default' && d.label);
       if (defaultOut) {
         detectedLabel = defaultOut.label.replace(/^Default\s*-\s*/i, '').trim();
@@ -288,10 +238,6 @@ class AudioEngine {
     } catch (_) {}
   }
 
-  /**
-   * Измерение реальной системной задержки аудиовывода (ms):
-   * Использует AudioContext.outputLatency, AudioContext.baseLatency и ctx.getOutputTimestamp().
-   */
   measureSystemLatency(forceEmit = false) {
     if (!this.ctx) return this.systemLatencyMs;
 
@@ -319,9 +265,6 @@ class AudioEngine {
     this.outputLatencyMs = outMs;
     this.impliedLatencyMs = impliedMs;
 
-    // Не суммируем outputLatency и impliedMs дважды:
-    // impliedMs из getOutputTimestamp() уже отражает задержку до физического DAC/BT-выхода.
-    // Берём максимум из (outputLatency + baseLatency) и (impliedMs), сглаживая мелкий шум.
     let measured = 0;
     if (outMs > 0) {
       measured = Math.max(outMs + baseMs, impliedMs);
@@ -331,11 +274,9 @@ class AudioEngine {
       measured = baseMs;
     }
 
-    if (this.systemLatencyMs === 0 || Math.abs(measured - this.systemLatencyMs) > 20) {
-      // Резкий скачок (например, подключили или отключили Bluetooth-колонку!) — реагируем сразу
+    if (this.systemLatencyMs === 0 || Math.abs(measured - this.systemLatencyMs) > 18) {
       this.systemLatencyMs = measured;
     } else {
-      // Мелкие флуктуации (< 20 мс) мягко усредняем
       this.systemLatencyMs = this.systemLatencyMs * 0.7 + measured * 0.3;
     }
 
@@ -347,9 +288,8 @@ class AudioEngine {
       this._lastReportedLatencySig = sig;
       this.onLatencyChange(profile);
 
-      // Если во время воспроизведения подключился/отключился Bluetooth и задержка изменилась > 15 мс —
-      // мгновенно пересинхронизируем источник, чтобы звук в комнате остался идеально ровным!
-      if (this.isPlaying && this.buffer && Math.abs(newTotal - prevTotal) >= 15) {
+      // Если во время игры подключился/отключился Bluetooth — мгновенно перестраиваемся
+      if (this.isPlaying && this.buffer && Math.abs(newTotal - prevTotal) >= 12) {
         this._stopSourceNode(true);
         this._startSourceAligned();
       }
@@ -364,20 +304,19 @@ class AudioEngine {
       if (this.ctx && this.ctx.state === 'running') {
         this.measureSystemLatency(false);
       }
-    }, 1200);
+    }, 1000);
 
     if (!this._deviceChangeBound && navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
       this._deviceChangeBound = async () => {
         await this.probeAudioDevices();
-        // Даём ОС 350 мс и 900 мс перестроить Bluetooth A2DP тракт и обновить outputLatency
-        setTimeout(() => this.measureSystemLatency(true), 350);
-        setTimeout(() => this.measureSystemLatency(true), 950);
+        setTimeout(() => this.measureSystemLatency(true), 300);
+        setTimeout(() => this.measureSystemLatency(true), 900);
       };
       navigator.mediaDevices.addEventListener('devicechange', this._deviceChangeBound);
     }
   }
 
-  /* ==================== КЭШИРОВАНИЕ И ДЕКОДИРОВАНИЕ ТРЕКОВ ==================== */
+  /* ==================== КЭШ И ДЕКОДИРОВАНИЕ ==================== */
 
   hasCachedTrack(trackId) {
     return this.bufferCache.has(trackId);
@@ -395,7 +334,6 @@ class AudioEngine {
     }
   }
 
-  /** Декодирование в кэш (без остановки текущего воспроизведения — для предзагрузки плейлиста!) */
   async decodeToCache(trackId, arrayBuffer) {
     if (this.bufferCache.has(trackId)) {
       return this.bufferCache.get(trackId);
@@ -414,7 +352,6 @@ class AudioEngine {
     return decoded;
   }
 
-  /** Активация уже декодированного трека из кэша */
   activateTrack(trackId) {
     const buf = this.bufferCache.get(trackId);
     if (!buf) return null;
@@ -431,16 +368,11 @@ class AudioEngine {
     return this.activateTrack(id) || decoded;
   }
 
-  /**
-   * Встроенный детерминированный тест-бит (120 BPM, 32 сек) для точной проверки синхронизации.
-   */
   async generateDemoTrack(trackId = 'demo-120bpm-v2', activate = true) {
     if (this.bufferCache.has(trackId)) {
       return activate ? this.activateTrack(trackId) : this.bufferCache.get(trackId);
     }
-    if (!this.ctx) {
-      await this.unlock();
-    }
+    if (!this.ctx) await this.unlock();
 
     const sampleRate = 44100;
     const bpm = 120;
@@ -478,7 +410,6 @@ class AudioEngine {
       const bar = Math.floor(beat / 4);
       const chordIdx = bar % chords.length;
 
-      // Бочка
       const kickOsc = offline.createOscillator();
       const kickGain = offline.createGain();
       kickOsc.type = 'sine';
@@ -490,7 +421,6 @@ class AudioEngine {
       kickOsc.start(t);
       kickOsc.stop(t + 0.26);
 
-      // Острый транзиент-клик (помогает на слух уловить рассинхрон даже 10 мс)
       const clickOsc = offline.createOscillator();
       const clickGain = offline.createGain();
       clickOsc.type = 'triangle';
@@ -502,7 +432,6 @@ class AudioEngine {
       clickOsc.start(t);
       clickOsc.stop(t + 0.025);
 
-      // Клэп на 2 и 4
       if (beat % 2 === 1) {
         const clap = offline.createBufferSource();
         clap.buffer = noiseBuf;
@@ -518,7 +447,6 @@ class AudioEngine {
         clap.stop(t + 0.16);
       }
 
-      // Хай-хэт
       for (let sub = 0; sub < 2; sub++) {
         const ht = t + sub * (beatSec / 2);
         const hat = offline.createBufferSource();
@@ -534,7 +462,6 @@ class AudioEngine {
         hat.stop(ht + 0.06);
       }
 
-      // Бас
       const bassFreq = bassNotes[chordIdx];
       const bassOsc = offline.createOscillator();
       const bassFilter = offline.createBiquadFilter();
@@ -550,7 +477,6 @@ class AudioEngine {
       bassOsc.start(t + beatSec * 0.5);
       bassOsc.stop(t + beatSec);
 
-      // Пэд-аккорд
       if (beat % 4 === 0) {
         const chord = chords[chordIdx];
         const barDur = beatSec * 4;
@@ -577,16 +503,11 @@ class AudioEngine {
     return activate ? this.activateTrack(trackId) : rendered;
   }
 
-  /**
-   * Встроенный калибровочный метроном (чёткие импульсы 1 Гц, 30 сек) для проверки Bluetooth-синхрона.
-   */
   async generatePulseTrack(trackId = 'demo-pulse-60bpm-v2', activate = true) {
     if (this.bufferCache.has(trackId)) {
       return activate ? this.activateTrack(trackId) : this.bufferCache.get(trackId);
     }
-    if (!this.ctx) {
-      await this.unlock();
-    }
+    if (!this.ctx) await this.unlock();
 
     const sampleRate = 44100;
     const duration = 30;
@@ -616,12 +537,8 @@ class AudioEngine {
     return this.buffer ? this.buffer.duration : 0;
   }
 
-  /* ==================== АКУСТИЧЕСКОЕ ПЛАНИРОВАНИЕ СТАРТА ==================== */
+  /* ==================== АКУСТИЧЕСКОЕ ПЛАНИРОВАНИЕ ==================== */
 
-  /**
-   * Запланированный старт с учётом собственной задержки аудио/Bluetooth:
-   * hostStartTime = T_acoustic (когда звук должен выйти в воздух ИЗ ВСЕХ КОЛОНОК одновременно!).
-   */
   async schedulePlay({ hostStartTime, trackOffset, getHostTime }) {
     if (!this.buffer) return;
     await this.ensureResumed();
@@ -640,13 +557,6 @@ class AudioEngine {
     this.onStateChange({ playing: true, scheduled: this.isScheduled });
   }
 
-  /**
-   * Внутренний старт AudioBufferSourceNode:
-   * T_feed = T_acoustic - totalOutputLatencyMs
-   * Устройство с BT 260 мс стартует подачу на 260 мс раньше T_acoustic;
-   * Телефон без BT (24 мс) стартует подачу на 24 мс раньше T_acoustic (т.е. ждёт на 236 мс дольше).
-   * Звук выходит из обоих устройств одновременно в T_acoustic!
-   */
   _startSourceAligned() {
     if (!this.buffer || !this.ctx || !this._getHostTimeFn) return;
 
@@ -654,7 +564,6 @@ class AudioEngine {
     const audioNow = this.ctx.currentTime;
     const totalLatencyMs = this.getTotalOutputLatencyMs();
 
-    // Целевое время подачи в Web Audio = hostStartTime (T_acoustic) - totalLatencyMs
     const feedTargetHostMs = this.hostStartTime - totalLatencyMs;
     const delaySec = (feedTargetHostMs - hostNow) / 1000;
 
@@ -666,6 +575,7 @@ class AudioEngine {
       offsetInTrack = Math.max(0, this.startTrackOffset);
       this.isScheduled = true;
     } else {
+      // Поздний вход (Late Join) или мгновенный ресинк
       const lookahead = 0.025;
       whenAudioTime = audioNow + lookahead;
       offsetInTrack = Math.max(0, this.startTrackOffset + -delaySec + lookahead);
@@ -742,7 +652,6 @@ class AudioEngine {
     }
   }
 
-  /** Фактическая позиция в буфере Web Audio (сек) */
   getCurrentPosition() {
     if (!this.buffer) return 0;
     if (!this.isPlaying || !this.ctx) return this.pausedPosition;
@@ -756,7 +665,6 @@ class AudioEngine {
     return Math.max(0, Math.min(this.anchorTrackPos + elapsed, this.buffer.duration));
   }
 
-  /** Акустическая позиция трека, звучащая в воздухе прямо сейчас (сек) */
   getAcousticPosition() {
     if (!this.buffer) return 0;
     if (!this.isPlaying || !this._getHostTimeFn) return this.pausedPosition;
@@ -765,7 +673,6 @@ class AudioEngine {
     return Math.max(0, Math.min(this.startTrackOffset + (hostNow - this.hostStartTime) / 1000, this.buffer.duration));
   }
 
-  /** Обратный отсчёт до акустического старта T_acoustic (сек) */
   getCountdownSec() {
     if (!this.isPlaying || !this._getHostTimeFn) return 0;
     const rem = (this.hostStartTime - this._getHostTimeFn()) / 1000;
@@ -776,7 +683,6 @@ class AudioEngine {
     return rem;
   }
 
-  /** Ожидаемая позиция подачи в Web Audio с учётом локальной задержки вывода */
   getExpectedFeedPosition() {
     if (!this.isPlaying || !this._getHostTimeFn) return this.pausedPosition;
     const hostNow = this._getHostTimeFn();
@@ -797,7 +703,7 @@ class AudioEngine {
 
   _startDriftMonitor() {
     this._stopDriftMonitor();
-    this._driftTimer = setInterval(() => this.checkDrift(), 650);
+    this._driftTimer = setInterval(() => this.checkDrift(), 600);
   }
 
   _stopDriftMonitor() {
@@ -847,38 +753,6 @@ class AudioEngine {
     const idealAudioTime = this.ctx.currentTime + (feedTargetHostMs - hostNow) / 1000;
     if (Math.abs(idealAudioTime - this.anchorAudioTime) > 0.005) {
       this._stopSourceNode(false);
-      this._startSourceAligned();
-    }
-  }
-
-  /* ==================== НАСТРОЙКИ ЗАДЕРЖКИ BLUETOOTH ==================== */
-
-  setAutoSystemLatency(enabled) {
-    this.autoSystemLatency = Boolean(enabled);
-    this._savePref('orpheus_auto_sys_latency', this.autoSystemLatency ? '1' : '0');
-    this._applyLatencyUpdate();
-    return this.getLatencyProfile();
-  }
-
-  setExtraLatency(ms) {
-    this.extraLatencyMs = Math.max(-500, Math.min(1200, Math.round(ms)));
-    this._savePref('orpheus_extra_latency_ms', this.extraLatencyMs);
-    this._applyLatencyUpdate();
-    return this.getLatencyProfile();
-  }
-
-  nudgeExtraLatency(deltaMs) {
-    if (deltaMs === 0) return this.setExtraLatency(0);
-    return this.setExtraLatency(this.extraLatencyMs + deltaMs);
-  }
-
-  _applyLatencyUpdate() {
-    const profile = this.getLatencyProfile();
-    this._lastReportedLatencySig = '';
-    this.onLatencyChange(profile);
-
-    if (this.isPlaying && this.buffer) {
-      this._stopSourceNode(true);
       this._startSourceAligned();
     }
   }
