@@ -815,18 +815,19 @@
   }
 
   async function handleListenerSynthTrack(trackId, synthType, name, isActive) {
-    const activateNow = isActive || trackId === state.activeTrackId;
-    if (activateNow) {
+    const isCurrentlyActive = () => trackId === state.activeTrackId || (!state.activeTrackId && isActive);
+    if (isCurrentlyActive()) {
       audio.pause(0);
       showTransfer(true, `Локальный синтез: ${name}...`, 65);
     }
     try {
       const decoded =
         synthType === 'pulse'
-          ? await audio.generatePulseTrack(trackId, activateNow)
-          : await audio.generateDemoTrack(trackId, activateNow);
+          ? await audio.generatePulseTrack(trackId, false)
+          : await audio.generateDemoTrack(trackId, false);
 
-      if (activateNow) {
+      if (isCurrentlyActive()) {
+        audio.activateTrack(trackId);
         state.activeTrackId = trackId;
         onTrackReadyUI(name, `${formatTime(decoded.duration)} • Локальный синтез (0 КБ)`, decoded.duration);
         showTransfer(false);
@@ -834,16 +835,16 @@
       }
       network.sendToHost({ type: 'TRACK_READY', trackId });
       renderPlaylist();
-      if (activateNow) tryApplyPendingPlay();
+      if (isCurrentlyActive()) tryApplyPendingPlay();
     } catch (_) {
-      if (activateNow) showTransfer(false);
+      if (isCurrentlyActive()) showTransfer(false);
       network.sendToHost({ type: 'TRACK_ERROR', trackId });
     }
   }
 
   async function handleListenerUrlTrack(trackId, name, url, isActive) {
-    const activateNow = isActive || trackId === state.activeTrackId;
-    if (activateNow) {
+    const isCurrentlyActive = () => trackId === state.activeTrackId || (!state.activeTrackId && isActive);
+    if (isCurrentlyActive()) {
       audio.pause(0);
       showTransfer(true, 'Загрузка трека по URL...', 35);
     }
@@ -851,9 +852,9 @@
       const resp = await fetch(url, { mode: 'cors' });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const buf = await resp.arrayBuffer();
-      if (activateNow) showTransfer(true, 'Декодирование аудио...', 85);
+      if (isCurrentlyActive()) showTransfer(true, 'Декодирование аудио...', 85);
       const decoded = await audio.decodeToCache(trackId, buf);
-      if (activateNow) {
+      if (isCurrentlyActive()) {
         audio.activateTrack(trackId);
         state.activeTrackId = trackId;
         onTrackReadyUI(name, `${formatTime(decoded.duration)} • Загружено по URL`, decoded.duration);
@@ -862,21 +863,21 @@
       }
       network.sendToHost({ type: 'TRACK_READY', trackId });
       renderPlaylist();
-      if (activateNow) tryApplyPendingPlay();
+      if (isCurrentlyActive()) tryApplyPendingPlay();
     } catch (_) {
-      if (activateNow) showTransfer(false);
+      if (isCurrentlyActive()) showTransfer(false);
       network.sendToHost({ type: 'TRACK_ERROR', trackId });
     }
   }
 
   async function handleListenerFileComplete(trackId, name, buffer, isActive) {
-    const activateNow = isActive || trackId === state.activeTrackId;
-    if (activateNow) {
+    const isCurrentlyActive = () => trackId === state.activeTrackId || (!state.activeTrackId && isActive);
+    if (isCurrentlyActive()) {
       showTransfer(true, 'Декодирование аудио...', 100);
     }
     try {
       const decoded = await audio.decodeToCache(trackId, buffer);
-      if (activateNow) {
+      if (isCurrentlyActive()) {
         audio.activateTrack(trackId);
         state.activeTrackId = trackId;
         onTrackReadyUI(name, `${formatTime(decoded.duration)} • Получено от Хоста`, decoded.duration);
@@ -885,12 +886,12 @@
       }
       network.sendToHost({ type: 'TRACK_READY', trackId });
       renderPlaylist();
-      if (activateNow) tryApplyPendingPlay();
+      if (isCurrentlyActive()) tryApplyPendingPlay();
     } catch (err) {
       console.error('[App/Listener] Decode error:', err);
-      if (activateNow) showTransfer(false);
+      if (isCurrentlyActive()) showTransfer(false);
       network.sendToHost({ type: 'TRACK_ERROR', trackId });
-      if (activateNow) showToast('Ошибка декодирования полученного файла', 'error');
+      if (isCurrentlyActive()) showToast('Ошибка декодирования полученного файла', 'error');
     }
   }
 
