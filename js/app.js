@@ -300,6 +300,7 @@
   /* ==================== УТИЛИТЫ UI ==================== */
 
   function showView(name) {
+    document.documentElement.classList.remove('has-invite-room');
     ui.viewLanding.classList.toggle('hidden', name !== 'landing');
     ui.viewInviteUnlock.classList.toggle('hidden', name !== 'invite');
     ui.viewRoom.classList.toggle('hidden', name !== 'room');
@@ -1485,10 +1486,16 @@
   };
 
   const params = new URLSearchParams(window.location.search);
-  const urlRoom = NetworkManager.normalizeCode(params.get('room') || window.location.hash.replace('#room=', ''));
+  const hashMatch = window.location.hash.match(/room=([A-Za-z0-9-]+)/i);
+  const urlRoom = NetworkManager.normalizeCode(
+    window.__initialRoomCode || params.get('room') || (hashMatch ? hashMatch[1] : '')
+  );
   if (urlRoom.length >= 4) {
-    ui.inviteRoomCode.textContent = NetworkManager.formatCode(urlRoom);
+    const formatted = NetworkManager.formatCode(urlRoom);
+    ui.inviteRoomCode.textContent = formatted;
     ui.inviteRoomCode.dataset.code = urlRoom;
+    ui.inputRoomCode.value = formatted;
+    ui.btnUnlockAndJoin.textContent = `Подключиться к ${formatted}`;
     showView('invite');
   } else {
     showView('landing');

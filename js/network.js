@@ -11,9 +11,10 @@
  */
 class NetworkManager {
   static DEFAULT_CHUNK_SIZE = 16000;
-  static MAX_CHUNK_SIZE = 60000; // До 60 КБ на чанк при поддержке SCTP maxMessageSize (в 3.7x быстрее!)
-  static MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1 МБ окно буфера — полная загрузка канала Wi-Fi P2P
-  static STREAM_THRESHOLD_BYTES = 600 * 1024;
+  static MAX_CHUNK_SIZE = 60000;
+  static MAX_BUFFERED_AMOUNT = 768 * 1024;          // Высокоскоростное окно (когда поток не требуется)
+  static STREAMING_DATA_BUFFER_LIMIT = 128 * 1024;  // Щадящее окно для фонового кэша во время живого стриминга (чтобы orpheus-stream не ждал!)
+  static STREAM_THRESHOLD_BYTES = 450 * 1024;       // Файлы > 450 КБ сразу запускаются через прогрессивный поток
   static ICE_GATHER_WAIT_MS = 1600;
   static P2P_TIMEOUT_MS = 7000;
   static NTFY_BASE = 'https://ntfy.sh';
@@ -36,8 +37,11 @@ class NetworkManager {
     this.selfId = NetworkManager.generatePeerId();
     this.deviceName = NetworkManager.detectDeviceName();
 
-    // Сигналинг (ntfy.sh WSS + BroadcastChannel)
+    // Сигналинг (ntfy.sh WSS + EventSource SSE + HTTPS Polling + BroadcastChannel)
     this._sigWs = null;
+    this._sigSse = null;
+    this._sigPollTimer = null;
+    this._sigLastPollTs = 0;
     this._sigTopic = null;
     this._sigReconnectTimer = null;
     this._sigAlive = false;
@@ -61,7 +65,7 @@ class NetworkManager {
     // Слушатель
     this.hostPeerId = null;
     this.hostPc = null;
-    this.hostChannels = { ntp: null, ctrl: null, data: null };
+    this.hostChannels = { ntp: null, ctrl: null, stream: null, data: null };
     this.hostTransport = 'connecting';
     this._listenerJoinResolve = null;
     this._listenerJoinReject = null;
@@ -134,6 +138,7 @@ class NetworkManager {
     this._closeSignaling();
     this._sigTopic = this._roomTopic(code);
     this._sigAlive = true;
+    this._sigLastPollTs = Math.floor(Date.now() / 1000) - 2;
 
     try {
       this._bc = new BroadcastChannel(this._sigTopic);
@@ -142,8 +147,93 @@ class NetworkManager {
       };
     } catch (_) {}
 
+    const handleEnvelope = async (envelope) => {
+      if (!envelope || envelope.event !== 'message') return;
+      if (envelope.time && envelope.time > this._sigLastPollTs) {
+        this._sigLastPollTs = envelope.time;
+      }
+      let rawText = envelope.message || '';
+      if (envelope.attachment && envelope.attachment.url) {
+        const r = await fetch(envelope.attachment.url);
+        if (r.ok) rawText = await r.text();
+      }
+      if (!rawText) return;
+      const data = JSON.parse(rawText);
+      this._onSignalMessage(data);
+    };
+
+    const startHttpsFallback = (onReady) => {
+      if (!this._sigAlive) return;
+      // 1. EventSource (HTTPS/2 SSE — работает даже там, где прокси/Safari/файрвол режут wss://!)
+      if (!this._sigSse && typeof EventSource !== 'undefined') {
+        try {
+          const sse = new EventSource(`${NetworkManager.NTFY_BASE}/${this._sigTopic}/sse`);
+          this._sigSse = sse;
+          sse.onopen = () => onReady();
+          sse.onmessage = (ev) => {
+            try { handleEnvelope(JSON.parse(ev.data)); } catch (_) {}
+          };
+          sse.onerror = () => {
+            // Если SSE тоже недоступен — polling ниже уже подхватит сообщения
+          };
+        } catch (_) {}
+      }
+
+      // 2. HTTPS JSON Polling — 100% проходит любой корпоративный/школьный прокси и антивирус
+      if (!this._sigPollTimer) {
+        const pollOnce = async () => {
+          if (!this._sigAlive) return;
+          // Останавливаем лишний polling, когда слушатель уже перешёл на прямой WebRTC P2P
+          if (this.role === 'listener' && this._listenerConnected && this.hostTransport !== 'relay') {
+            return;
+          }
+          // Если WebSocket живой и открыт — polling не нужен
+          if (this._sigWs && this._sigWs.readyState === WebSocket.OPEN) {
+            return;
+          }
+          try {
+            const url = `${NetworkManager.NTFY_BASE}/${this._sigTopic}/json?poll=1&since=${this._sigLastPollTs}`;
+            const resp = await fetch(url, { cache: 'no-store' });
+            if (resp.ok) {
+              onReady();
+              const text = await resp.text();
+              const lines = text.split('\n');
+              for (const line of lines) {
+                if (!line.trim()) continue;
+                try { await handleEnvelope(JSON.parse(line)); } catch (_) {}
+              }
+            }
+          } catch (_) {}
+        };
+        pollOnce();
+        this._sigPollTimer = setInterval(pollOnce, 1100);
+      }
+    };
+
     return new Promise((resolve, reject) => {
       let settled = false;
+      const markReady = () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(fallbackKickTimer);
+          clearTimeout(hardTimeout);
+          resolve();
+        }
+      };
+
+      // Если WebSocket не открылся за 1.6 сек (например, на Mac с прокси/Safari) —
+      // автоматически без ошибок переключаемся на HTTPS SSE + JSON Polling!
+      const fallbackKickTimer = setTimeout(() => {
+        if (!settled) startHttpsFallback(markReady);
+      }, 1600);
+
+      const hardTimeout = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(new Error('Нет связи с интернетом для обнаружения комнаты. Проверьте Wi-Fi.'));
+        }
+      }, 10000);
+
       const wsUrl = `${NetworkManager.NTFY_WS_BASE}/${this._sigTopic}/ws`;
       const connectWs = () => {
         if (!this._sigAlive) return;
@@ -151,48 +241,27 @@ class NetworkManager {
           const ws = new WebSocket(wsUrl);
           this._sigWs = ws;
 
-          const openTimeout = setTimeout(() => {
-            if (!settled) {
-              settled = true;
-              reject(new Error('Не удалось подключиться к сигнальному серверу (WSS 443).'));
-            }
-          }, 9000);
-
           ws.onopen = () => {
-            clearTimeout(openTimeout);
-            if (!settled) {
-              settled = true;
-              resolve();
-            }
+            markReady();
           };
 
           ws.onmessage = async (ev) => {
-            try {
-              const envelope = JSON.parse(ev.data);
-              if (envelope.event !== 'message') return;
-              let rawText = envelope.message || '';
-              if (envelope.attachment && envelope.attachment.url) {
-                const r = await fetch(envelope.attachment.url);
-                if (r.ok) rawText = await r.text();
-              }
-              if (!rawText) return;
-              const data = JSON.parse(rawText);
-              this._onSignalMessage(data);
-            } catch (_) {}
+            try { await handleEnvelope(JSON.parse(ev.data)); } catch (_) {}
           };
 
           ws.onclose = () => {
             if (this._sigAlive && this._sigWs === ws) {
-              this._sigReconnectTimer = setTimeout(connectWs, 1500);
+              // Сразу страхуем HTTPS SSE/Polling, пока WebSocket переподключается
+              startHttpsFallback(markReady);
+              this._sigReconnectTimer = setTimeout(connectWs, 2500);
             }
           };
 
-          ws.onerror = () => {};
-        } catch (err) {
-          if (!settled) {
-            settled = true;
-            reject(err);
-          }
+          ws.onerror = () => {
+            startHttpsFallback(markReady);
+          };
+        } catch (_) {
+          startHttpsFallback(markReady);
         }
       };
 
@@ -205,6 +274,14 @@ class NetworkManager {
     if (this._sigReconnectTimer) {
       clearTimeout(this._sigReconnectTimer);
       this._sigReconnectTimer = null;
+    }
+    if (this._sigPollTimer) {
+      clearInterval(this._sigPollTimer);
+      this._sigPollTimer = null;
+    }
+    if (this._sigSse) {
+      try { this._sigSse.close(); } catch (_) {}
+      this._sigSse = null;
     }
     if (this._sigWs) {
       try { this._sigWs.close(); } catch (_) {}
@@ -333,7 +410,7 @@ class NetworkManager {
     const client = {
       id: peerId,
       pc,
-      channels: { ntp: null, ctrl: null, data: null },
+      channels: { ntp: null, ctrl: null, stream: null, data: null },
       transport: 'connecting',
       transportLabel: 'Подкл.',
       open: false,
@@ -385,6 +462,7 @@ class NetworkManager {
       ch.binaryType = 'arraybuffer';
       if (ch.label === 'orpheus-ntp') client.channels.ntp = ch;
       else if (ch.label === 'orpheus-ctrl') client.channels.ctrl = ch;
+      else if (ch.label === 'orpheus-stream') client.channels.stream = ch;
       else if (ch.label === 'orpheus-data') client.channels.data = ch;
 
       ch.onopen = () => {
@@ -405,8 +483,11 @@ class NetworkManager {
             });
             this._emitPeers();
             this._hostSyncNewClient(client);
-          } else if (ch.label === 'orpheus-data' && !client.isSendingFile && client.transferQueue.length > 0) {
-            // Если data-канал открылся на пару миллисекунд позже ctrl — сразу запускаем очередь!
+          } else if (
+            (ch.label === 'orpheus-data' || ch.label === 'orpheus-stream') &&
+            !client.isSendingFile &&
+            (client.transferQueue.length > 0 || client.urgentSegments.length > 0)
+          ) {
             this._processClientTransferQueue(client);
           }
         }
@@ -625,14 +706,14 @@ class NetworkManager {
       }
 
       case 'NEED_STREAM_SEG': {
-        // Если основной файл уже докачан >= 80%, не тратим канал на лишний сегмент — даём файлу завершиться за доли секунды!
-        if (
-          msg.trackId &&
-          typeof msg.fromSec === 'number' &&
-          !client.readyTracks.has(msg.trackId) &&
-          !(msg.trackId === this.activeTrackId && client.progress >= 80)
-        ) {
-          client.urgentSegments.push({ trackId: msg.trackId, fromSec: msg.fromSec, durationSec: 8 });
+        // Всегда отдаём срочный потоковый сегмент, пока полный файл не закэширован — чтобы звук НИКОГДА не прерывался!
+        if (msg.trackId && typeof msg.fromSec === 'number' && !client.readyTracks.has(msg.trackId)) {
+          const dup = client.urgentSegments.some(
+            (s) => s.trackId === msg.trackId && Math.abs(s.fromSec - msg.fromSec) < 1.5
+          );
+          if (!dup) {
+            client.urgentSegments.push({ trackId: msg.trackId, fromSec: msg.fromSec, durationSec: 8.5 });
+          }
           if (!client.isSendingFile) {
             this._processClientTransferQueue(client);
           }
@@ -864,10 +945,12 @@ class NetworkManager {
     return NetworkManager.DEFAULT_CHUNK_SIZE;
   }
 
-  async _sendStreamSegmentToClient(client, trackId, fromSec, durationSec = 6) {
+  async _sendStreamSegmentToClient(client, trackId, fromSec, durationSec = 8.5) {
     if (!client.open || client.transport === 'relay' || !this.cb.onBuildStreamSegment) return false;
-    const dataCh = await this._waitChannelOpen(client, 'data', 4000);
-    if (!dataCh) return false;
+    // Выделенный приоритетный канал orpheus-stream (не стоит в очереди за тяжёлым фоновым файлом!)
+    let streamCh = await this._waitChannelOpen(client, 'stream', 2000);
+    if (!streamCh) streamCh = await this._waitChannelOpen(client, 'data', 3000);
+    if (!streamCh) return false;
 
     const seg = this.cb.onBuildStreamSegment(trackId, fromSec, durationSec);
     if (!seg || !seg.buffer) return false;
@@ -891,14 +974,12 @@ class NetworkManager {
       totalChunks,
     });
 
-    await new Promise((r) => setTimeout(r, 12));
-
     const rawBytes = new Uint8Array(seg.buffer);
     for (let i = 0; i < totalChunks; i++) {
-      if (!client.open || dataCh.readyState !== 'open') return false;
-      if (dataCh.bufferedAmount > NetworkManager.MAX_BUFFERED_AMOUNT) {
-        await this._waitForDrain(dataCh);
-        if (!client.open || dataCh.readyState !== 'open') return false;
+      if (!client.open || streamCh.readyState !== 'open') return false;
+      if (streamCh.bufferedAmount > NetworkManager.MAX_BUFFERED_AMOUNT) {
+        await this._waitForDrain(streamCh, 256 * 1024);
+        if (!client.open || streamCh.readyState !== 'open') return false;
       }
 
       const start = i * chunkSize;
@@ -911,7 +992,7 @@ class NetworkManager {
       new Uint8Array(packet, 12).set(rawBytes.subarray(start, end));
 
       try {
-        dataCh.send(packet);
+        streamCh.send(packet);
       } catch (_) {
         return false;
       }
@@ -985,7 +1066,8 @@ class NetworkManager {
         client.status = 'Буфер потока...';
         this._emitPeers();
 
-        await this._sendStreamSegmentToClient(client, track.id, startSec, 6);
+        // Отправляем 8.5 сек стартового потока на выделенный orpheus-stream — мгновенный старт с большим запасом!
+        await this._sendStreamSegmentToClient(client, track.id, startSec, 8.5);
         if (!client.open || dataCh.readyState !== 'open') return;
       }
 
@@ -1012,16 +1094,13 @@ class NetworkManager {
         isActive,
       });
 
-      await new Promise((r) => setTimeout(r, 15));
-
       const rawBytes = new Uint8Array(track.buffer);
-      let lastUiPct = -1;
 
       for (let i = 0; i < totalChunks; i++) {
         if (!client.open || dataCh.readyState !== 'open') return;
 
-        // Если слушателю срочно нужен следующий потоковый сегмент — вставляем его вне очереди!
-        if (client.urgentSegments.length > 0) {
+        // Срочный потоковый сегмент всегда уходит первым на orpheus-stream — ZERO разрывов звука!
+        while (client.urgentSegments.length > 0) {
           const req = client.urgentSegments.shift();
           await this._sendStreamSegmentToClient(client, req.trackId, req.fromSec, req.durationSec);
           if (!client.open || dataCh.readyState !== 'open') return;
@@ -1032,8 +1111,12 @@ class NetworkManager {
           return;
         }
 
-        if (dataCh.bufferedAmount > NetworkManager.MAX_BUFFERED_AMOUNT) {
-          await this._waitForDrain(dataCh);
+        // Пока слушатель играет из потока, держим окно фонового кэша компактным (128 КБ),
+        // чтобы при запросе следующего сегмента сеть не была забита 1 МБ очереди!
+        const isStreamingActive = isActive && this.playbackState.playing && client.streamReadyTracks.has(track.id);
+        const bufLimit = isStreamingActive ? NetworkManager.STREAMING_DATA_BUFFER_LIMIT : NetworkManager.MAX_BUFFERED_AMOUNT;
+        if (dataCh.bufferedAmount > bufLimit) {
+          await this._waitForDrain(dataCh, Math.floor(bufLimit / 2));
           if (!client.open || dataCh.readyState !== 'open') return;
         }
 
@@ -1116,9 +1199,8 @@ class NetworkManager {
     }
   }
 
-  _waitForDrain(dc) {
+  _waitForDrain(dc, lowThreshold = 256 * 1024) {
     return new Promise((resolve) => {
-      const lowThreshold = 256 * 1024;
       if (dc.readyState !== 'open' || dc.bufferedAmount <= lowThreshold) {
         resolve();
         return;
@@ -1229,11 +1311,13 @@ class NetworkManager {
 
       const ntpCh = pc.createDataChannel('orpheus-ntp', { ordered: false, maxRetransmits: 0 });
       const ctrlCh = pc.createDataChannel('orpheus-ctrl', { ordered: true });
+      const streamCh = pc.createDataChannel('orpheus-stream', { ordered: true });
       const dataCh = pc.createDataChannel('orpheus-data', { ordered: true });
       ntpCh.binaryType = 'arraybuffer';
       ctrlCh.binaryType = 'arraybuffer';
+      streamCh.binaryType = 'arraybuffer';
       dataCh.binaryType = 'arraybuffer';
-      this.hostChannels = { ntp: ntpCh, ctrl: ctrlCh, data: dataCh };
+      this.hostChannels = { ntp: ntpCh, ctrl: ctrlCh, stream: streamCh, data: dataCh };
 
       const gatheredCandidates = [];
       let offerSent = false;
@@ -1307,6 +1391,15 @@ class NetworkManager {
         if (this.hostPc !== pc) return;
         if (typeof ev.data === 'string') {
           try { this._listenerHandleHostMessage(JSON.parse(ev.data)); } catch (_) {}
+        }
+      };
+
+      streamCh.onmessage = (ev) => {
+        if (this.hostPc !== pc) return;
+        if (ev.data instanceof ArrayBuffer) {
+          this._listenerHandleBinaryChunk(ev.data);
+        } else if (ev.data instanceof Blob) {
+          ev.data.arrayBuffer().then((ab) => this._listenerHandleBinaryChunk(ab));
         }
       };
 
@@ -1727,7 +1820,7 @@ class NetworkManager {
       try { this.hostPc.close(); } catch (_) {}
       this.hostPc = null;
     }
-    this.hostChannels = { ntp: null, ctrl: null, data: null };
+    this.hostChannels = { ntp: null, ctrl: null, stream: null, data: null };
     this.hostPeerId = null;
 
     this._closeSignaling();

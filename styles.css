@@ -91,6 +91,14 @@ body {
   display: none !important;
 }
 
+/* Предотвращаем мелькание стартового экрана при переходе по ?room=CODE */
+html.has-invite-room #viewLanding {
+  display: none !important;
+}
+html.has-invite-room #viewInviteUnlock {
+  display: flex !important;
+}
+
 .mono {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;

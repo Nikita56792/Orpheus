@@ -437,12 +437,36 @@ class AudioEngine {
   _findSegmentForPosition(trackId, posSec) {
     const segs = this.streamSegments.get(trackId);
     if (!segs || segs.length === 0) return null;
+    // Если позиция попадает в зону перекрытия двух сегментов — берём тот, у которого больше запас вперёд!
+    let best = null;
     for (const s of segs) {
       if (posSec >= s.startSec - 0.05 && posSec < s.endSec - 0.05) {
-        return s;
+        if (!best || s.endSec > best.endSec) best = s;
       }
     }
-    return null;
+    return best;
+  }
+
+  /** Возвращает непрерывный конец закэшированных потоковых сегментов, начиная от posSec */
+  getContiguousStreamEndSec(trackId, posSec) {
+    if (this.bufferCache.has(trackId)) {
+      return this.bufferCache.get(trackId).duration;
+    }
+    const segs = this.streamSegments.get(trackId);
+    if (!segs || segs.length === 0) return 0;
+
+    let frontier = posSec;
+    let expanded = true;
+    while (expanded) {
+      expanded = false;
+      for (const s of segs) {
+        if (s.startSec <= frontier + 0.18 && s.endSec > frontier + 0.05) {
+          frontier = s.endSec;
+          expanded = true;
+        }
+      }
+    }
+    return frontier;
   }
 
   _putCache(trackId, audioBuffer) {
@@ -821,11 +845,10 @@ class AudioEngine {
     const totalDur = this.getDuration();
     if (totalDur > 0 && fromSec >= totalDur - 0.25) return;
 
-    // Уже есть сегмент на эту позицию?
-    if (this._findSegmentForPosition(this.currentTrackId, fromSec + 0.1)) return;
+    if (this._findSegmentForPosition(this.currentTrackId, fromSec + 0.25)) return;
 
-    const bucket = Math.floor(fromSec);
-    if (Math.abs(bucket - this._requestedNextSegAt) < 2) return;
+    const bucket = Math.floor(fromSec / 2);
+    if (bucket === this._requestedNextSegAt) return;
     this._requestedNextSegAt = bucket;
     this.onNeedNextSegment({ trackId: this.currentTrackId, fromSec: Math.max(0, fromSec) });
   }
@@ -935,11 +958,26 @@ class AudioEngine {
   checkDrift() {
     if (!this.isPlaying || !this.ctx || !this._getHostTimeFn) return;
 
-    // Если играем из потокового сегмента и до его конца осталось < 3 сек — заранее запрашиваем следующий сегмент!
-    if (this.playingFromSegment && !this.buffer && this.activeSegmentEndSec > 0) {
+    // Бесшовное подкачивание следующего потокового сегмента за 5.5 сек до исчерпания буфера
+    if (this.playingFromSegment && !this.buffer && this.currentTrackId) {
       const curPos = this.getCurrentPosition();
-      if (this.activeSegmentEndSec - curPos < 3.2) {
-        this._requestNextSegmentIfNeeded(Math.max(0, this.activeSegmentEndSec - 0.15));
+      const contiguousEnd = this.getContiguousStreamEndSec(this.currentTrackId, curPos);
+      const totalDur = this.getDuration();
+      if (contiguousEnd > 0 && (totalDur === 0 || contiguousEnd < totalDur - 0.2)) {
+        if (contiguousEnd - curPos < 5.5) {
+          this._requestNextSegmentIfNeeded(Math.max(0, contiguousEnd - 0.25));
+        }
+      }
+
+      // Если до конца ТЕКУЩЕГО сегмента осталось < 0.35 сек, а следующий уже декодирован —
+      // бесшовно переключаемся на него ДО обрыва звука!
+      if (this.source && this.activeSegmentEndSec > 0 && this.activeSegmentEndSec - curPos < 0.35) {
+        const nextSeg = this._findSegmentForPosition(this.currentTrackId, curPos + 0.4);
+        if (nextSeg && nextSeg.endSec > this.activeSegmentEndSec + 0.5) {
+          this._stopSourceNode(true);
+          this._startSourceAligned();
+          return;
+        }
       }
     }
 

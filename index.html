@@ -9,15 +9,33 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   <title>Orpheus Sync — Синхронная музыка</title>
-  <link rel="stylesheet" href="styles.css?v=10" />
+  <link rel="stylesheet" href="styles.css?v=11" />
   <script defer src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js" onerror="var s=document.createElement('script');s.src='https://unpkg.com/qrcode-generator@1.4.4/qrcode.min.js';document.head.appendChild(s);"></script>
-  <script defer src="js/wake-lock.js?v=10"></script>
-  <script defer src="js/clock-sync.js?v=10"></script>
-  <script defer src="js/audio-engine.js?v=10"></script>
-  <script defer src="js/network.js?v=10"></script>
-  <script defer src="js/app.js?v=10"></script>
+  <script defer src="js/wake-lock.js?v=11"></script>
+  <script defer src="js/clock-sync.js?v=11"></script>
+  <script defer src="js/audio-engine.js?v=11"></script>
+  <script defer src="js/network.js?v=11"></script>
+  <script defer src="js/app.js?v=11"></script>
 </head>
 <body>
+  <script>
+    // Мгновенно (до отрисовки) определяем ?room=CODE в ссылке, чтобы сразу показать экран подключения без «Создать комнату»
+    (function () {
+      try {
+        var params = new URLSearchParams(window.location.search);
+        var raw = params.get('room') || '';
+        if (!raw && window.location.hash) {
+          var m = window.location.hash.match(/room=([A-Za-z0-9-]+)/i);
+          if (m) raw = m[1];
+        }
+        var clean = raw.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+        if (clean.length >= 4) {
+          window.__initialRoomCode = clean;
+          document.documentElement.classList.add('has-invite-room');
+        }
+      } catch (_) {}
+    })();
+  </script>
   <div class="app-shell">
     <!-- Верхняя панель -->
     <header class="topbar">
