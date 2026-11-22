@@ -363,11 +363,12 @@ async def cors_middleware(request: web.Request, handler):
         resp = web.Response(status=204)
     else:
         resp = await handler(request)
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Range, X-Track-Name, X-Pinggy-No-Screen"
-    resp.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Accept-Ranges"
-    resp.headers["Access-Control-Max-Age"] = "86400"
+    if not resp.prepared:
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Range, X-Track-Name"
+        resp.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Accept-Ranges"
+        resp.headers["Access-Control-Max-Age"] = "86400"
     return resp
 
 

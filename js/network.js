@@ -28,13 +28,9 @@ class NetworkManager {
   static ICE_GATHER_WAIT_MS = 1400;
   static P2P_TIMEOUT_MS = 7000;
 
-  // Основной выделенный сервер Orpheus (автоматически обновляется через discovery при ротации туннеля)
-  static DEFAULT_SERVER_URL = 'https://eqmzq-93-175-30-192.free.pinggy.net';
-  static SERVER_DISCOVERY_URLS = [
-    'https://ntfy.adminforge.de/orpheus-srv-nikita56792-v1/json?poll=1&since=all',
-    'https://ntfy.envs.net/orpheus-srv-nikita56792-v1/json?poll=1&since=all',
-  ];
-  static SERVER_STORAGE_KEY = 'orpheus_server_url_v3';
+  // Постоянный выделенный Docker-сервер Orpheus с доверенным TLS (работает напрямую без туннелей и с VPN)
+  static DEFAULT_SERVER_URL = 'https://158.160.205.107/orpheus';
+  static SERVER_STORAGE_KEY = 'orpheus_server_url_v4';
 
   // Резервный кластер сигналинга (используется только если выделенный сервер полностью недоступен)
   static SIGNALING_NODES = [
@@ -162,15 +158,14 @@ class NetworkManager {
   /* ==================== ОБНАРУЖЕНИЕ И ПОДКЛЮЧЕНИЕ К ВЫДЕЛЕННОМУ СЕРВЕРУ ==================== */
 
   _serverHeaders(extra = {}) {
-    return { 'X-Pinggy-No-Screen': '1', ...extra };
+    return { ...extra };
   }
 
-  async _probeServerHealth(baseUrl, timeoutMs = 2600) {
+  async _probeServerHealth(baseUrl, timeoutMs = 2000) {
     if (!baseUrl) return null;
     const clean = baseUrl.replace(/\/+$/, '');
     try {
       const resp = await fetch(`${clean}/health`, {
-        headers: this._serverHeaders(),
         cache: 'no-store',
         signal: AbortSignal.timeout(timeoutMs),
       });
@@ -183,104 +178,40 @@ class NetworkManager {
     return null;
   }
 
-  async _fetchDiscoveredServerUrl() {
-    const candidates = [];
-    await Promise.allSettled(
-      NetworkManager.SERVER_DISCOVERY_URLS.map(async (ep) => {
-        try {
-          const resp = await fetch(ep, { cache: 'no-store', signal: AbortSignal.timeout(3000) });
-          if (!resp.ok) return;
-          const text = await resp.text();
-          let latest = null;
-          let latestTs = 0;
-          for (const line of text.split('\n')) {
-            if (!line.trim()) continue;
-            try {
-              const env = JSON.parse(line);
-              if (env && env.event === 'message' && env.message) {
-                const m = String(env.message).match(/https:\/\/[a-z0-9.-]+/i);
-                if (m && (env.time || 0) >= latestTs) {
-                  latestTs = env.time || 0;
-                  latest = m[0];
-                }
-              }
-            } catch (_) {}
-          }
-          if (latest) candidates.push({ url: latest, ts: latestTs });
-        } catch (_) {}
-      })
-    );
-    candidates.sort((a, b) => b.ts - a.ts);
-    for (const item of candidates) {
-      const ok = await this._probeServerHealth(item.url, 2800);
-      if (ok) return ok;
-    }
-    return null;
-  }
-
   async _resolveServerUrl() {
-    if (this._serverBaseUrl) {
-      const stillAlive = await this._probeServerHealth(this._serverBaseUrl, 1800);
-      if (stillAlive) return stillAlive;
-      this._serverBaseUrl = null;
-    }
+    if (this._serverBaseUrl) return this._serverBaseUrl;
 
     // 1. Явный параметр ?server=https://...
     try {
       const qs = new URLSearchParams(window.location.search).get('server');
       if (qs && /^https?:\/\//i.test(qs)) {
-        const ok = await this._probeServerHealth(qs, 2500);
-        if (ok) {
-          this._serverBaseUrl = ok;
-          return ok;
-        }
+        const clean = qs.replace(/\/+$/, '');
+        this._serverBaseUrl = clean;
+        return clean;
       }
     } catch (_) {}
 
-    // 2. Если страница открыта напрямую с нашего Docker/сервера — используем same-origin (0 мс)
+    // 2. Если страница открыта с нашего или standalone Docker-сервера — используем собственный origin без лишних кругов!
     const host = window.location.hostname || '';
+    const path = window.location.pathname || '/';
+    if (host === '158.160.205.107') {
+      const url = path.startsWith('/orpheus') ? `${window.location.origin}/orpheus` : NetworkManager.DEFAULT_SERVER_URL;
+      this._serverBaseUrl = url;
+      return url;
+    }
+
     if (host && !host.endsWith('github.io') && window.location.protocol !== 'file:') {
-      const sameOrigin = await this._probeServerHealth(window.location.origin, 1400);
+      const basePath = path.startsWith('/orpheus') ? `${window.location.origin}/orpheus` : window.location.origin;
+      const sameOrigin = await this._probeServerHealth(basePath, 1200);
       if (sameOrigin) {
         this._serverBaseUrl = sameOrigin;
         return sameOrigin;
       }
     }
 
-    // 3. Параллельная гонка: сохранённый в localStorage URL + дефолтный URL сервера
-    const fastCandidates = [];
-    try {
-      const cached = localStorage.getItem(NetworkManager.SERVER_STORAGE_KEY);
-      if (cached && /^https?:\/\//i.test(cached)) fastCandidates.push(cached);
-    } catch (_) {}
-    if (NetworkManager.DEFAULT_SERVER_URL && !fastCandidates.includes(NetworkManager.DEFAULT_SERVER_URL)) {
-      fastCandidates.push(NetworkManager.DEFAULT_SERVER_URL);
-    }
-
-    if (fastCandidates.length > 0) {
-      try {
-        const winner = await Promise.any(
-          fastCandidates.map(async (u) => {
-            const ok = await this._probeServerHealth(u, 2500);
-            if (!ok) throw new Error('unhealthy');
-            return ok;
-          })
-        );
-        this._serverBaseUrl = winner;
-        try { localStorage.setItem(NetworkManager.SERVER_STORAGE_KEY, winner); } catch (_) {}
-        return winner;
-      } catch (_) {}
-    }
-
-    // 4. Авто-поиск актуального адреса сервера (на случай ротации туннеля)
-    const discovered = await this._fetchDiscoveredServerUrl();
-    if (discovered) {
-      this._serverBaseUrl = discovered;
-      try { localStorage.setItem(NetworkManager.SERVER_STORAGE_KEY, discovered); } catch (_) {}
-      return discovered;
-    }
-
-    return null;
+    // 3. Постоянный выделенный сервер — подключаемся к /ws СРАЗУ за 1 RTT (~50 мс) без предварительного /health!
+    this._serverBaseUrl = NetworkManager.DEFAULT_SERVER_URL;
+    return this._serverBaseUrl;
   }
 
   _openServerWs(baseUrl, timeoutMs = 4500) {
