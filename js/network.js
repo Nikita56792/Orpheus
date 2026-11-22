@@ -17,8 +17,12 @@ class NetworkManager {
   static STREAM_THRESHOLD_BYTES = 450 * 1024;       // Файлы > 450 КБ сразу запускаются через прогрессивный поток
   static ICE_GATHER_WAIT_MS = 1600;
   static P2P_TIMEOUT_MS = 7000;
-  static NTFY_BASE = 'https://ntfy.sh';
-  static NTFY_WS_BASE = 'wss://ntfy.sh';
+  // Кластер независимых сигнальных узлов (работают параллельно — выдерживает VPN, прокси, DPI и лимиты на любом устройстве)
+  static SIGNALING_NODES = [
+    { id: 'adminforge', http: 'https://ntfy.adminforge.de', ws: 'wss://ntfy.adminforge.de' },
+    { id: 'envs', http: 'https://ntfy.envs.net', ws: 'wss://ntfy.envs.net' },
+    { id: 'ntfy', http: 'https://ntfy.sh', ws: 'wss://ntfy.sh' },
+  ];
 
   static ICE_CONFIG = {
     iceServers: [
@@ -37,13 +41,9 @@ class NetworkManager {
     this.selfId = NetworkManager.generatePeerId();
     this.deviceName = NetworkManager.detectDeviceName();
 
-    // Сигналинг (ntfy.sh WSS + EventSource SSE + HTTPS Polling + BroadcastChannel)
-    this._sigWs = null;
-    this._sigSse = null;
-    this._sigPollTimer = null;
-    this._sigLastPollTs = 0;
+    // Многоузловой кластер сигналинга (WSS + EventSource SSE + HTTPS Polling + BroadcastChannel)
+    this._sigNodes = []; // [{ cfg, ws, sse, pollTimer, reconnectTimer, lastTs, ready, failedUntil }]
     this._sigTopic = null;
-    this._sigReconnectTimer = null;
     this._sigAlive = false;
     this._bc = null;
     this._seenMsgIds = new Set();
@@ -138,7 +138,6 @@ class NetworkManager {
     this._closeSignaling();
     this._sigTopic = this._roomTopic(code);
     this._sigAlive = true;
-    this._sigLastPollTs = Math.floor(Date.now() / 1000) - 2;
 
     try {
       this._bc = new BroadcastChannel(this._sigTopic);
@@ -147,10 +146,10 @@ class NetworkManager {
       };
     } catch (_) {}
 
-    const handleEnvelope = async (envelope) => {
+    const handleEnvelope = async (node, envelope) => {
       if (!envelope || envelope.event !== 'message') return;
-      if (envelope.time && envelope.time > this._sigLastPollTs) {
-        this._sigLastPollTs = envelope.time;
+      if (envelope.time && envelope.time > node.lastTs) {
+        node.lastTs = envelope.time;
       }
       let rawText = envelope.message || '';
       if (envelope.attachment && envelope.attachment.url) {
@@ -162,138 +161,150 @@ class NetworkManager {
       this._onSignalMessage(data);
     };
 
-    const startHttpsFallback = (onReady) => {
-      if (!this._sigAlive) return;
-      // 1. EventSource (HTTPS/2 SSE — работает даже там, где прокси/Safari/файрвол режут wss://!)
-      if (!this._sigSse && typeof EventSource !== 'undefined') {
-        try {
-          const sse = new EventSource(`${NetworkManager.NTFY_BASE}/${this._sigTopic}/sse`);
-          this._sigSse = sse;
-          sse.onopen = () => onReady();
-          sse.onmessage = (ev) => {
-            try { handleEnvelope(JSON.parse(ev.data)); } catch (_) {}
-          };
-          sse.onerror = () => {
-            // Если SSE тоже недоступен — polling ниже уже подхватит сообщения
-          };
-        } catch (_) {}
-      }
-
-      // 2. HTTPS JSON Polling — 100% проходит любой корпоративный/школьный прокси и антивирус
-      if (!this._sigPollTimer) {
-        const pollOnce = async () => {
-          if (!this._sigAlive) return;
-          // Останавливаем лишний polling, когда слушатель уже перешёл на прямой WebRTC P2P
-          if (this.role === 'listener' && this._listenerConnected && this.hostTransport !== 'relay') {
-            return;
-          }
-          // Если WebSocket живой и открыт — polling не нужен
-          if (this._sigWs && this._sigWs.readyState === WebSocket.OPEN) {
-            return;
-          }
-          try {
-            const url = `${NetworkManager.NTFY_BASE}/${this._sigTopic}/json?poll=1&since=${this._sigLastPollTs}`;
-            const resp = await fetch(url, { cache: 'no-store' });
-            if (resp.ok) {
-              onReady();
-              const text = await resp.text();
-              const lines = text.split('\n');
-              for (const line of lines) {
-                if (!line.trim()) continue;
-                try { await handleEnvelope(JSON.parse(line)); } catch (_) {}
-              }
-            }
-          } catch (_) {}
-        };
-        pollOnce();
-        this._sigPollTimer = setInterval(pollOnce, 1100);
-      }
-    };
-
     return new Promise((resolve, reject) => {
       let settled = false;
-      const markReady = () => {
+      const markReady = (node) => {
+        if (node) {
+          node.ready = true;
+          node.failedUntil = 0;
+        }
         if (!settled) {
           settled = true;
-          clearTimeout(fallbackKickTimer);
           clearTimeout(hardTimeout);
           resolve();
         }
       };
 
-      // Если WebSocket не открылся за 1.6 сек (например, на Mac с прокси/Safari) —
-      // автоматически без ошибок переключаемся на HTTPS SSE + JSON Polling!
-      const fallbackKickTimer = setTimeout(() => {
-        if (!settled) startHttpsFallback(markReady);
-      }, 1600);
-
       const hardTimeout = setTimeout(() => {
         if (!settled) {
           settled = true;
-          reject(new Error('Нет связи с интернетом для обнаружения комнаты. Проверьте Wi-Fi.'));
+          reject(new Error('Не удалось связаться ни с одним сигнальным узлом. Проверьте доступ в интернет.'));
         }
-      }, 10000);
+      }, 9000);
 
-      const wsUrl = `${NetworkManager.NTFY_WS_BASE}/${this._sigTopic}/ws`;
-      const connectWs = () => {
-        if (!this._sigAlive) return;
-        try {
-          const ws = new WebSocket(wsUrl);
-          this._sigWs = ws;
+      const startHttpsFallbackForNode = (node) => {
+        if (!this._sigAlive || node.sse || node.pollTimer) return;
 
-          ws.onopen = () => {
-            markReady();
-          };
+        // 1. HTTPS EventSource (SSE) — работает там, где прокси/VPN/Safari режут WebSocket
+        if (typeof EventSource !== 'undefined') {
+          try {
+            const sse = new EventSource(`${node.cfg.http}/${this._sigTopic}/sse`);
+            node.sse = sse;
+            sse.onopen = () => markReady(node);
+            sse.onmessage = (ev) => {
+              try { handleEnvelope(node, JSON.parse(ev.data)); } catch (_) {}
+            };
+            sse.onerror = () => {};
+          } catch (_) {}
+        }
 
-          ws.onmessage = async (ev) => {
-            try { await handleEnvelope(JSON.parse(ev.data)); } catch (_) {}
-          };
-
-          ws.onclose = () => {
-            if (this._sigAlive && this._sigWs === ws) {
-              // Сразу страхуем HTTPS SSE/Polling, пока WebSocket переподключается
-              startHttpsFallback(markReady);
-              this._sigReconnectTimer = setTimeout(connectWs, 2500);
+        // 2. HTTPS JSON Polling — 100% проходит любой прокси/VPN/антивирус
+        const pollOnce = async () => {
+          if (!this._sigAlive) return;
+          if (this.role === 'listener' && this._listenerConnected && this.hostTransport !== 'relay') return;
+          if (node.ws && node.ws.readyState === WebSocket.OPEN) return;
+          if (node.failedUntil && Date.now() < node.failedUntil) return;
+          try {
+            const url = `${node.cfg.http}/${this._sigTopic}/json?poll=1&since=${node.lastTs}`;
+            const resp = await fetch(url, { cache: 'no-store', signal: AbortSignal.timeout(3500) });
+            if (resp.ok) {
+              markReady(node);
+              const text = await resp.text();
+              for (const line of text.split('\n')) {
+                if (!line.trim()) continue;
+                try { await handleEnvelope(node, JSON.parse(line)); } catch (_) {}
+              }
+            } else if (resp.status === 429) {
+              node.failedUntil = Date.now() + 8000;
             }
-          };
-
-          ws.onerror = () => {
-            startHttpsFallback(markReady);
-          };
-        } catch (_) {
-          startHttpsFallback(markReady);
-        }
+          } catch (_) {
+            node.failedUntil = Date.now() + 12000;
+          }
+        };
+        pollOnce();
+        node.pollTimer = setInterval(pollOnce, 1400);
       };
 
-      connectWs();
+      // Подключаемся КО ВСЕМ независимым узлам параллельно — первый ответивший мгновенно открывает комнату!
+      for (const cfg of NetworkManager.SIGNALING_NODES) {
+        const node = {
+          cfg,
+          ws: null,
+          sse: null,
+          pollTimer: null,
+          reconnectTimer: null,
+          fallbackTimer: null,
+          lastTs: Math.floor(Date.now() / 1000) - 2,
+          ready: false,
+          failedUntil: 0,
+        };
+        this._sigNodes.push(node);
+
+        node.fallbackTimer = setTimeout(() => {
+          if (this._sigAlive && !node.ready) {
+            startHttpsFallbackForNode(node);
+          }
+        }, 1600);
+
+        const connectWs = () => {
+          if (!this._sigAlive) return;
+          try {
+            const ws = new WebSocket(`${cfg.ws}/${this._sigTopic}/ws`);
+            node.ws = ws;
+
+            ws.onopen = () => {
+              clearTimeout(node.fallbackTimer);
+              markReady(node);
+            };
+
+            ws.onmessage = async (ev) => {
+              try { await handleEnvelope(node, JSON.parse(ev.data)); } catch (_) {}
+            };
+
+            ws.onclose = () => {
+              if (this._sigAlive && node.ws === ws) {
+                if (node.ready) startHttpsFallbackForNode(node);
+                node.reconnectTimer = setTimeout(connectWs, 4000);
+              }
+            };
+
+            ws.onerror = () => {
+              startHttpsFallbackForNode(node);
+            };
+          } catch (_) {
+            startHttpsFallbackForNode(node);
+          }
+        };
+
+        connectWs();
+      }
     });
   }
 
   _closeSignaling() {
     this._sigAlive = false;
-    if (this._sigReconnectTimer) {
-      clearTimeout(this._sigReconnectTimer);
-      this._sigReconnectTimer = null;
+    for (const node of this._sigNodes) {
+      if (node.fallbackTimer) clearTimeout(node.fallbackTimer);
+      if (node.reconnectTimer) clearTimeout(node.reconnectTimer);
+      if (node.pollTimer) clearInterval(node.pollTimer);
+      if (node.sse) { try { node.sse.close(); } catch (_) {} }
+      if (node.ws) { try { node.ws.close(); } catch (_) {} }
     }
-    if (this._sigPollTimer) {
-      clearInterval(this._sigPollTimer);
-      this._sigPollTimer = null;
-    }
-    if (this._sigSse) {
-      try { this._sigSse.close(); } catch (_) {}
-      this._sigSse = null;
-    }
-    if (this._sigWs) {
-      try { this._sigWs.close(); } catch (_) {}
-      this._sigWs = null;
-    }
+    this._sigNodes = [];
     if (this._bc) {
       try { this._bc.close(); } catch (_) {}
       this._bc = null;
     }
   }
 
-  async _sendSignal(payload, attempt = 0) {
+  _getHealthySignalingNodes() {
+    const now = Date.now();
+    const readyNodes = this._sigNodes.filter((n) => n.ready && (!n.failedUntil || n.failedUntil <= now));
+    if (readyNodes.length > 0) return readyNodes;
+    return this._sigNodes.filter((n) => !n.failedUntil || n.failedUntil <= now);
+  }
+
+  async _sendSignal(payload) {
     if (!this._sigTopic) return;
     const msg = {
       ...payload,
@@ -302,22 +313,34 @@ class NetworkManager {
     };
     this._seenMsgIds.add(msg.mid);
 
-    if (this._bc && attempt === 0) {
+    if (this._bc) {
       try { this._bc.postMessage(msg); } catch (_) {}
     }
 
-    try {
-      const resp = await fetch(`${NetworkManager.NTFY_BASE}/${this._sigTopic}`, {
-        method: 'POST',
-        body: JSON.stringify(msg),
-      });
-      if (resp.status === 429 && attempt < 2) {
-        await new Promise((r) => setTimeout(r, 450 + attempt * 500));
-        return this._sendSignal(msg, attempt + 1);
-      }
-    } catch (err) {
-      console.warn('[Network] Signal POST error:', err);
-    }
+    const body = JSON.stringify(msg);
+    const targets = this._getHealthySignalingNodes();
+    const list = targets.length > 0 ? targets : this._sigNodes;
+
+    // Отправляем параллельно во все живые узлы кластера (дедупликация по mid на приёме)
+    await Promise.allSettled(
+      list.map(async (node) => {
+        try {
+          const resp = await fetch(`${node.cfg.http}/${this._sigTopic}`, {
+            method: 'POST',
+            body,
+            signal: AbortSignal.timeout(4000),
+          });
+          if (resp.ok) {
+            node.ready = true;
+            node.failedUntil = 0;
+          } else if (resp.status === 429) {
+            node.failedUntil = Date.now() + 8000;
+          }
+        } catch (_) {
+          node.failedUntil = Date.now() + 15000;
+        }
+      })
+    );
   }
 
   _onSignalMessage(msg) {
@@ -1163,17 +1186,24 @@ class NetworkManager {
     try {
       if (!track._relayUrl) {
         const fileTopic = `${this._sigTopic}-f-${NetworkManager.hashKey(track.id)}`;
-        const resp = await fetch(`${NetworkManager.NTFY_BASE}/${fileTopic}`, {
-          method: 'PUT',
-          headers: { Filename: encodeURIComponent(track.name || 'track.mp3') },
-          body: track.buffer,
-        });
-        const meta = await resp.json();
-        if (meta && meta.attachment && meta.attachment.url) {
-          track._relayUrl = meta.attachment.url;
-        } else {
-          throw new Error('Relay upload failed');
+        const nodes = this._getHealthySignalingNodes();
+        const tryList = nodes.length > 0 ? nodes : this._sigNodes;
+        for (const node of tryList) {
+          try {
+            const resp = await fetch(`${node.cfg.http}/${fileTopic}`, {
+              method: 'PUT',
+              headers: { Filename: encodeURIComponent(track.name || 'track.mp3') },
+              body: track.buffer,
+              signal: AbortSignal.timeout(15000),
+            });
+            const meta = await resp.json();
+            if (meta && meta.attachment && meta.attachment.url) {
+              track._relayUrl = meta.attachment.url;
+              break;
+            }
+          } catch (_) {}
         }
+        if (!track._relayUrl) throw new Error('Relay upload failed');
       }
 
       if (isActive) {
