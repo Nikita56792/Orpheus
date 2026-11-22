@@ -1,23 +1,42 @@
 /**
- * NetworkManager v2.2 — Мгновенная синхронизация + прогрессивный стриминг аудио
- * во время фонового кэширования + надёжный многоканальный WebRTC / WSS Relay.
+ * NetworkManager v3.0 — Гибридный движок «Выделенный сервер + Локальный P2P».
  *
- * Исправлено в v2.2:
- * - Не сбрасывает NTP-пинги, если канал orpheus-ntp ещё открывается (мгновенный fallback на orpheus-ctrl).
- * - Ожидает готовности бинарного канала orpheus-data перед передачей файлов (не отменяет загрузку молча!).
- * - Прогрессивный стриминг: для файлов > 700 КБ первым делом отправляется лёгкий стартовый
- *   сегмент (~6 сек, < 0.5 сек передачи), чтобы музыка заиграла СРАЗУ, пока полный файл
- *   продолжает кэшироваться с отображением процентов 0%..100% на главном устройстве.
+ * Архитектура:
+ * 1. Мгновенный WebSocket-хаб на выделенном сервере (/ws):
+ *    - Создание и вход в комнату за миллисекунды, работает при включённом VPN на любых устройствах.
+ *    - Мгновенный обмен NTP, задержками Bluetooth, плейлистом и командами Play/Pause без ожидания ICE.
+ * 2. Параллельный локальный P2P-апгрейд (WebRTC):
+ *    - Сразу после входа через серверный /ws в фоне поднимается прямой локальный канал (LAN / P2P UDP).
+ *    - Как только прямой канал готов, NTP-синхронизация автоматически переходит на прямой UDP-канал
+ *      orpheus-ntp с минимальным джиттером; в локальной сети аудио дополнительно летит напрямую по LAN.
+ * 3. Двухпутевая прогрессивная доставка аудио (Сервер HTTPS + P2P):
+ *    - Стартовый потоковый сегмент (8.5 сек) загружается на сервер и отдаётся всем устройствам за ~0.5 сек —
+ *      музыка начинает играть СРАЗУ во время кэширования полного файла.
+ *    - Полный файл загружается Хостом на сервер 1 раз, а все устройства параллельно качают его по HTTPS
+ *      с отображением живых процентов (0%..100%) на главном устройстве.
+ *    - Если кэш ещё не завершён, следующие потоковые сегменты подгружаются отдельными независимыми
+ *      HTTPS-запросами (не блокируются фоновой закачкой — 0 разрывов звука).
+ * 4. Авто-резерв: если выделенный сервер временно недоступен, автоматически включается резервный
+ *    многоузловой P2P-сигналинг.
  */
 class NetworkManager {
   static DEFAULT_CHUNK_SIZE = 16000;
   static MAX_CHUNK_SIZE = 60000;
-  static MAX_BUFFERED_AMOUNT = 768 * 1024;          // Высокоскоростное окно (когда поток не требуется)
-  static STREAMING_DATA_BUFFER_LIMIT = 128 * 1024;  // Щадящее окно для фонового кэша во время живого стриминга (чтобы orpheus-stream не ждал!)
-  static STREAM_THRESHOLD_BYTES = 450 * 1024;       // Файлы > 450 КБ сразу запускаются через прогрессивный поток
-  static ICE_GATHER_WAIT_MS = 1600;
+  static MAX_BUFFERED_AMOUNT = 768 * 1024;
+  static STREAMING_DATA_BUFFER_LIMIT = 128 * 1024;
+  static STREAM_THRESHOLD_BYTES = 350 * 1024;
+  static ICE_GATHER_WAIT_MS = 1400;
   static P2P_TIMEOUT_MS = 7000;
-  // Кластер независимых сигнальных узлов (работают параллельно — выдерживает VPN, прокси, DPI и лимиты на любом устройстве)
+
+  // Основной выделенный сервер Orpheus (автоматически обновляется через discovery при ротации туннеля)
+  static DEFAULT_SERVER_URL = 'https://eqmzq-93-175-30-192.free.pinggy.net';
+  static SERVER_DISCOVERY_URLS = [
+    'https://ntfy.adminforge.de/orpheus-srv-nikita56792-v1/json?poll=1&since=all',
+    'https://ntfy.envs.net/orpheus-srv-nikita56792-v1/json?poll=1&since=all',
+  ];
+  static SERVER_STORAGE_KEY = 'orpheus_server_url_v3';
+
+  // Резервный кластер сигналинга (используется только если выделенный сервер полностью недоступен)
   static SIGNALING_NODES = [
     { id: 'adminforge', http: 'https://ntfy.adminforge.de', ws: 'wss://ntfy.adminforge.de' },
     { id: 'envs', http: 'https://ntfy.envs.net', ws: 'wss://ntfy.envs.net' },
@@ -41,8 +60,17 @@ class NetworkManager {
     this.selfId = NetworkManager.generatePeerId();
     this.deviceName = NetworkManager.detectDeviceName();
 
-    // Многоузловой кластер сигналинга (WSS + EventSource SSE + HTTPS Polling + BroadcastChannel)
-    this._sigNodes = []; // [{ cfg, ws, sse, pollTimer, reconnectTimer, lastTs, ready, failedUntil }]
+    // Выделенный сервер (primary)
+    this._serverBaseUrl = null;
+    this._serverWs = null;
+    this._serverMode = false;
+    this._serverKeepaliveTimer = null;
+    this._serverReconnectTimer = null;
+    this._pendingServerResolve = null;
+    this._pendingServerReject = null;
+
+    // Резервный кластер сигналинга
+    this._sigNodes = [];
     this._sigTopic = null;
     this._sigAlive = false;
     this._bc = null;
@@ -72,10 +100,13 @@ class NetworkManager {
     this._listenerJoinTimer = null;
     this._listenerProgressCb = null;
     this._listenerConnected = false;
+    this._listenerP2pReady = false;
     this._listenerPendingIce = [];
+    this._downloadingTracks = new Set();
+    this._downloadingSegments = new Set();
 
-    this.incomingTransfers = new Map(); // transferHash -> { kind: 'file'|'seg', ... }
-    this.earlyChunks = new Map();       // transferHash -> Map(index -> Uint8Array) если бинарный пакет опередил META
+    this.incomingTransfers = new Map();
+    this.earlyChunks = new Map();
   }
 
   static generatePeerId() {
@@ -128,7 +159,194 @@ class NetworkManager {
     return 'Устройство';
   }
 
-  /* ==================== СИГНАЛИНГ ==================== */
+  /* ==================== ОБНАРУЖЕНИЕ И ПОДКЛЮЧЕНИЕ К ВЫДЕЛЕННОМУ СЕРВЕРУ ==================== */
+
+  _serverHeaders(extra = {}) {
+    return { 'X-Pinggy-No-Screen': '1', ...extra };
+  }
+
+  async _probeServerHealth(baseUrl, timeoutMs = 2600) {
+    if (!baseUrl) return null;
+    const clean = baseUrl.replace(/\/+$/, '');
+    try {
+      const resp = await fetch(`${clean}/health`, {
+        headers: this._serverHeaders(),
+        cache: 'no-store',
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!resp.ok) return null;
+      const data = await resp.json();
+      if (data && data.ok && data.service === 'orpheus-sync') {
+        return clean;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  async _fetchDiscoveredServerUrl() {
+    const candidates = [];
+    await Promise.allSettled(
+      NetworkManager.SERVER_DISCOVERY_URLS.map(async (ep) => {
+        try {
+          const resp = await fetch(ep, { cache: 'no-store', signal: AbortSignal.timeout(3000) });
+          if (!resp.ok) return;
+          const text = await resp.text();
+          let latest = null;
+          let latestTs = 0;
+          for (const line of text.split('\n')) {
+            if (!line.trim()) continue;
+            try {
+              const env = JSON.parse(line);
+              if (env && env.event === 'message' && env.message) {
+                const m = String(env.message).match(/https:\/\/[a-z0-9.-]+/i);
+                if (m && (env.time || 0) >= latestTs) {
+                  latestTs = env.time || 0;
+                  latest = m[0];
+                }
+              }
+            } catch (_) {}
+          }
+          if (latest) candidates.push({ url: latest, ts: latestTs });
+        } catch (_) {}
+      })
+    );
+    candidates.sort((a, b) => b.ts - a.ts);
+    for (const item of candidates) {
+      const ok = await this._probeServerHealth(item.url, 2800);
+      if (ok) return ok;
+    }
+    return null;
+  }
+
+  async _resolveServerUrl() {
+    if (this._serverBaseUrl) {
+      const stillAlive = await this._probeServerHealth(this._serverBaseUrl, 1800);
+      if (stillAlive) return stillAlive;
+      this._serverBaseUrl = null;
+    }
+
+    // 1. Явный параметр ?server=https://...
+    try {
+      const qs = new URLSearchParams(window.location.search).get('server');
+      if (qs && /^https?:\/\//i.test(qs)) {
+        const ok = await this._probeServerHealth(qs, 2500);
+        if (ok) {
+          this._serverBaseUrl = ok;
+          return ok;
+        }
+      }
+    } catch (_) {}
+
+    // 2. Если страница открыта напрямую с нашего Docker/сервера — используем same-origin (0 мс)
+    const host = window.location.hostname || '';
+    if (host && !host.endsWith('github.io') && window.location.protocol !== 'file:') {
+      const sameOrigin = await this._probeServerHealth(window.location.origin, 1400);
+      if (sameOrigin) {
+        this._serverBaseUrl = sameOrigin;
+        return sameOrigin;
+      }
+    }
+
+    // 3. Параллельная гонка: сохранённый в localStorage URL + дефолтный URL сервера
+    const fastCandidates = [];
+    try {
+      const cached = localStorage.getItem(NetworkManager.SERVER_STORAGE_KEY);
+      if (cached && /^https?:\/\//i.test(cached)) fastCandidates.push(cached);
+    } catch (_) {}
+    if (NetworkManager.DEFAULT_SERVER_URL && !fastCandidates.includes(NetworkManager.DEFAULT_SERVER_URL)) {
+      fastCandidates.push(NetworkManager.DEFAULT_SERVER_URL);
+    }
+
+    if (fastCandidates.length > 0) {
+      try {
+        const winner = await Promise.any(
+          fastCandidates.map(async (u) => {
+            const ok = await this._probeServerHealth(u, 2500);
+            if (!ok) throw new Error('unhealthy');
+            return ok;
+          })
+        );
+        this._serverBaseUrl = winner;
+        try { localStorage.setItem(NetworkManager.SERVER_STORAGE_KEY, winner); } catch (_) {}
+        return winner;
+      } catch (_) {}
+    }
+
+    // 4. Авто-поиск актуального адреса сервера (на случай ротации туннеля)
+    const discovered = await this._fetchDiscoveredServerUrl();
+    if (discovered) {
+      this._serverBaseUrl = discovered;
+      try { localStorage.setItem(NetworkManager.SERVER_STORAGE_KEY, discovered); } catch (_) {}
+      return discovered;
+    }
+
+    return null;
+  }
+
+  _openServerWs(baseUrl, timeoutMs = 4500) {
+    return new Promise((resolve, reject) => {
+      const wsUrl = baseUrl.replace(/^http/i, 'ws') + '/ws';
+      let settled = false;
+      const ws = new WebSocket(wsUrl);
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          try { ws.close(); } catch (_) {}
+          reject(new Error('Таймаут подключения к серверу'));
+        }
+      }, timeoutMs);
+
+      ws.onopen = () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(ws);
+        }
+      };
+      ws.onerror = () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          reject(new Error('Ошибка WebSocket сервера'));
+        }
+      };
+      ws.onclose = () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          reject(new Error('Сервер закрыл соединение'));
+        }
+      };
+    });
+  }
+
+  _sendServerWs(obj) {
+    if (this._serverWs && this._serverWs.readyState === WebSocket.OPEN) {
+      try {
+        this._serverWs.send(JSON.stringify(obj));
+        return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  _closeServerWs() {
+    clearInterval(this._serverKeepaliveTimer);
+    clearTimeout(this._serverReconnectTimer);
+    this._serverKeepaliveTimer = null;
+    this._serverReconnectTimer = null;
+    this._serverMode = false;
+    if (this._serverWs) {
+      const old = this._serverWs;
+      this._serverWs = null;
+      old.onclose = null;
+      old.onmessage = null;
+      old.onerror = null;
+      try { old.close(); } catch (_) {}
+    }
+  }
+
+  /* ==================== РЕЗЕРВНЫЙ СИГНАЛИНГ (FALLBACK) ==================== */
 
   _roomTopic(code) {
     return `orpheus-sync-v2-room-${code.toLowerCase()}`;
@@ -178,14 +396,12 @@ class NetworkManager {
       const hardTimeout = setTimeout(() => {
         if (!settled) {
           settled = true;
-          reject(new Error('Не удалось связаться ни с одним сигнальным узлом. Проверьте доступ в интернет.'));
+          reject(new Error('Не удалось связаться с сервером. Проверьте подключение к интернету.'));
         }
       }, 9000);
 
       const startHttpsFallbackForNode = (node) => {
         if (!this._sigAlive || node.sse || node.pollTimer) return;
-
-        // 1. HTTPS EventSource (SSE) — работает там, где прокси/VPN/Safari режут WebSocket
         if (typeof EventSource !== 'undefined') {
           try {
             const sse = new EventSource(`${node.cfg.http}/${this._sigTopic}/sse`);
@@ -197,8 +413,6 @@ class NetworkManager {
             sse.onerror = () => {};
           } catch (_) {}
         }
-
-        // 2. HTTPS JSON Polling — 100% проходит любой прокси/VPN/антивирус
         const pollOnce = async () => {
           if (!this._sigAlive) return;
           if (this.role === 'listener' && this._listenerConnected && this.hostTransport !== 'relay') return;
@@ -225,7 +439,6 @@ class NetworkManager {
         node.pollTimer = setInterval(pollOnce, 1400);
       };
 
-      // Подключаемся КО ВСЕМ независимым узлам параллельно — первый ответивший мгновенно открывает комнату!
       for (const cfg of NetworkManager.SIGNALING_NODES) {
         const node = {
           cfg,
@@ -241,9 +454,7 @@ class NetworkManager {
         this._sigNodes.push(node);
 
         node.fallbackTimer = setTimeout(() => {
-          if (this._sigAlive && !node.ready) {
-            startHttpsFallbackForNode(node);
-          }
+          if (this._sigAlive && !node.ready) startHttpsFallbackForNode(node);
         }, 1600);
 
         const connectWs = () => {
@@ -251,31 +462,24 @@ class NetworkManager {
           try {
             const ws = new WebSocket(`${cfg.ws}/${this._sigTopic}/ws`);
             node.ws = ws;
-
             ws.onopen = () => {
               clearTimeout(node.fallbackTimer);
               markReady(node);
             };
-
             ws.onmessage = async (ev) => {
               try { await handleEnvelope(node, JSON.parse(ev.data)); } catch (_) {}
             };
-
             ws.onclose = () => {
               if (this._sigAlive && node.ws === ws) {
                 if (node.ready) startHttpsFallbackForNode(node);
                 node.reconnectTimer = setTimeout(connectWs, 4000);
               }
             };
-
-            ws.onerror = () => {
-              startHttpsFallbackForNode(node);
-            };
+            ws.onerror = () => startHttpsFallbackForNode(node);
           } catch (_) {
             startHttpsFallbackForNode(node);
           }
         };
-
         connectWs();
       }
     });
@@ -305,6 +509,14 @@ class NetworkManager {
   }
 
   async _sendSignal(payload) {
+    if (this._serverMode) {
+      this._sendServerWs({
+        t: 'SIGNAL',
+        to: payload.to || undefined,
+        data: payload,
+      });
+      return;
+    }
     if (!this._sigTopic) return;
     const msg = {
       ...payload,
@@ -321,7 +533,6 @@ class NetworkManager {
     const targets = this._getHealthySignalingNodes();
     const list = targets.length > 0 ? targets : this._sigNodes;
 
-    // Отправляем параллельно во все живые узлы кластера (дедупликация по mid на приёме)
     await Promise.allSettled(
       list.map(async (node) => {
         try {
@@ -369,19 +580,166 @@ class NetworkManager {
     this.destroy();
     this.role = 'host';
     this.selfId = NetworkManager.generatePeerId();
-    const code = preferredCode
+    const wantedCode = preferredCode
       ? NetworkManager.normalizeCode(preferredCode)
       : NetworkManager.generateRoomCode();
-    this.roomCode = code;
 
-    await this._openSignaling(code);
-    return code;
+    // 1. Быстрый путь: наш выделенный сервер (/ws) — мгновенное создание комнаты даже с VPN!
+    const serverUrl = await this._resolveServerUrl();
+    if (serverUrl) {
+      try {
+        const code = await this._startHostOnServer(serverUrl, wantedCode);
+        return code;
+      } catch (err) {
+        console.warn('[Network/Host] Dedicated server failed, falling back to P2P cluster:', err);
+        this._closeServerWs();
+      }
+    }
+
+    // 2. Резервный путь: многоузловой P2P кластер
+    this.roomCode = wantedCode;
+    await this._openSignaling(wantedCode);
+    return wantedCode;
+  }
+
+  async _startHostOnServer(serverUrl, wantedCode) {
+    const ws = await this._openServerWs(serverUrl, 4500);
+    this._serverWs = ws;
+    this._serverBaseUrl = serverUrl;
+    this._serverMode = true;
+
+    return new Promise((resolve, reject) => {
+      let created = false;
+      const timeout = setTimeout(() => {
+        if (!created) {
+          created = true;
+          this._closeServerWs();
+          reject(new Error('Сервер не ответил на создание комнаты'));
+        }
+      }, 4500);
+
+      ws.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch (_) { return; }
+        if (!msg || typeof msg !== 'object') return;
+
+        if (msg.t === 'ROOM_CREATED' && !created) {
+          created = true;
+          clearTimeout(timeout);
+          this.roomCode = msg.code;
+          this.selfId = msg.peerId || this.selfId;
+          resolve(msg.code);
+          return;
+        }
+
+        this._hostHandleServerMessage(msg);
+      };
+
+      ws.onclose = () => {
+        if (!created) {
+          created = true;
+          clearTimeout(timeout);
+          reject(new Error('Соединение с сервером разорвано'));
+          return;
+        }
+        // Авто-переподключение Хоста к серверу с тем же кодом комнаты
+        if (this.role === 'host' && this._serverMode && this.roomCode) {
+          const keepCode = this.roomCode;
+          this._serverReconnectTimer = setTimeout(async () => {
+            if (this.role !== 'host' || this.roomCode !== keepCode) return;
+            try {
+              const freshUrl = await this._resolveServerUrl();
+              if (freshUrl && this.role === 'host') {
+                await this._startHostOnServer(freshUrl, keepCode);
+              }
+            } catch (_) {}
+          }, 2500);
+        }
+      };
+
+      this._sendServerWs({
+        t: 'CREATE_ROOM',
+        code: wantedCode,
+        deviceName: this.deviceName,
+      });
+    });
+  }
+
+  _hostHandleServerMessage(msg) {
+    switch (msg.t) {
+      case 'PEER_JOINED': {
+        this._hostAddServerClient(msg.peerId, msg.deviceName || 'Устройство');
+        break;
+      }
+
+      case 'PEER_LEFT': {
+        this._hostRemoveClient(msg.peerId);
+        break;
+      }
+
+      case 'FROM_PEER': {
+        const client = this.clients.get(msg.from);
+        if (client && msg.payload) {
+          this._hostHandleClientMessage(client, msg.payload);
+        }
+        break;
+      }
+
+      case 'SIGNAL': {
+        if (msg.data) {
+          this._hostHandleSignal({ ...msg.data, from: msg.from });
+        }
+        break;
+      }
+    }
+  }
+
+  _hostAddServerClient(peerId, deviceName) {
+    if (this.clients.has(peerId)) {
+      this._hostRemoveClient(peerId, false);
+    }
+    const label = `${deviceName} #${++this.clientCounter}`;
+    const client = {
+      id: peerId,
+      pc: null,
+      channels: { ntp: null, ctrl: null, stream: null, data: null },
+      viaServer: true,
+      p2pReady: false,
+      transport: 'server',
+      transportLabel: 'Сервер',
+      open: true,
+      label,
+      rttMs: null,
+      status: 'Синхронизация...',
+      phase: 'syncing',
+      progress: 0,
+      readyTracks: new Set(),
+      streamReadyTracks: new Set(),
+      urgentSegments: [],
+      transferQueue: [],
+      isSendingFile: false,
+      latency: { totalLatencyMs: 0, systemLatencyMs: 0, isBluetooth: false, outputDeviceLabel: '' },
+      syncedOnce: true,
+    };
+    this.clients.set(peerId, client);
+    this._emitPeers();
+    // СРАЗУ синхронизируем часы, задержки и запускаем передачу/стрим аудио (0 мс ожидания ICE!)
+    this._hostSyncNewClient(client);
   }
 
   async _hostHandleSignal(msg) {
     switch (msg.sig) {
       case 'JOIN_REQ': {
         await this._hostAcceptListener(msg.from, msg.deviceName || 'Устройство', msg.offer, msg.candidates || []);
+        break;
+      }
+
+      case 'P2P_OFFER': {
+        // Фоновый апгрейд уже подключённого через сервер клиента на прямой локальный P2P!
+        const client = this.clients.get(msg.from);
+        if (client && msg.offer) {
+          await this._hostUpgradeClientToP2P(client, msg.offer, msg.candidates || []);
+        }
         break;
       }
 
@@ -423,6 +781,107 @@ class NetworkManager {
     }
   }
 
+  async _hostUpgradeClientToP2P(client, remoteOffer, remoteCandidates) {
+    if (client.pc) {
+      try { client.pc.close(); } catch (_) {}
+    }
+    const pc = new RTCPeerConnection(NetworkManager.ICE_CONFIG);
+    client.pc = pc;
+
+    const gatheredCandidates = [];
+    let trickleSent = false;
+    let lateCandidates = [];
+    let lateFlushTimer = null;
+
+    pc.onicecandidate = (ev) => {
+      if (!ev.candidate) return;
+      const candJson = ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate;
+      if (!trickleSent) {
+        gatheredCandidates.push(candJson);
+      } else {
+        lateCandidates.push(candJson);
+        if (!lateFlushTimer) {
+          lateFlushTimer = setTimeout(() => {
+            lateFlushTimer = null;
+            if (lateCandidates.length > 0 && client.pc === pc) {
+              const batch = lateCandidates;
+              lateCandidates = [];
+              this._sendSignal({ sig: 'ICE_BATCH', to: client.id, candidates: batch });
+            }
+          }, 200);
+        }
+      }
+    };
+
+    pc.ondatachannel = (ev) => {
+      const ch = ev.channel;
+      ch.binaryType = 'arraybuffer';
+      if (ch.label === 'orpheus-ntp') client.channels.ntp = ch;
+      else if (ch.label === 'orpheus-ctrl') client.channels.ctrl = ch;
+      else if (ch.label === 'orpheus-stream') client.channels.stream = ch;
+      else if (ch.label === 'orpheus-data') client.channels.data = ch;
+
+      ch.onopen = () => {
+        if (ch.label === 'orpheus-ntp' || ch.label === 'orpheus-ctrl') {
+          client.p2pReady = true;
+          this._detectTransportType(pc, (type, text) => {
+            client.transport = type;
+            client.transportLabel = type === 'p2p-lan' ? 'LAN' : text === 'P2P' ? 'P2P' : 'Сервер';
+            this._emitPeers();
+          });
+        }
+      };
+
+      ch.onmessage = (msgEv) => {
+        if (typeof msgEv.data === 'string') {
+          try {
+            this._hostHandleClientMessage(client, JSON.parse(msgEv.data));
+          } catch (_) {}
+        }
+      };
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      const st = pc.iceConnectionState;
+      if (st === 'connected' || st === 'completed') {
+        client.p2pReady = true;
+        this._detectTransportType(pc, (type, text) => {
+          client.transport = type;
+          client.transportLabel = type === 'p2p-lan' ? 'LAN' : text === 'P2P' ? 'P2P' : 'Сервер';
+          this._emitPeers();
+        });
+      } else if (st === 'failed' || st === 'closed') {
+        // Не отключаем клиента — он продолжает работать через сервер!
+        client.p2pReady = false;
+        if (client.viaServer) {
+          client.transport = 'server';
+          client.transportLabel = 'Сервер';
+          this._emitPeers();
+        }
+      }
+    };
+
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(remoteOffer));
+      for (const c of remoteCandidates) {
+        try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (_) {}
+      }
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await this._waitIceGathering(pc, NetworkManager.ICE_GATHER_WAIT_MS);
+      trickleSent = true;
+
+      await this._sendSignal({
+        sig: 'P2P_ANSWER',
+        to: client.id,
+        answer: { type: pc.localDescription.type, sdp: pc.localDescription.sdp },
+        candidates: gatheredCandidates,
+      });
+    } catch (_) {
+      client.p2pReady = false;
+    }
+  }
+
   async _hostAcceptListener(peerId, deviceName, remoteOffer, remoteCandidates) {
     if (this.clients.has(peerId)) {
       this._hostRemoveClient(peerId, false);
@@ -434,6 +893,8 @@ class NetworkManager {
       id: peerId,
       pc,
       channels: { ntp: null, ctrl: null, stream: null, data: null },
+      viaServer: false,
+      p2pReady: false,
       transport: 'connecting',
       transportLabel: 'Подкл.',
       open: false,
@@ -444,7 +905,7 @@ class NetworkManager {
       progress: 0,
       readyTracks: new Set(),
       streamReadyTracks: new Set(),
-      urgentSegments: [], // Приоритетные потоковые сегменты (вставляются поверх фонового кэша!)
+      urgentSegments: [],
       transferQueue: [],
       isSendingFile: false,
       latency: { totalLatencyMs: 0, systemLatencyMs: 0, isBluetooth: false, outputDeviceLabel: '' },
@@ -491,6 +952,7 @@ class NetworkManager {
       ch.onopen = () => {
         if (client.channels.ctrl && client.channels.ctrl.readyState === 'open') {
           client.open = true;
+          client.p2pReady = true;
           if (client.transport === 'connecting') {
             client.transport = 'p2p';
             client.transportLabel = 'P2P';
@@ -518,14 +980,12 @@ class NetworkManager {
 
       ch.onmessage = (msgEv) => {
         if (typeof msgEv.data === 'string') {
-          try {
-            this._hostHandleClientMessage(client, JSON.parse(msgEv.data));
-          } catch (_) {}
+          try { this._hostHandleClientMessage(client, JSON.parse(msgEv.data)); } catch (_) {}
         }
       };
 
       ch.onclose = () => {
-        if (ch.label === 'orpheus-ctrl' && client.transport !== 'relay') {
+        if (ch.label === 'orpheus-ctrl' && client.transport !== 'relay' && !client.viaServer) {
           this._hostRemoveClient(peerId);
         }
       };
@@ -540,9 +1000,9 @@ class NetworkManager {
           this._emitPeers();
         });
       } else if (st === 'disconnected' || st === 'failed' || st === 'closed') {
-        if (client.transport !== 'relay') {
+        if (client.transport !== 'relay' && !client.viaServer) {
           setTimeout(() => {
-            if (this.clients.get(peerId) === client && client.transport !== 'relay') {
+            if (this.clients.get(peerId) === client && client.transport !== 'relay' && !client.viaServer) {
               const cur = pc.iceConnectionState;
               if (cur === 'failed' || cur === 'closed' || cur === 'disconnected') {
                 this._hostRemoveClient(peerId);
@@ -705,8 +1165,6 @@ class NetworkManager {
       }
 
       case 'TRACK_STREAM_READY': {
-        // Слушатель получил стартовый потоковый сегмент — можно СРАЗУ запускать звук,
-        // не дожидаясь 100% скачивания полного файла!
         client.streamReadyTracks.add(msg.trackId);
         if (msg.trackId === this.activeTrackId && !client.readyTracks.has(msg.trackId)) {
           client.phase = 'streaming';
@@ -729,16 +1187,20 @@ class NetworkManager {
       }
 
       case 'NEED_STREAM_SEG': {
-        // Всегда отдаём срочный потоковый сегмент, пока полный файл не закэширован — чтобы звук НИКОГДА не прерывался!
         if (msg.trackId && typeof msg.fromSec === 'number' && !client.readyTracks.has(msg.trackId)) {
-          const dup = client.urgentSegments.some(
-            (s) => s.trackId === msg.trackId && Math.abs(s.fromSec - msg.fromSec) < 1.5
-          );
-          if (!dup) {
-            client.urgentSegments.push({ trackId: msg.trackId, fromSec: msg.fromSec, durationSec: 8.5 });
-          }
-          if (!client.isSendingFile) {
-            this._processClientTransferQueue(client);
+          if (client.viaServer && this._serverMode) {
+            // Мгновенно отдаём сегмент через выделенный сервер (не зависит от очереди фонового кэша!)
+            this._serveStreamSegmentViaServer(client, msg.trackId, msg.fromSec, 8.5);
+          } else {
+            const dup = client.urgentSegments.some(
+              (s) => s.trackId === msg.trackId && Math.abs(s.fromSec - msg.fromSec) < 1.5
+            );
+            if (!dup) {
+              client.urgentSegments.push({ trackId: msg.trackId, fromSec: msg.fromSec, durationSec: 8.5 });
+            }
+            if (!client.isSendingFile) {
+              this._processClientTransferQueue(client);
+            }
           }
         }
         break;
@@ -753,7 +1215,6 @@ class NetworkManager {
           client.status = 'Готово';
           this._emitPeers();
 
-          // Если ещё не отправили CMD_PLAY на этапе STREAM_READY — отправляем сейчас
           if (this.playbackState.playing && this.playbackState.trackId === msg.trackId) {
             this._sendToClient(client, 'ctrl', {
               type: 'CMD_PLAY',
@@ -837,7 +1298,7 @@ class NetworkManager {
     }
   }
 
-  /* ==================== ПЛЕЙЛИСТ И ПРОГРЕССИВНАЯ ПЕРЕДАЧА ==================== */
+  /* ==================== ПЛЕЙЛИСТ И ДВУХПУТЕВАЯ ПРОГРЕССИВНАЯ ПЕРЕДАЧА ==================== */
 
   _serializePlaylistMeta() {
     return this.playlist.map((t) => ({
@@ -881,6 +1342,11 @@ class NetworkManager {
     const activeTrack = this.playlist.find((t) => t.id === activeTrackId);
     const nextTrack = this._getNextPlaylistTrack(activeTrackId);
 
+    // Если активен наш сервер — сразу пре-загружаем файл в RAM сервера, чтобы даже новые устройства забирали мгновенно!
+    if (this._serverMode && activeTrack && activeTrack.type === 'file' && activeTrack.buffer) {
+      this._ensureTrackUploadedToServer(activeTrack).catch(() => {});
+    }
+
     for (const client of this.clients.values()) {
       if (activeTrack) {
         if (client.readyTracks.has(activeTrack.id)) {
@@ -903,6 +1369,140 @@ class NetworkManager {
       }
     }
     this._emitPeers();
+  }
+
+  async _ensureTrackUploadedToServer(track) {
+    if (!this._serverMode || !this._serverBaseUrl || !this.roomCode || !track.buffer) return null;
+    if (track._serverTrackUrl && track._serverRoomCode === this.roomCode) {
+      return track._serverTrackUrl;
+    }
+    if (track._serverUploadPromise && track._serverRoomCode === this.roomCode) {
+      return track._serverUploadPromise;
+    }
+
+    const safeTrackId = encodeURIComponent(String(NetworkManager.hashKey(track.id)));
+    const url = `${this._serverBaseUrl}/api/rooms/${this.roomCode}/tracks/${safeTrackId}`;
+    track._serverRoomCode = this.roomCode;
+
+    track._serverUploadPromise = (async () => {
+      try {
+        const resp = await fetch(url, {
+          method: 'PUT',
+          headers: this._serverHeaders({
+            'Content-Type': track.mime || 'application/octet-stream',
+            'X-Track-Name': encodeURIComponent(track.name || 'track'),
+          }),
+          body: track.buffer,
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        track._serverTrackUrl = url;
+        return url;
+      } catch (err) {
+        track._serverUploadPromise = null;
+        console.warn('[Network/Host] Server track upload error:', err);
+        return null;
+      }
+    })();
+
+    return track._serverUploadPromise;
+  }
+
+  async _ensureSegmentUploadedToServer(track, fromSec, durationSec = 8.5) {
+    if (!this._serverMode || !this._serverBaseUrl || !this.roomCode || !this.cb.onBuildStreamSegment) {
+      return null;
+    }
+    if (!track._serverSegments || track._serverRoomCode !== this.roomCode) {
+      track._serverSegments = new Map();
+    }
+    const bucket = Math.max(0, Math.floor(fromSec * 2) / 2);
+    const segKey = `${NetworkManager.hashKey(track.id)}_${Math.round(bucket * 10)}`;
+
+    const existing = track._serverSegments.get(segKey);
+    if (existing) return existing;
+
+    const p = (async () => {
+      const seg = this.cb.onBuildStreamSegment(track.id, bucket, durationSec);
+      if (!seg || !seg.buffer) return null;
+      const url = `${this._serverBaseUrl}/api/rooms/${this.roomCode}/seg/${segKey}`;
+      try {
+        const resp = await fetch(url, {
+          method: 'PUT',
+          headers: this._serverHeaders({ 'Content-Type': 'audio/wav' }),
+          body: seg.buffer,
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        return {
+          url,
+          startSec: seg.startSec,
+          endSec: seg.endSec,
+          totalDuration: seg.totalDuration,
+        };
+      } catch (err) {
+        track._serverSegments.delete(segKey);
+        console.warn('[Network/Host] Server segment upload error:', err);
+        return null;
+      }
+    })();
+
+    track._serverSegments.set(segKey, p);
+    return p;
+  }
+
+  async _serveStreamSegmentViaServer(client, trackId, fromSec, durationSec = 8.5) {
+    const track = this.playlist.find((t) => t.id === trackId);
+    if (!track || !client.open) return false;
+    const uploaded = await this._ensureSegmentUploadedToServer(track, fromSec, durationSec);
+    if (!uploaded || !client.open) return false;
+
+    this._sendToClient(client, 'ctrl', {
+      type: 'SERVER_STREAM_SEG',
+      trackId: track.id,
+      name: track.name,
+      url: uploaded.url,
+      startSec: uploaded.startSec,
+      endSec: uploaded.endSec,
+      totalDuration: uploaded.totalDuration,
+    });
+    return true;
+  }
+
+  async _sendFileViaServer(client, track, isActive) {
+    const totalBytes = track.buffer.byteLength;
+
+    // 1. Запускаем загрузку ПОЛНОГО файла на сервер сразу в параллель (1 раз для всех устройств!)
+    const fullUploadPromise = this._ensureTrackUploadedToServer(track);
+
+    // 2. Для активного файла > 350 КБ ПЕРВЫМ делом отдаём стартовый 8.5-сек сегмент — музыка стартует за ~0.5 сек!
+    if (isActive && totalBytes > NetworkManager.STREAM_THRESHOLD_BYTES && this.cb.onBuildStreamSegment) {
+      let startSec = 0;
+      if (this.playbackState.playing && this.playbackState.trackId === track.id) {
+        const elapsed = Math.max(0, (performance.now() - this.playbackState.hostStartTime) / 1000);
+        startSec = Math.max(0, Math.floor(this.playbackState.trackOffset + elapsed + 0.5));
+      } else {
+        startSec = Math.max(0, Math.floor(this.playbackState.trackOffset || 0));
+      }
+
+      client.progress = Math.max(client.progress, 5);
+      client.phase = 'loading';
+      client.status = 'Буфер потока...';
+      this._emitPeers();
+
+      await this._serveStreamSegmentViaServer(client, track.id, startSec, 8.5);
+    }
+
+    // 3. Как только полный файл на сервере — даём ссылку на параллельную скачку с живыми %!
+    const trackUrl = await fullUploadPromise;
+    if (!trackUrl || !client.open || client.readyTracks.has(track.id)) return;
+
+    this._sendToClient(client, 'ctrl', {
+      type: 'SERVER_FILE_READY',
+      trackId: track.id,
+      name: track.name,
+      mime: track.mime || 'audio/mpeg',
+      totalBytes,
+      url: trackUrl,
+      isActive,
+    });
   }
 
   _queueTrackForClient(client, track, highPriority) {
@@ -970,7 +1570,6 @@ class NetworkManager {
 
   async _sendStreamSegmentToClient(client, trackId, fromSec, durationSec = 8.5) {
     if (!client.open || client.transport === 'relay' || !this.cb.onBuildStreamSegment) return false;
-    // Выделенный приоритетный канал orpheus-stream (не стоит в очереди за тяжёлым фоновым файлом!)
     let streamCh = await this._waitChannelOpen(client, 'stream', 2000);
     if (!streamCh) streamCh = await this._waitChannelOpen(client, 'data', 3000);
     if (!streamCh) return false;
@@ -1062,19 +1661,33 @@ class NetworkManager {
     }
 
     if (track.type === 'file' && track.buffer) {
+      // Если клиент в той же локальной сети LAN и P2P DataChannel уже открыт — отдаём прямо по LAN (20-50 МБ/с)!
+      const canUseDirectLan =
+        client.p2pReady &&
+        client.transport === 'p2p-lan' &&
+        client.channels.data &&
+        client.channels.data.readyState === 'open';
+
+      if (client.viaServer && this._serverMode && !canUseDirectLan) {
+        await this._sendFileViaServer(client, track, isActive);
+        return;
+      }
+
       if (client.transport === 'relay') {
         await this._sendFileViaRelay(client, track, isActive);
         return;
       }
 
-      // Ждём открытия бинарного канала orpheus-data (устраняет зависание при раннем старте!)
       const dataCh = await this._waitChannelOpen(client, 'data', 5000);
-      if (!dataCh) return;
+      if (!dataCh) {
+        if (client.viaServer && this._serverMode) {
+          await this._sendFileViaServer(client, track, isActive);
+        }
+        return;
+      }
 
       const totalBytes = track.buffer.byteLength;
 
-      // ПРОГРЕССИВНЫЙ СТРИМИНГ: для активного файла > 700 КБ СНАЧАЛА шлём 6-секундный стартовый сегмент
-      // с текущей позиции воспроизведения, чтобы музыка заиграла СРАЗУ во время кэширования полного файла!
       if (isActive && totalBytes > NetworkManager.STREAM_THRESHOLD_BYTES && this.cb.onBuildStreamSegment) {
         let startSec = 0;
         if (this.playbackState.playing && this.playbackState.trackId === track.id) {
@@ -1089,12 +1702,10 @@ class NetworkManager {
         client.status = 'Буфер потока...';
         this._emitPeers();
 
-        // Отправляем 8.5 сек стартового потока на выделенный orpheus-stream — мгновенный старт с большим запасом!
         await this._sendStreamSegmentToClient(client, track.id, startSec, 8.5);
         if (!client.open || dataCh.readyState !== 'open') return;
       }
 
-      // Далее передаём ПОЛНЫЙ оригинальный файл в фоне для 100% кэша!
       const chunkSize = this._getOptimalChunkSize(client);
       const totalChunks = Math.ceil(totalBytes / chunkSize);
       const transferHash = NetworkManager.hashKey(`file:${track.id}`);
@@ -1122,7 +1733,6 @@ class NetworkManager {
       for (let i = 0; i < totalChunks; i++) {
         if (!client.open || dataCh.readyState !== 'open') return;
 
-        // Срочный потоковый сегмент всегда уходит первым на orpheus-stream — ZERO разрывов звука!
         while (client.urgentSegments.length > 0) {
           const req = client.urgentSegments.shift();
           await this._sendStreamSegmentToClient(client, req.trackId, req.fromSec, req.durationSec);
@@ -1134,8 +1744,6 @@ class NetworkManager {
           return;
         }
 
-        // Пока слушатель играет из потока, держим окно фонового кэша компактным (128 КБ),
-        // чтобы при запросе следующего сегмента сеть не была забита 1 МБ очереди!
         const isStreamingActive = isActive && this.playbackState.playing && client.streamReadyTracks.has(track.id);
         const bufLimit = isStreamingActive ? NetworkManager.STREAMING_DATA_BUFFER_LIMIT : NetworkManager.MAX_BUFFERED_AMOUNT;
         if (dataCh.bufferedAmount > bufLimit) {
@@ -1271,11 +1879,24 @@ class NetworkManager {
 
   _sendToClient(client, channelName, payload) {
     if (!client) return;
+    // Если есть прямой открытый P2P-канал для NTP (или LAN ctrl) — используем прямой UDP-путь!
+    if (channelName === 'ntp' && client.channels.ntp && client.channels.ntp.readyState === 'open') {
+      try {
+        client.channels.ntp.send(JSON.stringify(payload));
+        return;
+      } catch (_) {}
+    }
+
+    if (client.viaServer && this._serverMode) {
+      this._sendServerWs({ t: 'TO_PEER', to: client.id, payload });
+      return;
+    }
+
     if (client.transport === 'relay') {
       this._sendSignal({ sig: 'RELAY_MSG', to: client.id, payload });
       return;
     }
-    // Проверяем readyState === 'open' (если ntp ещё не открылся — шлём через ctrl без потери пакетов!)
+
     const preferred = client.channels[channelName];
     const ch = preferred && preferred.readyState === 'open' ? preferred : client.channels.ctrl;
     if (ch && ch.readyState === 'open') {
@@ -1288,6 +1909,16 @@ class NetworkManager {
   }
 
   _broadcast(channelName, payload) {
+    if (this._serverMode && channelName !== 'ntp') {
+      // 1 пакет на сервер -> сервер мгновенно и параллельно рассылает всем слушателям
+      this._sendServerWs({ t: 'TO_PEER', payload });
+      for (const client of this.clients.values()) {
+        if (client.open && !client.viaServer) {
+          this._sendToClient(client, channelName, payload);
+        }
+      }
+      return;
+    }
     for (const client of this.clients.values()) {
       if (client.open) {
         this._sendToClient(client, channelName, payload);
@@ -1328,6 +1959,217 @@ class NetworkManager {
     this.roomCode = code;
     this._listenerProgressCb = onProgress;
 
+    onProgress('Подключение к серверу...');
+    const serverUrl = await this._resolveServerUrl();
+    if (serverUrl) {
+      try {
+        return await this._joinViaServer(serverUrl, code, onProgress);
+      } catch (err) {
+        // Если сервер ответил что комната не найдена — пробрасываем ошибку сразу,
+        // если сам сервер недоступен — пробуем резервный P2P кластер
+        if (err && err._roomNotFound) throw err;
+        console.warn('[Network/Listener] Server join failed, trying fallback cluster:', err);
+        this._closeServerWs();
+      }
+    }
+
+    return this._joinViaFallbackCluster(code, onProgress);
+  }
+
+  async _joinViaServer(serverUrl, code, onProgress) {
+    const ws = await this._openServerWs(serverUrl, 4500);
+    this._serverWs = ws;
+    this._serverBaseUrl = serverUrl;
+    this._serverMode = true;
+
+    return new Promise((resolve, reject) => {
+      let joined = false;
+      const timeout = setTimeout(() => {
+        if (!joined) {
+          joined = true;
+          this._closeServerWs();
+          reject(new Error('Таймаут входа в комнату'));
+        }
+      }, 5000);
+
+      ws.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch (_) { return; }
+        if (!msg || typeof msg !== 'object') return;
+
+        if (msg.t === 'ROOM_JOINED' && !joined) {
+          joined = true;
+          clearTimeout(timeout);
+          this.roomCode = msg.code;
+          this.selfId = msg.peerId || this.selfId;
+          this.hostPeerId = msg.hostPeerId;
+          this._listenerConnected = true;
+          this.hostTransport = 'server';
+
+          if (this.cb.onTransportChanged) this.cb.onTransportChanged('server', 'Сервер');
+          resolve(msg.code);
+          if (this.cb.onHostConnected) this.cb.onHostConnected('server');
+
+          // В ФОНЕ (не блокируя старт музыки!) пробуем поднять прямой локальный P2P-канал
+          this._startListenerBackgroundP2PUpgrade();
+          return;
+        }
+
+        if (msg.t === 'JOIN_ERROR' && !joined) {
+          joined = true;
+          clearTimeout(timeout);
+          this._closeServerWs();
+          const err = new Error(msg.message || `Комната ${NetworkManager.formatCode(code)} не найдена.`);
+          err._roomNotFound = true;
+          reject(err);
+          return;
+        }
+
+        if (msg.t === 'FROM_HOST' && msg.payload) {
+          this._listenerHandleHostMessage(msg.payload);
+        } else if (msg.t === 'SIGNAL' && msg.data) {
+          this._listenerHandleSignal({ ...msg.data, from: msg.from });
+        } else if (msg.t === 'HOST_LEFT') {
+          if (this._listenerConnected) {
+            this._listenerConnected = false;
+            if (this.cb.onHostDisconnected) this.cb.onHostDisconnected('host-left');
+          }
+        }
+      };
+
+      ws.onclose = () => {
+        if (!joined) {
+          joined = true;
+          clearTimeout(timeout);
+          reject(new Error('Соединение с сервером закрыто'));
+          return;
+        }
+        if (this._listenerConnected) {
+          this._listenerConnected = false;
+          if (this.cb.onHostDisconnected) this.cb.onHostDisconnected('server-closed');
+        }
+      };
+
+      onProgress(`Вход в комнату ${NetworkManager.formatCode(code)}...`);
+      this._sendServerWs({
+        t: 'JOIN_ROOM',
+        code,
+        deviceName: this.deviceName,
+      });
+    });
+  }
+
+  async _startListenerBackgroundP2PUpgrade() {
+    if (!this._serverMode || !this._listenerConnected || !this.hostPeerId) return;
+    try {
+      const pc = new RTCPeerConnection(NetworkManager.ICE_CONFIG);
+      this.hostPc = pc;
+
+      const ntpCh = pc.createDataChannel('orpheus-ntp', { ordered: false, maxRetransmits: 0 });
+      const ctrlCh = pc.createDataChannel('orpheus-ctrl', { ordered: true });
+      const streamCh = pc.createDataChannel('orpheus-stream', { ordered: true });
+      const dataCh = pc.createDataChannel('orpheus-data', { ordered: true });
+      ntpCh.binaryType = 'arraybuffer';
+      ctrlCh.binaryType = 'arraybuffer';
+      streamCh.binaryType = 'arraybuffer';
+      dataCh.binaryType = 'arraybuffer';
+      this.hostChannels = { ntp: ntpCh, ctrl: ctrlCh, stream: streamCh, data: dataCh };
+
+      const gatheredCandidates = [];
+      let offerSent = false;
+      let lateCandidates = [];
+      let lateTimer = null;
+
+      pc.onicecandidate = (ev) => {
+        if (!ev.candidate) return;
+        const candJson = ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate;
+        if (!offerSent) {
+          gatheredCandidates.push(candJson);
+        } else if (this.hostPeerId) {
+          lateCandidates.push(candJson);
+          if (!lateTimer) {
+            lateTimer = setTimeout(() => {
+              lateTimer = null;
+              if (lateCandidates.length > 0 && this.hostPeerId) {
+                const batch = lateCandidates;
+                lateCandidates = [];
+                this._sendSignal({ sig: 'ICE_BATCH', to: this.hostPeerId, candidates: batch });
+              }
+            }, 200);
+          }
+        }
+      };
+
+      ntpCh.onopen = () => {
+        if (this.hostPc !== pc) return;
+        this._listenerP2pReady = true;
+        this._detectTransportType(pc, (type, text) => {
+          this.hostTransport = type;
+          if (this.cb.onTransportChanged) this.cb.onTransportChanged(type, text);
+        });
+        // Перезапускаем быстрый burst NTP уже по прямому локальному UDP-каналу!
+        if (this.cb.onNtpChannelReady) this.cb.onNtpChannelReady();
+      };
+
+      ntpCh.onmessage = (ev) => {
+        if (this.hostPc !== pc) return;
+        if (typeof ev.data === 'string') {
+          try { this._listenerHandleHostMessage(JSON.parse(ev.data)); } catch (_) {}
+        }
+      };
+
+      ctrlCh.onmessage = (ev) => {
+        if (this.hostPc !== pc) return;
+        if (typeof ev.data === 'string') {
+          try { this._listenerHandleHostMessage(JSON.parse(ev.data)); } catch (_) {}
+        }
+      };
+
+      streamCh.onmessage = (ev) => {
+        if (this.hostPc !== pc) return;
+        if (ev.data instanceof ArrayBuffer) this._listenerHandleBinaryChunk(ev.data);
+        else if (ev.data instanceof Blob) ev.data.arrayBuffer().then((ab) => this._listenerHandleBinaryChunk(ab));
+      };
+
+      dataCh.onmessage = (ev) => {
+        if (this.hostPc !== pc) return;
+        if (ev.data instanceof ArrayBuffer) this._listenerHandleBinaryChunk(ev.data);
+        else if (ev.data instanceof Blob) ev.data.arrayBuffer().then((ab) => this._listenerHandleBinaryChunk(ab));
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        if (this.hostPc !== pc) return;
+        const st = pc.iceConnectionState;
+        if (st === 'connected' || st === 'completed') {
+          this._listenerP2pReady = true;
+          this._detectTransportType(pc, (type, text) => {
+            this.hostTransport = type;
+            if (this.cb.onTransportChanged) this.cb.onTransportChanged(type, text);
+          });
+        } else if (st === 'failed' || st === 'closed') {
+          // Не мешаем работе через сервер!
+          this._listenerP2pReady = false;
+          this.hostTransport = 'server';
+        }
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await this._waitIceGathering(pc, NetworkManager.ICE_GATHER_WAIT_MS);
+      offerSent = true;
+
+      await this._sendSignal({
+        sig: 'P2P_OFFER',
+        to: this.hostPeerId,
+        offer: { type: pc.localDescription.type, sdp: pc.localDescription.sdp },
+        candidates: gatheredCandidates,
+      });
+    } catch (_) {
+      this._listenerP2pReady = false;
+    }
+  }
+
+  async _joinViaFallbackCluster(code, onProgress) {
     onProgress('Подключение...');
     await this._openSignaling(code);
 
@@ -1381,6 +2223,7 @@ class NetworkManager {
           const wasRelay = this._listenerConnected && this.hostTransport === 'relay';
           if (!this._listenerConnected || wasRelay) {
             this._listenerConnected = true;
+            this._listenerP2pReady = true;
             clearTimeout(this._listenerJoinTimer);
             this.hostTransport = 'p2p';
 
@@ -1416,30 +2259,21 @@ class NetworkManager {
           try { this._listenerHandleHostMessage(JSON.parse(ev.data)); } catch (_) {}
         }
       };
-
       ctrlCh.onmessage = (ev) => {
         if (this.hostPc !== pc) return;
         if (typeof ev.data === 'string') {
           try { this._listenerHandleHostMessage(JSON.parse(ev.data)); } catch (_) {}
         }
       };
-
       streamCh.onmessage = (ev) => {
         if (this.hostPc !== pc) return;
-        if (ev.data instanceof ArrayBuffer) {
-          this._listenerHandleBinaryChunk(ev.data);
-        } else if (ev.data instanceof Blob) {
-          ev.data.arrayBuffer().then((ab) => this._listenerHandleBinaryChunk(ab));
-        }
+        if (ev.data instanceof ArrayBuffer) this._listenerHandleBinaryChunk(ev.data);
+        else if (ev.data instanceof Blob) ev.data.arrayBuffer().then((ab) => this._listenerHandleBinaryChunk(ab));
       };
-
       dataCh.onmessage = (ev) => {
         if (this.hostPc !== pc) return;
-        if (ev.data instanceof ArrayBuffer) {
-          this._listenerHandleBinaryChunk(ev.data);
-        } else if (ev.data instanceof Blob) {
-          ev.data.arrayBuffer().then((ab) => this._listenerHandleBinaryChunk(ab));
-        }
+        if (ev.data instanceof ArrayBuffer) this._listenerHandleBinaryChunk(ev.data);
+        else if (ev.data instanceof Blob) ev.data.arrayBuffer().then((ab) => this._listenerHandleBinaryChunk(ab));
       };
 
       ctrlCh.onclose = () => {
@@ -1523,10 +2357,12 @@ class NetworkManager {
 
   async _listenerHandleSignal(msg) {
     switch (msg.sig) {
-      case 'JOIN_ANS': {
-        if (!this.hostPc || this.hostPeerId) return;
-        this.hostPeerId = msg.from;
-        if (this._listenerProgressCb) {
+      case 'JOIN_ANS':
+      case 'P2P_ANSWER': {
+        if (!this.hostPc) return;
+        if (msg.sig === 'JOIN_ANS' && this.hostPeerId) return;
+        if (!this.hostPeerId) this.hostPeerId = msg.from;
+        if (msg.sig === 'JOIN_ANS' && this._listenerProgressCb) {
           this._listenerProgressCb('Установка соединения...');
         }
         try {
@@ -1583,13 +2419,27 @@ class NetworkManager {
 
   sendToHost(payload, channelName = 'ctrl') {
     if (!this._listenerConnected) return;
+
+    // Если прямой P2P NTP-канал открыт — шлём SYNC_PING прямо по UDP для минимального джиттера!
+    if (channelName === 'ntp' && this.hostChannels.ntp && this.hostChannels.ntp.readyState === 'open') {
+      try {
+        this.hostChannels.ntp.send(JSON.stringify(payload));
+        return;
+      } catch (_) {}
+    }
+
+    if (this._serverMode) {
+      this._sendServerWs({ t: 'TO_HOST', payload });
+      return;
+    }
+
     if (this.hostTransport === 'relay') {
       if (this.hostPeerId) {
         this._sendSignal({ sig: 'RELAY_MSG', to: this.hostPeerId, payload });
       }
       return;
     }
-    // Проверяем readyState === 'open' (если ntp ещё не открылся — надёжно отправляем через ctrl!)
+
     const preferred = this.hostChannels[channelName];
     const ch = preferred && preferred.readyState === 'open' ? preferred : this.hostChannels.ctrl;
     if (ch && ch.readyState === 'open') {
@@ -1598,6 +2448,108 @@ class NetworkManager {
       } catch (err) {
         console.warn('[Network/Listener] Send error:', err);
       }
+    }
+  }
+
+  async _listenerDownloadServerSegment(msg) {
+    const key = `${msg.trackId}:${Math.round((msg.startSec || 0) * 10)}`;
+    if (this._downloadingSegments.has(key)) return;
+    this._downloadingSegments.add(key);
+
+    try {
+      const resp = await fetch(msg.url, {
+        headers: this._serverHeaders(),
+        cache: 'no-store',
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const buffer = await resp.arrayBuffer();
+      if (this.role !== 'listener') return;
+      if (this.cb.onStreamSegmentComplete) {
+        this.cb.onStreamSegmentComplete({
+          trackId: msg.trackId,
+          name: msg.name,
+          startSec: msg.startSec,
+          endSec: msg.endSec,
+          totalDuration: msg.totalDuration,
+          buffer,
+        });
+      }
+    } catch (err) {
+      console.warn('[Network/Listener] Server segment fetch error:', err);
+    } finally {
+      this._downloadingSegments.delete(key);
+    }
+  }
+
+  async _listenerDownloadServerFile(msg) {
+    if (this._downloadingTracks.has(msg.trackId)) return;
+    this._downloadingTracks.add(msg.trackId);
+
+    if (msg.isActive && this.cb.onFileProgress) {
+      this.cb.onFileProgress({ trackId: msg.trackId, name: msg.name, pct: 0, isActive: true });
+    }
+
+    try {
+      const resp = await fetch(msg.url, {
+        headers: this._serverHeaders(),
+        cache: 'no-store',
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+      const totalBytes = Number(resp.headers.get('Content-Length')) || msg.totalBytes || 0;
+      let merged;
+
+      if (resp.body && typeof resp.body.getReader === 'function' && totalBytes > 0) {
+        const reader = resp.body.getReader();
+        const chunks = [];
+        let received = 0;
+        let lastPct = -1;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (this.role !== 'listener') return;
+          chunks.push(value);
+          received += value.byteLength;
+
+          const pct = Math.min(94, Math.round((received / totalBytes) * 94));
+          if (pct !== lastPct && (pct - lastPct >= 3 || received >= totalBytes)) {
+            lastPct = pct;
+            if (msg.isActive && this.cb.onFileProgress) {
+              this.cb.onFileProgress({ trackId: msg.trackId, name: msg.name, pct, isActive: true });
+            }
+            if (msg.isActive) {
+              this.sendToHost({ type: 'TRACK_PROGRESS', trackId: msg.trackId, progress: pct, phase: 'loading' });
+            }
+          }
+        }
+
+        const out = new Uint8Array(received);
+        let offset = 0;
+        for (const c of chunks) {
+          out.set(c, offset);
+          offset += c.byteLength;
+        }
+        merged = out.buffer;
+      } else {
+        merged = await resp.arrayBuffer();
+      }
+
+      if (this.role !== 'listener') return;
+      if (this.cb.onFileComplete) {
+        this.cb.onFileComplete({
+          trackId: msg.trackId,
+          name: msg.name,
+          mime: msg.mime,
+          isActive: Boolean(msg.isActive),
+          buffer: merged,
+        });
+      }
+    } catch (err) {
+      console.warn('[Network/Listener] Server file fetch error:', err);
+      this.sendToHost({ type: 'TRACK_ERROR', trackId: msg.trackId });
+    } finally {
+      this._downloadingTracks.delete(msg.trackId);
     }
   }
 
@@ -1629,6 +2581,14 @@ class NetworkManager {
 
       case 'TRACK_URL':
         if (this.cb.onTrackUrl) this.cb.onTrackUrl(msg);
+        break;
+
+      case 'SERVER_STREAM_SEG':
+        this._listenerDownloadServerSegment(msg);
+        break;
+
+      case 'SERVER_FILE_READY':
+        this._listenerDownloadServerFile(msg);
         break;
 
       case 'STREAM_SEG_META': {
@@ -1833,13 +2793,20 @@ class NetworkManager {
   }
 
   destroy() {
-    if (this.role === 'listener' && this.hostPeerId) {
+    if (this._serverMode) {
+      this._sendServerWs({ t: 'LEAVE' });
+    } else if (this.role === 'listener' && this.hostPeerId) {
       this._sendSignal({ sig: 'LEAVE', to: this.hostPeerId }).catch(() => {});
     }
+    this._closeServerWs();
+
     clearTimeout(this._listenerJoinTimer);
     this._listenerJoinResolve = null;
     this._listenerJoinReject = null;
     this._listenerConnected = false;
+    this._listenerP2pReady = false;
+    this._downloadingTracks.clear();
+    this._downloadingSegments.clear();
 
     for (const c of this.clients.values()) {
       try { c.pc?.close(); } catch (_) {}

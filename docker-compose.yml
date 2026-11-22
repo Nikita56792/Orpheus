@@ -1,0 +1,11 @@
+services:
+  orpheus:
+    build: .
+    container_name: orpheus-sync
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8765
+      - MAX_FILE_MB=60
