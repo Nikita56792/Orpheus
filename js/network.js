@@ -10,9 +10,10 @@
  *   продолжает кэшироваться с отображением процентов 0%..100% на главном устройстве.
  */
 class NetworkManager {
-  static CHUNK_SIZE = 16000;
-  static MAX_BUFFERED_AMOUNT = 512 * 1024; // 512 КБ окно буфера — высокая скорость передачи по Wi-Fi P2P
-  static STREAM_THRESHOLD_BYTES = 600 * 1024; // Файлы > 600 КБ стартуют мгновенно через потоковый сегмент!
+  static DEFAULT_CHUNK_SIZE = 16000;
+  static MAX_CHUNK_SIZE = 60000; // До 60 КБ на чанк при поддержке SCTP maxMessageSize (в 3.7x быстрее!)
+  static MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1 МБ окно буфера — полная загрузка канала Wi-Fi P2P
+  static STREAM_THRESHOLD_BYTES = 600 * 1024;
   static ICE_GATHER_WAIT_MS = 1600;
   static P2P_TIMEOUT_MS = 7000;
   static NTFY_BASE = 'https://ntfy.sh';
@@ -624,8 +625,13 @@ class NetworkManager {
       }
 
       case 'NEED_STREAM_SEG': {
-        // Слушателю нужен следующий потоковый сегмент, пока полный файл ещё докачивается
-        if (msg.trackId && typeof msg.fromSec === 'number' && !client.readyTracks.has(msg.trackId)) {
+        // Если основной файл уже докачан >= 80%, не тратим канал на лишний сегмент — даём файлу завершиться за доли секунды!
+        if (
+          msg.trackId &&
+          typeof msg.fromSec === 'number' &&
+          !client.readyTracks.has(msg.trackId) &&
+          !(msg.trackId === this.activeTrackId && client.progress >= 80)
+        ) {
           client.urgentSegments.push({ trackId: msg.trackId, fromSec: msg.fromSec, durationSec: 8 });
           if (!client.isSendingFile) {
             this._processClientTransferQueue(client);
@@ -850,7 +856,15 @@ class NetworkManager {
     return null;
   }
 
-  async _sendStreamSegmentToClient(client, trackId, fromSec, durationSec = 7) {
+  _getOptimalChunkSize(client) {
+    const sctpMax = client?.pc?.sctp?.maxMessageSize;
+    if (Number.isFinite(sctpMax) && sctpMax >= 32768) {
+      return Math.min(NetworkManager.MAX_CHUNK_SIZE, Math.max(NetworkManager.DEFAULT_CHUNK_SIZE, sctpMax - 4096));
+    }
+    return NetworkManager.DEFAULT_CHUNK_SIZE;
+  }
+
+  async _sendStreamSegmentToClient(client, trackId, fromSec, durationSec = 6) {
     if (!client.open || client.transport === 'relay' || !this.cb.onBuildStreamSegment) return false;
     const dataCh = await this._waitChannelOpen(client, 'data', 4000);
     if (!dataCh) return false;
@@ -860,7 +874,7 @@ class NetworkManager {
 
     const track = this.playlist.find((t) => t.id === trackId);
     const totalBytes = seg.buffer.byteLength;
-    const chunkSize = NetworkManager.CHUNK_SIZE;
+    const chunkSize = this._getOptimalChunkSize(client);
     const totalChunks = Math.ceil(totalBytes / chunkSize);
     const segKey = `seg:${trackId}:${Math.round(seg.startSec * 10)}`;
     const transferHash = NetworkManager.hashKey(segKey);
@@ -971,12 +985,12 @@ class NetworkManager {
         client.status = 'Буфер потока...';
         this._emitPeers();
 
-        await this._sendStreamSegmentToClient(client, track.id, startSec, 5);
+        await this._sendStreamSegmentToClient(client, track.id, startSec, 6);
         if (!client.open || dataCh.readyState !== 'open') return;
       }
 
       // Далее передаём ПОЛНЫЙ оригинальный файл в фоне для 100% кэша!
-      const chunkSize = NetworkManager.CHUNK_SIZE;
+      const chunkSize = this._getOptimalChunkSize(client);
       const totalChunks = Math.ceil(totalBytes / chunkSize);
       const transferHash = NetworkManager.hashKey(`file:${track.id}`);
 
@@ -1120,7 +1134,7 @@ class NetworkManager {
 
   _waitForDrain(dc) {
     return new Promise((resolve) => {
-      const lowThreshold = NetworkManager.MAX_BUFFERED_AMOUNT / 2;
+      const lowThreshold = 256 * 1024;
       if (dc.readyState !== 'open' || dc.bufferedAmount <= lowThreshold) {
         resolve();
         return;
@@ -1135,7 +1149,7 @@ class NetworkManager {
       };
       dc.bufferedAmountLowThreshold = lowThreshold;
       dc.onbufferedamountlow = finish;
-      const fallbackTimer = setTimeout(finish, 40);
+      const fallbackTimer = setTimeout(finish, 25);
     });
   }
 

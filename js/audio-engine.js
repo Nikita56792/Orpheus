@@ -319,7 +319,7 @@ class AudioEngine {
    * из уже декодированного AudioBuffer для мгновенного старта воспроизведения,
    * пока основной файл ещё скачивается/кэшируется на телефоны!
    */
-  encodeStreamSegmentWav(trackId, startSec = 0, durationSec = 5) {
+  encodeStreamSegmentWav(trackId, startSec = 0, durationSec = 6) {
     const srcBuf = this.bufferCache.get(trackId);
     if (!srcBuf) return null;
 
@@ -327,7 +327,7 @@ class AudioEngine {
     const actualDur = Math.min(durationSec, srcBuf.duration - clampedStart);
     if (actualDur <= 0.15) return null;
 
-    const targetRate = Math.min(24000, srcBuf.sampleRate);
+    const targetRate = Math.min(22050, srcBuf.sampleRate);
     const outFrames = Math.floor(actualDur * targetRate);
     const numCh = Math.min(2, srcBuf.numberOfChannels);
     const ratio = srcBuf.sampleRate / targetRate;

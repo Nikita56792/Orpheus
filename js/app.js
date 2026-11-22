@@ -268,6 +268,11 @@
           rttRound < 50 ? 'metric-good' : rttRound < 130 ? 'metric-warn' : 'metric-bad'
         }`;
         setStatusMetric('Синхронизирован', 'metric-good');
+        if (!audio.isPlaying && ui.listenerBannerText.textContent === 'Синхронизация часов...') {
+          ui.listenerBannerText.textContent = audio.hasPlayableAudio()
+            ? 'Готово к воспроизведению'
+            : 'Подключено · ожидание трека';
+        }
 
         network.sendToHost({ type: 'CLIENT_METRICS', rttMs: rttRound }, 'ctrl');
 
