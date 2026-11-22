@@ -83,6 +83,10 @@ class NetworkManager {
       trackOffset: 0,
       trackId: null,
     };
+    this.volumeState = {
+      volume: 1.0,
+      muted: false,
+    };
     this.hostLatencyProfile = { totalLatencyMs: 0, systemLatencyMs: 0, isBluetooth: false, outputDeviceLabel: '' };
     this.roomLatencyState = { roomMaxLatencyMs: 0, slowestLabel: 'Хост', bluetoothCount: 0, deviceCount: 1 };
 
@@ -987,6 +991,12 @@ class NetworkManager {
     });
 
     this._sendToClient(client, 'ctrl', {
+      type: 'CMD_VOLUME',
+      volume: this.volumeState.volume,
+      muted: this.volumeState.muted,
+    });
+
+    this._sendToClient(client, 'ctrl', {
       type: 'PLAYLIST_STATE',
       activeTrackId: this.activeTrackId,
       tracks: this._serializePlaylistMeta(),
@@ -1808,6 +1818,39 @@ class NetworkManager {
     });
   }
 
+  broadcastVolume({ volume, muted }) {
+    this.volumeState = {
+      volume: Math.max(0, Math.min(1, Number(volume))),
+      muted: Boolean(muted),
+    };
+    this._broadcast('ctrl', {
+      type: 'CMD_VOLUME',
+      volume: this.volumeState.volume,
+      muted: this.volumeState.muted,
+    });
+  }
+
+  broadcastCalibDuck(ducked) {
+    this._broadcast('ctrl', { type: 'CMD_CALIB_DUCK', ducked: Boolean(ducked) });
+  }
+
+  sendCalibChirpsToPeer(peerId, hostTimes) {
+    const client = this.clients.get(peerId);
+    if (!client || !client.open) return false;
+    this._sendToClient(client, 'ctrl', { type: 'CMD_CALIB_CHIRP', hostTimes });
+    return true;
+  }
+
+  sendCalibratedLatencyToPeer(peerId, totalLatencyMs) {
+    const client = this.clients.get(peerId);
+    if (!client || !client.open) return false;
+    this._sendToClient(client, 'ctrl', {
+      type: 'SET_CALIBRATED_LATENCY',
+      totalLatencyMs: Math.max(10, Math.min(1200, Math.round(totalLatencyMs))),
+    });
+    return true;
+  }
+
   _sendToClient(client, channelName, payload) {
     if (!client) return;
     // Если есть прямой открытый P2P-канал для NTP (или LAN ctrl) — используем прямой UDP-путь!
@@ -2573,6 +2616,22 @@ class NetworkManager {
 
       case 'CMD_PAUSE':
         if (this.cb.onCmdPause) this.cb.onCmdPause(msg);
+        break;
+
+      case 'CMD_VOLUME':
+        if (this.cb.onCmdVolume) this.cb.onCmdVolume(msg);
+        break;
+
+      case 'CMD_CALIB_DUCK':
+        if (this.cb.onCmdCalibDuck) this.cb.onCmdCalibDuck(msg);
+        break;
+
+      case 'CMD_CALIB_CHIRP':
+        if (this.cb.onCmdCalibChirp) this.cb.onCmdCalibChirp(msg);
+        break;
+
+      case 'SET_CALIBRATED_LATENCY':
+        if (this.cb.onSetCalibratedLatency) this.cb.onSetCalibratedLatency(msg);
         break;
     }
   }

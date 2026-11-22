@@ -80,7 +80,6 @@
     listenerPlaybackBanner: $('listenerPlaybackBanner'),
     listenerPulse: $('listenerPulse'),
     listenerBannerText: $('listenerBannerText'),
-    btnCalibrateBt: $('btnCalibrateBt'),
     btnListenerReconnect: $('btnListenerReconnect'),
 
     btnMute: $('btnMute'),
@@ -121,8 +120,7 @@
     onDrift: (driftMs, mode) => updateDriftMetric(driftMs, mode),
     onEnded: () => handleTrackEnded(),
     onStateChange: ({ playing }) => updatePlaybackUI(playing),
-    onLatencyChange: (profile) => {
-      updateBluetoothCalibrateUI(profile);
+    onLatencyChange: () => {
       if (state.role) sendLocalLatencyToHost();
     },
     onNeedNextSegment: ({ trackId, fromSec }) => {
@@ -247,6 +245,34 @@
       clearPendingPlay();
       audio.pause(trackOffset);
       ui.listenerBannerText.textContent = 'На паузе';
+    },
+
+    onCmdVolume: ({ volume, muted }) => {
+      const v = Math.max(0, Math.min(1, Number(volume)));
+      const m = Boolean(muted);
+      audio.setVolume(v);
+      audio.setMuted(m);
+      ui.volumeSlider.value = String(v);
+      ui.volumePct.textContent = `${Math.round(v * 100)}%`;
+      ui.iconVolOn.classList.toggle('hidden', m);
+      ui.iconVolOff.classList.toggle('hidden', !m);
+    },
+
+    onCmdCalibDuck: ({ ducked }) => {
+      audio.setCalibrationDuck(Boolean(ducked));
+    },
+
+    onCmdCalibChirp: ({ hostTimes }) => {
+      if (clock && Array.isArray(hostTimes) && hostTimes.length > 0) {
+        audio.scheduleCalibrationChirps(hostTimes, () => clock.hostNow());
+      }
+    },
+
+    onSetCalibratedLatency: ({ totalLatencyMs }) => {
+      if (Number.isFinite(totalLatencyMs)) {
+        const profile = audio.applyExternalCalibration(totalLatencyMs);
+        showToast(`Задержка синхронизирована: ${profile.totalLatencyMs} мс`, 'success');
+      }
     },
 
     onError: (err) => {
@@ -375,55 +401,35 @@
     ui.qrCanvasWrap.innerHTML = qr.createSvgTag({ scalable: true, margin: 2 });
   }
 
-  function updateBluetoothCalibrateUI(profile) {
-    if (!ui.btnCalibrateBt) return;
-    const show = state.role === 'listener' && Boolean(profile && profile.isBluetooth);
-    ui.btnCalibrateBt.classList.toggle('hidden', !show);
-    if (!show || audio.isCalibrating) return;
-    ui.btnCalibrateBt.textContent = profile.isCalibrated
-      ? `BT ${profile.totalLatencyMs} мс ✓`
-      : 'Калибровать BT';
+  let _calibratingPeerId = null;
 
-    // Если микрофон уже разрешён в браузере, а эта колонка ещё не калибровалась — делаем авто-калибровку сами!
-    if (!profile.isCalibrated && !audio._autoCalAttempted && navigator.permissions && navigator.permissions.query) {
-      audio._autoCalAttempted = true;
-      navigator.permissions
-        .query({ name: 'microphone' })
-        .then((st) => {
-          if (st.state === 'granted' && state.role === 'listener' && !audio.isCalibrating && audio.calibratedLatencyMs === null) {
-            runBluetoothAcousticCalibration(true);
-          }
-        })
-        .catch(() => {});
-    }
-  }
+  async function hostCalibratePeer(peerId) {
+    if (state.role !== 'host' || !clock || _calibratingPeerId) return;
+    const client = network.clients.get(peerId);
+    if (!client) return;
 
-  async function runBluetoothAcousticCalibration(isSilentAuto = false) {
-    if (!ui.btnCalibrateBt || audio.isCalibrating) return;
-    ui.btnCalibrateBt.disabled = true;
-    ui.btnCalibrateBt.textContent = 'Замер...';
+    _calibratingPeerId = peerId;
+    network._emitPeers();
+    showToast(`Замер задержки ${client.label} (~3 сек)...`, 'info');
+
     try {
-      const res = await audio.autoCalibrateAcousticLatency({
-        onProgress: (txt) => {
-          if (ui.btnCalibrateBt) ui.btnCalibrateBt.textContent = txt.includes('Замер') ? 'Замер...' : 'Микрофон...';
-        },
+      network.broadcastCalibDuck(true);
+      const res = await audio.hostCalibrateRemotePeer({
+        peerCurrentLatencyMs: client.latency?.totalLatencyMs || 0,
+        sendPeerChirps: (hostTimes) => network.sendCalibChirpsToPeer(peerId, hostTimes),
+        getHostTime: () => clock.hostNow(),
       });
-      if (res) {
-        updateBluetoothCalibrateUI(audio.getLatencyProfile());
-        showToast(
-          `Колонка откалибрована: ${res.calibratedMs} мс${res.deviceLabel ? ` (${res.deviceLabel})` : ''}`,
-          'success'
-        );
-      }
+      network.sendCalibratedLatencyToPeer(peerId, res.newTotalLatencyMs);
+      showToast(
+        `${client.label}: откалибровано ${res.newTotalLatencyMs} мс (${res.deltaMs >= 0 ? '+' : ''}${res.deltaMs} мс)`,
+        'success'
+      );
     } catch (err) {
-      if (!isSilentAuto) {
-        showToast(err.message || 'Не удалось откалибровать Bluetooth', 'error');
-      }
+      showToast(err.message || 'Не удалось откалибровать устройство', 'error');
     } finally {
-      if (ui.btnCalibrateBt) {
-        ui.btnCalibrateBt.disabled = false;
-        updateBluetoothCalibrateUI(audio.getLatencyProfile());
-      }
+      network.broadcastCalibDuck(false);
+      _calibratingPeerId = null;
+      network._emitPeers();
     }
   }
 
@@ -490,6 +496,7 @@
       ui.metricDrift.textContent = '0 мс';
 
       sendLocalLatencyToHost();
+      network.broadcastVolume({ volume: audio.volume, muted: audio.muted });
       renderPlaylist();
       renderPeerList([]);
       showView('room');
@@ -582,7 +589,6 @@
 
       ensureListenerClockStarted(network.hostTransport === 'relay' ? 'relay' : 'p2p');
       sendLocalLatencyToHost();
-      updateBluetoothCalibrateUI(audio.getLatencyProfile());
 
       renderPlaylist();
       showView('room');
@@ -1182,6 +1188,10 @@
         const dotCls = p.phase === 'error' ? 'error' : (p.ready || p.streaming) ? 'ready' : '';
         const btChip = p.isBluetooth ? `<span class="peer-chip peer-chip-bt">BT ${p.latencyMs} мс</span>` : '';
         const netChip = p.transportLabel ? `<span class="peer-chip">${escapeHtml(p.transportLabel)}</span>` : '';
+        const isCalThis = _calibratingPeerId === p.id;
+        const calBtn = `<button class="btn-bt-cal" type="button" data-cal-peer="${escapeHtml(p.id)}" ${
+          _calibratingPeerId ? 'disabled' : ''
+        } title="Акустическая синхронизация колонки через микрофон Хоста">${isCalThis ? 'Замер...' : 'Калибр.'}</button>`;
 
         return `
           <li class="peer-item">
@@ -1192,6 +1202,7 @@
                   <strong>${escapeHtml(p.label)}</strong>
                   ${netChip}
                   ${btChip}
+                  ${calBtn}
                 </div>
               </div>
               <div class="peer-right mono">
@@ -1497,8 +1508,30 @@
     if (state.roomCode) enterAsListener(state.roomCode);
   });
 
-  if (ui.btnCalibrateBt) {
-    ui.btnCalibrateBt.addEventListener('click', () => runBluetoothAcousticCalibration(false));
+  ui.peerList.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-cal-peer]');
+    if (btn && state.role === 'host') {
+      hostCalibratePeer(btn.dataset.calPeer);
+    }
+  });
+
+  let _volSyncTimer = null;
+  function syncHostVolume(immediate = false) {
+    if (state.role !== 'host') return;
+    if (immediate) {
+      clearTimeout(_volSyncTimer);
+      _volSyncTimer = null;
+      network.broadcastVolume({ volume: audio.volume, muted: audio.muted });
+      return;
+    }
+    if (!_volSyncTimer) {
+      _volSyncTimer = setTimeout(() => {
+        _volSyncTimer = null;
+        if (state.role === 'host') {
+          network.broadcastVolume({ volume: audio.volume, muted: audio.muted });
+        }
+      }, 45);
+    }
   }
 
   ui.volumeSlider.addEventListener('input', () => {
@@ -1510,12 +1543,18 @@
       ui.iconVolOff.classList.add('hidden');
     }
     ui.volumePct.textContent = `${Math.round(val * 100)}%`;
+    syncHostVolume(false);
+  });
+
+  ui.volumeSlider.addEventListener('change', () => {
+    syncHostVolume(true);
   });
 
   ui.btnMute.addEventListener('click', () => {
     audio.setMuted(!audio.muted);
     ui.iconVolOn.classList.toggle('hidden', audio.muted);
     ui.iconVolOff.classList.toggle('hidden', !audio.muted);
+    syncHostVolume(true);
   });
 
   document.addEventListener('visibilitychange', async () => {

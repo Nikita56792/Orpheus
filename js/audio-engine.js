@@ -228,7 +228,8 @@ class AudioEngine {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
       const outputs = devices.filter((d) => d.kind === 'audiooutput');
-      const btRegex = /bluetooth|a2dp|airpods|buds|jbl|sony|bose|marshall|beats|sennheiser|anker|soundcore|harman|bang|wireless|headset|earbuds|hands-free|wh-|wf-|flip|charge|xtreme|boombox|bt\b/i;
+      const inputs = devices.filter((d) => d.kind === 'audioinput');
+      const btRegex = /bluetooth|a2dp|airpods|buds|jbl|sony|bose|marshall|beats|sennheiser|anker|soundcore|harman|bang|wireless|headset|earbuds|hands-free|wh-|wf-|flip|charge|xtreme|boombox|partybox|clip|encore|srs-|yandex|alice|sber|xiaomi|redmi|tronsmart|edifier|sven|hoco|baseus|ugreen|qcy|haylou|speaker|колонка|гарнитура|наушники|\bbt\b/i;
 
       let detectedLabel = '';
       let detectedBt = false;
@@ -240,10 +241,11 @@ class AudioEngine {
       }
 
       if (!detectedBt) {
-        const btDev = outputs.find((d) => d.label && btRegex.test(d.label));
+        const btDev = outputs.find((d) => d.label && btRegex.test(d.label)) ||
+          inputs.find((d) => d.label && btRegex.test(d.label));
         if (btDev) {
           detectedBt = true;
-          if (!detectedLabel) detectedLabel = btDev.label.trim();
+          if (!detectedLabel) detectedLabel = btDev.label.replace(/^Default\s*-\s*/i, '').trim();
         }
       }
 
@@ -407,80 +409,138 @@ class AudioEngine {
   }
 
   /**
-   * Автоматическая акустическая калибровка задержки ЛЮБОЙ Bluetooth-колонки через встроенный микрофон телефона.
-   * Проигрывает 3 коротких сонарных импульса (28 мс), вычисляет точную кросс-корреляцию с записью микрофона,
-   * находит физическую задержку колонки с точностью ±5 мс, сохраняет в localStorage и мгновенно выравнивает комнату.
+   * Временно приглушает или восстанавливает музыку (для чистых калибровочных импульсов без сброса синхронизации).
    */
-  async autoCalibrateAcousticLatency({ onProgress } = {}) {
-    if (this.isCalibrating) return null;
+  setCalibrationDuck(ducked) {
+    if (!this.masterGain || !this.ctx) return;
+    const target = ducked ? 0.0001 : (this.muted ? 0 : this.volume);
+    this.masterGain.gain.setTargetAtTime(target, this.ctx.currentTime, 0.015);
+  }
+
+  /**
+   * Генерирует эталонный 28-мс FM-чирп (1300 -> 3500 Гц) для акустической калибровки.
+   */
+  _createCalibrationChirp(sr) {
+    const chirpDur = 0.028;
+    const chirpLen = Math.floor(sr * chirpDur);
+    const template = new Float32Array(chirpLen);
+    for (let i = 0; i < chirpLen; i++) {
+      const u = i / chirpLen;
+      const win = 0.5 * (1 - Math.cos(2 * Math.PI * u));
+      const t = i / sr;
+      const phase = 2 * Math.PI * (1300 * t + 0.5 * ((3500 - 1300) / chirpDur) * t * t);
+      template[i] = Math.sin(phase) * win;
+    }
+    const buf = this.ctx.createBuffer(1, chirpLen, sr);
+    buf.getChannelData(0).set(template);
+    return { buf, template, chirpLen };
+  }
+
+  /**
+   * На Слушателе (или Хосте): проигрывает калибровочные чирпы ровно в заданные акустические моменты hostTimes
+   * (с учётом текущей задержки устройства — НЕ открывая микрофон на телефоне!).
+   */
+  async scheduleCalibrationChirps(hostTimes, getHostTime) {
+    if (!this.ctx) await this.unlock();
+    await this.ensureResumed();
+    const { buf } = this._createCalibrationChirp(this.ctx.sampleRate);
+    const hostNow = getHostTime();
+    const audioNow = this.ctx.currentTime;
+    const myLatencyMs = this.getTotalOutputLatencyMs();
+
+    for (const targetAcousticHostMs of hostTimes) {
+      const feedHostMs = targetAcousticHostMs - myLatencyMs;
+      const delaySec = (feedHostMs - hostNow) / 1000;
+      if (delaySec < 0.01) continue;
+      const s = this.ctx.createBufferSource();
+      s.buffer = buf;
+      const g = this.ctx.createGain();
+      g.gain.value = 0.82;
+      s.connect(g);
+      g.connect(this.ctx.destination);
+      s.start(audioNow + delaySec);
+    }
+  }
+
+  /**
+   * Применяет откалиброванную Хостом полную задержку устройства (сохраняет в localStorage и сразу выравнивает звук).
+   */
+  applyExternalCalibration(totalLatencyMs) {
+    const clamped = Math.max(10, Math.min(1200, Math.round(totalLatencyMs)));
+    const baseMsNow = this.ctx && Number.isFinite(this.ctx.baseLatency) ? this.ctx.baseLatency * 1000 : 0;
+    const outMsNow = this.ctx && Number.isFinite(this.ctx.outputLatency) ? this.ctx.outputLatency * 1000 : 0;
+    const rawOsNow = outMsNow > 0 ? outMsNow + baseMsNow : this._median(this._latencySamples);
+
+    this.calibratedLatencyMs = clamped;
+    this._calibratedRawOsMs = rawOsNow;
+    this.systemLatencyMs = clamped;
+    this.extraLatencyMs = 0;
+    this._saveCalibration(rawOsNow, clamped);
+    this._lastReportedLatencySig = '';
+
+    const profile = this.getLatencyProfile();
+    this.onLatencyChange(profile);
+
+    if (this.isPlaying && this.hasPlayableAudio()) {
+      this._stopSourceNode(true);
+      this._startSourceAligned();
+    }
+    return profile;
+  }
+
+  /**
+   * На Хосте: акустическая авто-калибровка УДАЛЁННОГО устройства через МИКРОФОН ХОСТА!
+   * Телефон-слушатель вообще НЕ открывает свой микрофон, поэтому его Bluetooth A2DP гарантированно
+   * не сбрасывается в SCO и не светится зелёный индикатор микрофона.
+   * Задержка микрофона Хоста и задержка динамиков Хоста полностью сокращаются в разности!
+   */
+  async hostCalibrateRemotePeer({ peerCurrentLatencyMs, sendPeerChirps, getHostTime }) {
+    if (this.isCalibrating) throw new Error('Калибровка уже выполняется');
     if (!this.ctx) await this.unlock();
     await this.ensureResumed();
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      throw new Error('Микрофон недоступен в этом браузере');
+      throw new Error('Микрофон недоступен в браузере Хоста');
     }
 
-    const progress = onProgress || (() => {});
     this.isCalibrating = true;
-    const wasPlaying = this.isPlaying;
-    const prevVol = this.volume;
-    const prevMuted = this.muted;
-    const beforeOutMs = Number.isFinite(this.ctx.outputLatency) ? this.ctx.outputLatency * 1000 : 0;
-
     let stream = null;
     let micSrc = null;
     let proc = null;
     let zeroGain = null;
 
+    const cleanupMic = () => {
+      if (proc) {
+        proc.onaudioprocess = null;
+        try { proc.disconnect(); } catch (_) {}
+        proc = null;
+      }
+      if (micSrc) { try { micSrc.disconnect(); } catch (_) {} micSrc = null; }
+      if (zeroGain) { try { zeroGain.disconnect(); } catch (_) {} zeroGain = null; }
+      if (stream) {
+        stream.getTracks().forEach((tr) => { try { tr.stop(); } catch (_) {} });
+        stream = null;
+      }
+    };
+
+    // Жёсткий предохранитель: гарантированно закрываем микрофон не позже чем через 6.5 сек!
+    const hardStopTimer = setTimeout(cleanupMic, 6500);
+
     try {
-      progress('Доступ к микрофону...');
-      // Отключаем echoCancellation/NS/AGC, чтобы Android оставался в режиме A2DP (MODE_NORMAL), а не падал в HFP/SCO!
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
-      });
+      stream = await Promise.race([
+        navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('Таймаут доступа к микрофону')), 5000)),
+      ]);
 
-      // После выдачи доступа к микрофону браузер раскрывает реальное имя Bluetooth-колонки (например, JBL Flip 7)
-      await this.probeAudioDevices();
-
-      // Временно приглушаем локальную музыку на 2.2 сек (не сбивая расписание и часы!)
-      if (this.masterGain) {
-        this.masterGain.gain.setTargetAtTime(0.0001, this.ctx.currentTime, 0.01);
-      }
-
-      // Ждём 260 мс и проверяем, что Android не сбросил Bluetooth в разговорный SCO-режим
-      await new Promise((r) => setTimeout(r, 260));
-      const duringOutMs = Number.isFinite(this.ctx.outputLatency) ? this.ctx.outputLatency * 1000 : 0;
-      if (this._isAndroid && beforeOutMs > 120 && duringOutMs > 0 && duringOutMs < 65) {
-        throw new Error('Телефон переключил Bluetooth в режим гарнитуры при включении микрофона');
-      }
-
-      progress('Замер задержки колонки...');
-
+      this.setCalibrationDuck(true);
       const sr = this.ctx.sampleRate;
-      const chirpDur = 0.028; // 28 мс линейный FM-чирп 1300 -> 3500 Гц
-      const chirpLen = Math.floor(sr * chirpDur);
-      const template = new Float32Array(chirpLen);
-      let tplEnergy = 0;
-      for (let i = 0; i < chirpLen; i++) {
-        const u = i / chirpLen;
-        const win = 0.5 * (1 - Math.cos(2 * Math.PI * u));
-        const phase = 2 * Math.PI * (1300 * (i / sr) + 0.5 * ((3500 - 1300) / chirpDur) * (i / sr) * (i / sr));
-        const v = Math.sin(phase) * win;
-        template[i] = v;
-        tplEnergy += v * v;
-      }
+      const { buf: chirpBuf, template, chirpLen } = this._createCalibrationChirp(sr);
 
-      const chirpBuf = this.ctx.createBuffer(1, chirpLen, sr);
-      chirpBuf.getChannelData(0).set(template);
-
-      // Записываем сырые PCM-сэмплы с привязкой к точному ctx.currentTime
       const chunks = [];
       let totalRecorded = 0;
-      let firstChunkEndTime = null;
+      let firstChunkEndAudioTime = null;
       const bufSize = 2048;
 
       micSrc = this.ctx.createMediaStreamSource(stream);
@@ -492,8 +552,8 @@ class AudioEngine {
         const inp = ev.inputBuffer.getChannelData(0);
         const copy = new Float32Array(inp.length);
         copy.set(inp);
-        if (firstChunkEndTime === null) {
-          firstChunkEndTime = this.ctx.currentTime;
+        if (firstChunkEndAudioTime === null) {
+          firstChunkEndAudioTime = this.ctx.currentTime;
         }
         chunks.push(copy);
         totalRecorded += copy.length;
@@ -503,151 +563,105 @@ class AudioEngine {
       proc.connect(zeroGain);
       zeroGain.connect(this.ctx.destination);
 
-      await new Promise((r) => setTimeout(r, 140));
+      await new Promise((r) => setTimeout(r, 180));
 
-      // Планируем 3 чирпа с шагом 760 мс (перекрывает задержки до 720 мс без наложений)
-      const baseT = this.ctx.currentTime + 0.14;
-      const emitTimes = [baseT, baseT + 0.76, baseT + 1.52];
-      for (const t of emitTimes) {
-        const s = this.ctx.createBufferSource();
-        s.buffer = chirpBuf;
-        const g = this.ctx.createGain();
-        g.gain.value = 0.75;
-        s.connect(g);
-        g.connect(this.ctx.destination);
-        s.start(t);
-      }
+      // Фиксируем связку audioTime <-> hostNow на момент планирования
+      const hostNow0 = getHostTime();
+      const audioNow0 = this.ctx.currentTime;
+      const hostLatMs = this.getTotalOutputLatencyMs();
 
-      // Ждём завершения последнего чирпа + 760 мс запаса
-      const waitMs = Math.max(400, Math.round((emitTimes[emitTimes.length - 1] + 0.78 - this.ctx.currentTime) * 1000));
+      // 1) Эталонный чирп на Хосте в T_ref
+      const refHostMs = hostNow0 + 320;
+      const refAudioFeed = audioNow0 + (refHostMs - hostLatMs - hostNow0) / 1000;
+      const sRef = this.ctx.createBufferSource();
+      sRef.buffer = chirpBuf;
+      const gRef = this.ctx.createGain();
+      gRef.gain.value = 0.78;
+      sRef.connect(gRef);
+      gRef.connect(this.ctx.destination);
+      sRef.start(Math.max(this.ctx.currentTime + 0.02, refAudioFeed));
+
+      // 2) Два калибровочных чирпа на удалённом устройстве с большим шагом 1.25с (ловит расхождение -500..+750 мс)
+      const peerTimes = [refHostMs + 900, refHostMs + 2150];
+      sendPeerChirps(peerTimes);
+
+      // Ждём завершения второго чирпа + 850 мс запаса
+      const waitMs = Math.max(500, Math.round(peerTimes[1] + 850 - getHostTime()));
       await new Promise((r) => setTimeout(r, waitMs));
 
-      // Останавливаем запись
-      proc.onaudioprocess = null;
-      try { micSrc.disconnect(); proc.disconnect(); zeroGain.disconnect(); } catch (_) {}
-      stream.getTracks().forEach((tr) => tr.stop());
-      stream = null;
+      cleanupMic();
 
-      if (firstChunkEndTime === null || totalRecorded < sr * 1.5) {
-        throw new Error('Микрофон не записал аудиопоток');
+      if (firstChunkEndAudioTime === null || totalRecorded < sr * 2.2) {
+        throw new Error('Микрофон Хоста не записал сигнал');
       }
 
-      // Склеиваем запись в единый буфер; начало буфера соответствует recordStartTime
       const rec = new Float32Array(totalRecorded);
       let off = 0;
       for (const c of chunks) {
         rec.set(c, off);
         off += c.length;
       }
-      const recordStartTime = firstChunkEndTime - bufSize / sr;
+      const recordStartAudioTime = firstChunkEndAudioTime - bufSize / sr;
+      const hostMsToSample = (hMs) => Math.round((audioNow0 + (hMs - hostNow0) / 1000 - recordStartAudioTime) * sr);
 
-      // Кросс-корреляция (matched filter) по каждому из 3 чирпов в окне [12 мс .. 720 мс]
-      const detections = [];
-      const stride = 2; // 24 кГц эффективная сетка = 0.04 мс точность, работает < 15 мс
-      const minLag = Math.floor(sr * 0.012);
-      const maxLag = Math.floor(sr * 0.720);
-
-      for (const tEmit of emitTimes) {
-        const emitSample = Math.round((tEmit - recordStartTime) * sr);
-        const searchStart = Math.max(0, emitSample + minLag);
-        const searchEnd = Math.min(rec.length - chirpLen - 1, emitSample + maxLag);
-        if (searchEnd <= searchStart + 100) continue;
-
-        const corrLen = Math.floor((searchEnd - searchStart) / stride);
-        const corrAbs = new Float32Array(corrLen);
-        let bestVal = 0;
-        let bestIdx = 0;
-
-        for (let k = 0; k < corrLen; k++) {
-          const base = searchStart + k * stride;
+      const findPeakInWindow = (centerSample, minDeltaMs, maxDeltaMs) => {
+        const stride = 2;
+        const startS = Math.max(0, centerSample + Math.floor((minDeltaMs / 1000) * sr));
+        const endS = Math.min(rec.length - chirpLen - 1, centerSample + Math.floor((maxDeltaMs / 1000) * sr));
+        if (endS <= startS + 80) return null;
+        const n = Math.floor((endS - startS) / stride);
+        const corr = new Float32Array(n);
+        let bestV = 0;
+        let bestK = 0;
+        for (let k = 0; k < n; k++) {
+          const base = startS + k * stride;
           let dot = 0;
-          for (let j = 0; j < chirpLen; j += 2) {
-            dot += rec[base + j] * template[j];
-          }
+          for (let j = 0; j < chirpLen; j += 2) dot += rec[base + j] * template[j];
           const mag = Math.abs(dot);
-          corrAbs[k] = mag;
-          if (mag > bestVal) {
-            bestVal = mag;
-            bestIdx = k;
+          corr[k] = mag;
+          if (mag > bestV) {
+            bestV = mag;
+            bestK = k;
           }
         }
-
-        // Оценка уровня шума (медиана корреляции вне зоны пика)
-        const noiseSamples = [];
-        for (let k = 0; k < corrLen; k += 8) {
-          if (Math.abs(k - bestIdx) > Math.floor(chirpLen / stride)) {
-            noiseSamples.push(corrAbs[k]);
-          }
+        const noise = [];
+        for (let k = 0; k < n; k += 8) {
+          if (Math.abs(k - bestK) > Math.floor(chirpLen / stride)) noise.push(corr[k]);
         }
-        const noiseFloor = this._median(noiseSamples) || 1e-6;
-        const snr = bestVal / noiseFloor;
-
-        if (snr >= 3.2 && tplEnergy > 0) {
-          // Уточняем начало пика (фронт корреляции) для стабильности к эху комнаты
-          const lagSamples = searchStart + bestIdx * stride - emitSample;
-          const lagMs = (lagSamples / sr) * 1000;
-          detections.push({ lagMs, snr });
-        }
-      }
-
-      if (detections.length < 2) {
-        throw new Error('Колонка слышна слишком тихо — сделайте громче и поднесите телефон ближе');
-      }
-
-      // Ищем согласованную пару/тройку замеров в пределах ±35 мс
-      detections.sort((a, b) => a.lagMs - b.lagMs);
-      let bestCluster = [];
-      for (let i = 0; i < detections.length; i++) {
-        const cluster = detections.filter((d) => Math.abs(d.lagMs - detections[i].lagMs) <= 35);
-        if (cluster.length > bestCluster.length) bestCluster = cluster;
-      }
-
-      if (bestCluster.length < 2) {
-        throw new Error('Слишком шумно для точной калибровки — повторите в тишине');
-      }
-
-      const roundTripMs = this._median(bestCluster.map((d) => d.lagMs));
-      // Вычитаем системную задержку захвата микрофона (~26 мс Android, ~15 мс macOS/iOS)
-      const micInputMs = this._isAndroid ? 26 : 15;
-      const calibratedMs = Math.max(15, Math.min(1100, Math.round(roundTripMs - micInputMs)));
-
-      const baseMsNow = Number.isFinite(this.ctx.baseLatency) ? this.ctx.baseLatency * 1000 : 0;
-      const outMsNow = Number.isFinite(this.ctx.outputLatency) ? this.ctx.outputLatency * 1000 : 0;
-      const rawOsNow = outMsNow > 0 ? outMsNow + baseMsNow : this._median(this._latencySamples);
-
-      this.calibratedLatencyMs = calibratedMs;
-      this._calibratedRawOsMs = rawOsNow;
-      this.systemLatencyMs = calibratedMs;
-      this._saveCalibration(rawOsNow, calibratedMs);
-      this._lastReportedLatencySig = '';
-
-      const profile = this.getLatencyProfile();
-      this.onLatencyChange(profile);
-
-      if (wasPlaying && this.hasPlayableAudio()) {
-        this._stopSourceNode(true);
-        this._startSourceAligned();
-      }
-
-      return {
-        calibratedMs,
-        roundTripMs: Math.round(roundTripMs),
-        detections: bestCluster.length,
-        deviceLabel: this.outputDeviceLabel,
+        const snr = bestV / (this._median(noise) || 1e-6);
+        const peakSample = startS + bestK * stride;
+        return { peakSample, snr };
       };
+
+      // Ищем эталонный чирп Хоста (приходит около refHostMs + 5..260 мс за счёт микрофона)
+      const refSearchCenter = hostMsToSample(refHostMs);
+      const refHit = findPeakInWindow(refSearchCenter, -60, 260);
+      if (!refHit || refHit.snr < 3.0) {
+        throw new Error('Микрофон не услышал сигнал Хоста — сделайте звук Хоста чуть громче');
+      }
+
+      // Ищем 2 чирпа удалённой колонки относительно эталонного прихода Хоста!
+      const deltas = [];
+      for (const pTime of peerTimes) {
+        const expectedPeerSample = refHit.peakSample + Math.round(((pTime - refHostMs) / 1000) * sr);
+        const hit = findPeakInWindow(expectedPeerSample, -520, 750);
+        if (hit && hit.snr >= 3.0) {
+          const deltaMs = ((hit.peakSample - expectedPeerSample) / sr) * 1000;
+          deltas.push({ deltaMs, snr: hit.snr });
+        }
+      }
+
+      if (deltas.length < 2 || Math.abs(deltas[0].deltaMs - deltas[1].deltaMs) > 40) {
+        throw new Error('Колонка устройства слышна слишком тихо — поднесите ближе или сделайте громче');
+      }
+
+      const deltaMs = Math.round((deltas[0].deltaMs + deltas[1].deltaMs) / 2);
+      const newTotalLatencyMs = Math.max(10, Math.min(1200, Math.round((peerCurrentLatencyMs || 0) + deltaMs)));
+      return { deltaMs, newTotalLatencyMs };
     } finally {
-      if (proc) {
-        proc.onaudioprocess = null;
-        try { proc.disconnect(); } catch (_) {}
-      }
-      if (micSrc) { try { micSrc.disconnect(); } catch (_) {} }
-      if (zeroGain) { try { zeroGain.disconnect(); } catch (_) {} }
-      if (stream) {
-        stream.getTracks().forEach((tr) => tr.stop());
-      }
-      if (this.masterGain && this.ctx) {
-        this.masterGain.gain.setTargetAtTime(prevMuted ? 0 : prevVol, this.ctx.currentTime, 0.02);
-      }
+      clearTimeout(hardStopTimer);
+      cleanupMic();
+      this.setCalibrationDuck(false);
       this.isCalibrating = false;
     }
   }
