@@ -72,8 +72,10 @@ class AudioEngine {
     this._iosSilentAudio = null;
     this._driftTimer = null;
     this._latencyTimer = null;
+    this._warmupTimers = [];
     this._deviceChangeBound = null;
     this._getHostTimeFn = null;
+    this._isAndroid = /Android/i.test(navigator.userAgent || '');
   }
 
   getTotalOutputLatencyMs() {
@@ -172,7 +174,15 @@ class AudioEngine {
     this._startLatencyMonitor();
     await this.probeAudioDevices();
     this.measureSystemLatency(true);
-    setTimeout(() => this.measureSystemLatency(false), 300);
+
+    // Android/Bluetooth A2DP выход просыпается в течение 250–900 мс после старта аудио-графа —
+    // делаем серию быстрых замеров прогрева, чтобы реальная задержка ушла на Хост до старта музыки.
+    for (const tm of this._warmupTimers) clearTimeout(tm);
+    this._warmupTimers = [140, 320, 550, 850, 1300, 2000].map((ms) =>
+      setTimeout(() => {
+        if (this.ctx) this.measureSystemLatency(false);
+      }, ms)
+    );
 
     this.unlocked = true;
     return true;
@@ -271,10 +281,17 @@ class AudioEngine {
       measured = baseMs;
     }
 
-    if (this.systemLatencyMs === 0 || Math.abs(measured - this.systemLatencyMs) > 18) {
+    // Android A2DP Offload (AudioFlinger / AAudio) обычно отдаёт в Web Audio только буфер HAL (~250–300 мс)
+    // без учёта AVRCP DelayReport / DSP самой Bluetooth-колонки (~155 мс на JBL Flip 7 и A2DP Offload).
+    const btOnAndroid = this._isAndroid && (this.isBluetoothDetected || outMs >= 100 || impliedMs >= 115);
+    if (btOnAndroid) {
+      measured += 155;
+    }
+
+    // Гистерезис от квантовых скачков Android HAL (280 <-> 288 <-> 296 <-> 304 мс),
+    // чтобы не вызывать ложное дрожание playbackRate во время уже идущего воспроизведения.
+    if (this.systemLatencyMs === 0 || Math.abs(measured - this.systemLatencyMs) >= 26) {
       this.systemLatencyMs = measured;
-    } else {
-      this.systemLatencyMs = this.systemLatencyMs * 0.7 + measured * 0.3;
     }
 
     const newTotal = this.getTotalOutputLatencyMs();
@@ -285,7 +302,7 @@ class AudioEngine {
       this._lastReportedLatencySig = sig;
       this.onLatencyChange(profile);
 
-      if (this.isPlaying && this.hasPlayableAudio() && Math.abs(newTotal - prevTotal) >= 12) {
+      if (this.isPlaying && this.hasPlayableAudio() && Math.abs(newTotal - prevTotal) >= 24) {
         this._stopSourceNode(true);
         this._startSourceAligned();
       }
