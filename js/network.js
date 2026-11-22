@@ -31,21 +31,19 @@
 class NetworkManager {
   static CHUNK_SIZE = 16000; // 16 КБ чистых байт (безопасно для SCTP iOS/Android, без base64!)
   static MAX_BUFFERED_AMOUNT = 128 * 1024;
-  static ICE_GATHER_WAIT_MS = 1100;
-  static P2P_TIMEOUT_MS = 9500;
+  static ICE_GATHER_WAIT_MS = 2400;
+  static P2P_TIMEOUT_MS = 10000;
   static NTFY_BASE = 'https://ntfy.sh';
   static NTFY_WS_BASE = 'wss://ntfy.sh';
 
   static ICE_CONFIG = {
     iceServers: [
-      { urls: 'stun:stun.sipnet.ru:3478' },
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' },
       { urls: 'stun:stun.cloudflare.com:3478' },
-      { urls: 'stun:stun.voip.blackberry.com:3478' },
+      { urls: 'stun:stun.sipnet.ru:3478' },
     ],
-    iceCandidatePoolSize: 6,
+    iceCandidatePoolSize: 4,
   };
 
   constructor(callbacks = {}) {
@@ -479,8 +477,8 @@ class NetworkManager {
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
 
-      // Ждём быстрый сбор локальных LAN и STUN кандидатов (они автоматически вшиваются в localDescription.sdp)
-      await this._waitIceGathering(pc, NetworkManager.ICE_GATHER_WAIT_MS);
+      // Ждём быстрый сбор локальных LAN и STUN кандидатов
+      await this._waitIceGathering(pc, NetworkManager.ICE_GATHER_WAIT_MS, gatheredCandidates);
       trickleSent = true;
 
       await this._sendSignal({
@@ -488,6 +486,7 @@ class NetworkManager {
         to: peerId,
         hostDeviceName: this.deviceName,
         answer: { type: pc.localDescription.type, sdp: pc.localDescription.sdp },
+        candidates: gatheredCandidates,
       });
     } catch (err) {
       console.error('[Network/Host] Handshake error:', err);
@@ -1086,23 +1085,28 @@ class NetworkManager {
 
       const onDataChannelReady = () => {
         if (this.hostPc !== pc) return;
-        if (ctrlCh.readyState === 'open' && !this._listenerConnected) {
-          this._listenerConnected = true;
-          clearTimeout(this._listenerJoinTimer);
-          this.hostTransport = 'p2p';
+        if (ctrlCh.readyState === 'open') {
+          const wasRelay = this._listenerConnected && this.hostTransport === 'relay';
+          if (!this._listenerConnected || wasRelay) {
+            this._listenerConnected = true;
+            clearTimeout(this._listenerJoinTimer);
+            this.hostTransport = 'p2p';
 
-          this._detectTransportType(pc, (type, text) => {
-            this.hostTransport = type;
-            if (this.cb.onTransportChanged) this.cb.onTransportChanged(type, text);
-          });
+            this._detectTransportType(pc, (type, text) => {
+              this.hostTransport = type;
+              if (this.cb.onTransportChanged) this.cb.onTransportChanged(type, text);
+            });
 
-          if (this._listenerJoinResolve) {
-            const res = this._listenerJoinResolve;
-            this._listenerJoinResolve = null;
-            this._listenerJoinReject = null;
-            res(code);
+            if (this._listenerJoinResolve) {
+              const res = this._listenerJoinResolve;
+              this._listenerJoinResolve = null;
+              this._listenerJoinReject = null;
+              res(code);
+            }
+            if (!wasRelay && this.cb.onHostConnected) {
+              this.cb.onHostConnected('p2p');
+            }
           }
-          if (this.cb.onHostConnected) this.cb.onHostConnected('p2p');
         }
       };
 
@@ -1165,7 +1169,7 @@ class NetworkManager {
       onProgress(`2/4 Поиск комнаты ${NetworkManager.formatCode(code)}...`);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      await this._waitIceGathering(pc, NetworkManager.ICE_GATHER_WAIT_MS);
+      await this._waitIceGathering(pc, NetworkManager.ICE_GATHER_WAIT_MS, gatheredCandidates);
       offerSent = true;
 
       const sendJoinReq = () => {
@@ -1174,6 +1178,7 @@ class NetworkManager {
           sig: 'JOIN_REQ',
           deviceName: this.deviceName,
           offer: { type: pc.localDescription.type, sdp: pc.localDescription.sdp },
+          candidates: gatheredCandidates,
         });
       };
 
@@ -1406,24 +1411,38 @@ class NetworkManager {
 
   /* ==================== УТИЛИТЫ WEBRTC ==================== */
 
-  _waitIceGathering(pc, maxWaitMs) {
+  _waitIceGathering(pc, maxWaitMs, gatheredRef = null) {
     return new Promise((resolve) => {
       if (pc.iceGatheringState === 'complete') {
         resolve();
         return;
       }
       let settled = false;
+      let earlyTimer = null;
       const done = () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        clearTimeout(earlyTimer);
         pc.removeEventListener('icegatheringstatechange', onState);
+        pc.removeEventListener('icecandidate', onCand);
         resolve();
       };
       const onState = () => {
         if (pc.iceGatheringState === 'complete') done();
       };
+      const onCand = (ev) => {
+        if (!ev.candidate) {
+          done();
+          return;
+        }
+        // Как только получили хотя бы 1 srflx (STUN) кандидат — даём 250 мс добрать остальные и стартуем!
+        if (ev.candidate.candidate && ev.candidate.candidate.includes('typ srflx') && !earlyTimer) {
+          earlyTimer = setTimeout(done, 250);
+        }
+      };
       pc.addEventListener('icegatheringstatechange', onState);
+      pc.addEventListener('icecandidate', onCand);
       const timer = setTimeout(done, maxWaitMs);
     });
   }
