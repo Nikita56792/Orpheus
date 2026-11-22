@@ -1053,24 +1053,8 @@ class NetworkManager {
           return;
         }
 
-        if (isActive) {
-          const baseOffset = totalBytes > NetworkManager.STREAM_THRESHOLD_BYTES ? 12 : 0;
-          const pct = Math.min(94, baseOffset + Math.round(((i + 1) / totalChunks) * (94 - baseOffset)));
-          if (pct !== lastUiPct && (pct - lastUiPct >= 2 || i === totalChunks - 1)) {
-            lastUiPct = pct;
-            client.progress = Math.max(client.progress, pct);
-            const streaming = client.streamReadyTracks.has(track.id);
-            client.phase = i === totalChunks - 1 ? 'decoding' : streaming ? 'streaming' : 'loading';
-            client.status =
-              i === totalChunks - 1
-                ? 'Обработка 95%'
-                : streaming
-                ? `Играет · кэш ${client.progress}%`
-                : `Загрузка ${client.progress}%`;
-            this._emitPeers();
-          }
-        } else if (i % 10 === 0) {
-          await new Promise((r) => setTimeout(r, 8));
+        if (!isActive && i % 10 === 0) {
+          await new Promise((r) => setTimeout(r, 6));
         }
       }
     }
