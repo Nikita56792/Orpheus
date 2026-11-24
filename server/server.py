@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
-from aiohttp import web, WSMsgType
+from aiohttp import ClientSession, TCPConnector, WSMsgType, web
 
 from wifi_locator import DeviceWifiTracker, MultiSiteWifiLocator
 from yandex_music import (
@@ -32,6 +32,7 @@ from yandex_music import (
     YandexNotFoundError,
     get_oauth_authorize_url,
     poll_device_auth,
+    refresh_oauth_token,
     start_device_auth,
 )
 
@@ -94,8 +95,11 @@ class OrpheusServer:
         self.rooms: Dict[str, Room] = {}
         self.started_at = time.time()
         self.wifi_locator = MultiSiteWifiLocator(ROOT_DIR)
-        # Кэш последних 16 скачанных треков Яндекс Музыки: cache_key -> { data, mime, ts }
+        self.http_session: Optional[ClientSession] = None
+        # Кэш последних 16 скачанных треков Яндекс Музыки: cache_key -> { data, mime, preview, ts }
         self.ym_audio_cache: Dict[str, dict] = {}
+        self.ym_inflight: Dict[str, asyncio.Future] = {}
+        self.ym_uid_cache: Dict[str, tuple] = {}  # token_hash -> (uid, ts)
 
     async def safe_send(self, ws: Optional[web.WebSocketResponse], payload: dict):
         if not ws or ws.closed:
@@ -163,7 +167,7 @@ class OrpheusServer:
         preferred = body.get("site") if isinstance(body, dict) else None
         if not aps:
             return web.json_response({"ok": True, "location": None})
-        loc = self.wifi_locator.locate(aps, preferred_site=preferred)
+        loc = await asyncio.to_thread(self.wifi_locator.locate, aps, None, preferred)
         return web.json_response({"ok": True, "location": loc})
 
     async def handle_put_track(self, request: web.Request) -> web.Response:
@@ -297,6 +301,14 @@ class OrpheusServer:
                 mtype = data.get("t")
 
                 if mtype == "CREATE_ROOM" or mtype == "RESUME_HOST":
+                    if room is not None and role == "listener":
+                        room.listeners.pop(peer_id, None)
+                        await self.safe_send(room.host_ws, {"t": "PEER_LEFT", "peerId": peer_id})
+                        room = None
+                    elif room is not None and role == "host" and room.host_id == peer_id:
+                        room.host_ws = None
+                        room.host_disconnected_at = time.time()
+                        room = None
                     preferred = normalize_code(data.get("code", ""))
                     req_secret = str(data.get("hostSecret") or "").strip()
                     device_name = str(data.get("deviceName") or "Хост")[:48]
@@ -386,6 +398,10 @@ class OrpheusServer:
                     )
 
                 elif mtype == "JOIN_ROOM":
+                    if room is not None and role == "listener":
+                        room.listeners.pop(peer_id, None)
+                        await self.safe_send(room.host_ws, {"t": "PEER_LEFT", "peerId": peer_id})
+                        room = None
                     code = normalize_code(data.get("code", ""))
                     target = self.rooms.get(code)
                     if target and target.is_expired():
@@ -475,7 +491,7 @@ class OrpheusServer:
                 elif mtype == "WIFI_SCAN":
                     aps = data.get("aps")
                     preferred = data.get("site")
-                    loc = self.wifi_locator.locate(aps, tracker=wifi_tracker, preferred_site=preferred)
+                    loc = await asyncio.to_thread(self.wifi_locator.locate, aps, wifi_tracker, preferred)
                     if loc:
                         await self.safe_send(ws, {"t": "LOCATION_UPDATE", "location": loc})
                         if room and role == "listener":
@@ -543,9 +559,34 @@ class OrpheusServer:
             return web.json_response({"ok": False, "error": str(err)}, status=status)
         return web.json_response({"ok": False, "error": f"Yandex Music error: {err}"}, status=502)
 
+    def _ym_client(self, token: str) -> YandexMusicClient:
+        ym = YandexMusicClient(token, session=self.http_session)
+        if token:
+            tkey = token[-16:]
+            cached = self.ym_uid_cache.get(tkey)
+            if cached and (time.time() - cached[1]) < 3600:
+                ym._uid_cache = cached[0]
+        return ym
+
+    def _ym_remember_uid(self, token: str, ym: YandexMusicClient):
+        if token and getattr(ym, "_uid_cache", None):
+            tkey = token[-16:]
+            self.ym_uid_cache[tkey] = (ym._uid_cache, time.time())
+            if len(self.ym_uid_cache) > 64:
+                oldest = min(self.ym_uid_cache.items(), key=lambda kv: kv[1][1])[0]
+                self.ym_uid_cache.pop(oldest, None)
+
+    @staticmethod
+    def _safe_int(raw, default: int, lo: int, hi: int) -> int:
+        try:
+            v = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return max(lo, min(hi, v))
+
     async def handle_ym_device_start(self, request: web.Request) -> web.Response:
         try:
-            res = await start_device_auth(device_name="Orpheus Sync")
+            res = await start_device_auth(device_name="Orpheus Sync", session=self.http_session)
             return web.json_response({"ok": True, "oauthUrl": get_oauth_authorize_url(), **res})
         except Exception as err:
             return self._ym_error_response(err)
@@ -556,7 +597,18 @@ class OrpheusServer:
             device_code = str(body.get("deviceCode") or "").strip()
             if not device_code:
                 return web.json_response({"ok": False, "error": "missing_device_code"}, status=400)
-            res = await poll_device_auth(device_code)
+            res = await poll_device_auth(device_code, session=self.http_session)
+            return web.json_response({"ok": True, **res})
+        except Exception as err:
+            return self._ym_error_response(err)
+
+    async def handle_ym_refresh(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            refresh_token = str(body.get("refreshToken") or "").strip()
+            if not refresh_token:
+                return web.json_response({"ok": False, "error": "missing_refresh_token"}, status=400)
+            res = await refresh_oauth_token(refresh_token, session=self.http_session)
             return web.json_response({"ok": True, **res})
         except Exception as err:
             return self._ym_error_response(err)
@@ -566,8 +618,9 @@ class OrpheusServer:
         if not token:
             return web.json_response({"ok": True, "authenticated": False, "oauthUrl": get_oauth_authorize_url()})
         try:
-            async with YandexMusicClient(token) as ym:
+            async with self._ym_client(token) as ym:
                 info = await ym.account_status()
+                self._ym_remember_uid(token, ym)
             return web.json_response({"ok": True, **info})
         except Exception as err:
             return self._ym_error_response(err)
@@ -575,7 +628,7 @@ class OrpheusServer:
     async def handle_ym_chart(self, request: web.Request) -> web.Response:
         token = self._ym_token(request)
         try:
-            async with YandexMusicClient(token) as ym:
+            async with self._ym_client(token) as ym:
                 tracks = await ym.chart()
             return web.json_response({"ok": True, "tracks": tracks})
         except Exception as err:
@@ -583,12 +636,12 @@ class OrpheusServer:
 
     async def handle_ym_search(self, request: web.Request) -> web.Response:
         q = (request.query.get("q") or "").strip()
-        page = int(request.query.get("page") or 0)
+        page = self._safe_int(request.query.get("page"), 0, 0, 20)
         if not q:
             return web.json_response({"ok": True, "tracks": [], "albums": [], "playlists": []})
         token = self._ym_token(request)
         try:
-            async with YandexMusicClient(token) as ym:
+            async with self._ym_client(token) as ym:
                 res = await ym.search(q, page=page)
             return web.json_response({"ok": True, **res})
         except Exception as err:
@@ -596,10 +649,11 @@ class OrpheusServer:
 
     async def handle_ym_likes(self, request: web.Request) -> web.Response:
         token = self._ym_token(request)
-        limit = min(200, max(10, int(request.query.get("limit") or 100)))
+        limit = self._safe_int(request.query.get("limit"), 100, 10, 250)
         try:
-            async with YandexMusicClient(token) as ym:
+            async with self._ym_client(token) as ym:
                 tracks = await ym.liked_tracks(limit=limit)
+                self._ym_remember_uid(token, ym)
             return web.json_response({"ok": True, "tracks": tracks})
         except Exception as err:
             return self._ym_error_response(err)
@@ -607,8 +661,9 @@ class OrpheusServer:
     async def handle_ym_playlists(self, request: web.Request) -> web.Response:
         token = self._ym_token(request)
         try:
-            async with YandexMusicClient(token) as ym:
+            async with self._ym_client(token) as ym:
                 playlists = await ym.user_playlists()
+                self._ym_remember_uid(token, ym)
             return web.json_response({"ok": True, "playlists": playlists})
         except Exception as err:
             return self._ym_error_response(err)
@@ -618,7 +673,7 @@ class OrpheusServer:
         kind = request.match_info["kind"]
         token = self._ym_token(request)
         try:
-            async with YandexMusicClient(token) as ym:
+            async with self._ym_client(token) as ym:
                 res = await ym.playlist_tracks(uid, kind)
             return web.json_response({"ok": True, **res})
         except Exception as err:
@@ -628,7 +683,7 @@ class OrpheusServer:
         album_id = request.match_info["album_id"]
         token = self._ym_token(request)
         try:
-            async with YandexMusicClient(token) as ym:
+            async with self._ym_client(token) as ym:
                 res = await ym.album_tracks(album_id)
             return web.json_response({"ok": True, **res})
         except Exception as err:
@@ -638,7 +693,7 @@ class OrpheusServer:
         token = self._ym_token(request)
         station = (request.query.get("station") or "user:onyourwave").strip()
         try:
-            async with YandexMusicClient(token) as ym:
+            async with self._ym_client(token) as ym:
                 tracks = await ym.wave_tracks(station=station)
             return web.json_response({"ok": True, "station": station, "tracks": tracks})
         except Exception as err:
@@ -652,47 +707,75 @@ class OrpheusServer:
         track_hash = (request.query.get("trackHash") or "").strip()
         track_name = (request.query.get("name") or f"ym-{track_id}")[:120]
 
-        cache_key = f"{track_id}:{quality}:{'auth' if token else 'anon'}"
+        # Ключ кэша привязан к токену (суффикс) или anon, чтобы превью без Плюса никогда не отравляло Плюс-пользователей
+        tok_bucket = token[-12:] if token else "anon"
+        cache_key = f"{track_id}:{quality}:{tok_bucket}"
         entry = self.ym_audio_cache.get(cache_key)
 
         if entry is None:
-            try:
-                async with YandexMusicClient(token) as ym:
-                    data, mime = await ym.fetch_track_bytes(track_id, quality=quality, max_bytes=MAX_FILE_BYTES)
-            except Exception as err:
-                return self._ym_error_response(err)
-
-            entry = {"data": data, "mime": mime or "audio/mpeg", "ts": time.time()}
-            self.ym_audio_cache[cache_key] = entry
-            if len(self.ym_audio_cache) > 16:
-                oldest = min(self.ym_audio_cache.items(), key=lambda kv: kv[1]["ts"])[0]
-                if oldest != cache_key:
-                    self.ym_audio_cache.pop(oldest, None)
+            inflight = self.ym_inflight.get(cache_key)
+            if inflight is None:
+                loop = asyncio.get_running_loop()
+                inflight = loop.create_future()
+                self.ym_inflight[cache_key] = inflight
+                try:
+                    async with self._ym_client(token) as ym:
+                        info = await ym.get_track_stream_url(track_id, quality=quality)
+                        data, mime = await ym.fetch_track_bytes(track_id, quality=quality, max_bytes=MAX_FILE_BYTES)
+                        is_preview = bool(info.get("preview")) or len(data) < 600_000
+                    entry = {"data": data, "mime": mime or "audio/mpeg", "preview": is_preview, "ts": time.time()}
+                    self.ym_audio_cache[cache_key] = entry
+                    if len(self.ym_audio_cache) > 16:
+                        oldest = min(self.ym_audio_cache.items(), key=lambda kv: kv[1]["ts"])[0]
+                        if oldest != cache_key:
+                            self.ym_audio_cache.pop(oldest, None)
+                    inflight.set_result(entry)
+                except Exception as err:
+                    inflight.set_exception(err)
+                    return self._ym_error_response(err)
+                finally:
+                    self.ym_inflight.pop(cache_key, None)
+            else:
+                try:
+                    entry = await inflight
+                except Exception as err:
+                    return self._ym_error_response(err)
         else:
             entry["ts"] = time.time()
 
         data: bytes = entry["data"]
         mime: str = entry["mime"]
+        is_preview: bool = bool(entry.get("preview"))
 
-        # Если передана комната и trackHash — сразу кладём трек в RAM комнаты,
-        # чтобы Хосту не пришлось повторно загружать файл обратно на сервер!
         if room_code and track_hash and room_code in self.rooms:
             room = self.rooms[room_code]
             room.tracks[track_hash] = {"data": data, "mime": mime, "name": track_name, "ts": time.time()}
-            if len(room.tracks) > 16:
+            if len(room.tracks) > 20:
                 oldest_key = min(room.tracks.items(), key=lambda kv: kv[1]["ts"])[0]
                 if oldest_key != track_hash:
                     room.tracks.pop(oldest_key, None)
             room.touch()
 
         total = len(data)
+        base_headers = {
+            "Content-Type": mime,
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "private, max-age=3600",
+            "X-YM-Preview": "1" if is_preview else "0",
+        }
         range_header = request.headers.get("Range")
-        if range_header and range_header.startswith("bytes="):
+        if total > 0 and range_header and range_header.startswith("bytes="):
             try:
                 spec = range_header.replace("bytes=", "").split(",")[0].strip()
                 start_s, end_s = spec.split("-")
-                start = int(start_s) if start_s else 0
-                end = int(end_s) if end_s else total - 1
+                if not start_s and end_s:
+                    # Suffix range: bytes=-500
+                    suffix = int(end_s)
+                    start = max(0, total - suffix)
+                    end = total - 1
+                else:
+                    start = int(start_s) if start_s else 0
+                    end = int(end_s) if end_s else total - 1
                 start = max(0, min(start, total - 1))
                 end = max(start, min(end, total - 1))
                 chunk = data[start : end + 1]
@@ -700,11 +783,9 @@ class OrpheusServer:
                     status=206,
                     body=chunk,
                     headers={
-                        "Content-Type": mime,
+                        **base_headers,
                         "Content-Length": str(len(chunk)),
                         "Content-Range": f"bytes {start}-{end}/{total}",
-                        "Accept-Ranges": "bytes",
-                        "Cache-Control": "private, max-age=3600",
                     },
                 )
             except Exception:
@@ -713,23 +794,22 @@ class OrpheusServer:
         return web.Response(
             status=200,
             body=data,
-            headers={
-                "Content-Type": mime,
-                "Content-Length": str(total),
-                "Accept-Ranges": "bytes",
-                "Cache-Control": "private, max-age=3600",
-            },
+            headers={**base_headers, "Content-Length": str(total)},
         )
 
-    # ==================== STATIC FRONTEND ====================
+    # ==================== STATIC FRONTEND (ALLOWLIST ONLY) ====================
+
+    PUBLIC_FILES = {"index.html", "styles.css"}
+    PUBLIC_PREFIXES = ("js/", "maps/", "dist/")
 
     async def handle_static(self, request: web.Request) -> web.StreamResponse:
         rel = request.match_info.get("path", "").lstrip("/")
         if not rel:
             rel = "index.html"
-        # Безопасная проверка пути
+        if rel not in self.PUBLIC_FILES and not rel.startswith(self.PUBLIC_PREFIXES):
+            return web.Response(status=404, text="Not found")
         target = (ROOT_DIR / rel).resolve()
-        if not str(target).startswith(str(ROOT_DIR)) or not target.is_file():
+        if not target.is_relative_to(ROOT_DIR) or not target.is_file():
             return web.Response(status=404, text="Not found")
         resp = web.FileResponse(target)
         if rel.startswith("maps/"):
@@ -744,12 +824,15 @@ async def cors_middleware(request: web.Request, handler):
     if request.method == "OPTIONS":
         resp = web.Response(status=204)
     else:
-        resp = await handler(request)
+        try:
+            resp = await handler(request)
+        except web.HTTPException as ex:
+            resp = ex
     if not resp.prepared:
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Range, X-Track-Name, X-YM-Token"
-        resp.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Accept-Ranges"
+        resp.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Accept-Ranges, X-YM-Preview"
         resp.headers["Access-Control-Max-Age"] = "86400"
     return resp
 
@@ -768,6 +851,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/rooms/{code}/seg/{seg_key}", srv.handle_get_segment)
     app.router.add_post("/api/ym/auth/device/start", srv.handle_ym_device_start)
     app.router.add_post("/api/ym/auth/device/poll", srv.handle_ym_device_poll)
+    app.router.add_post("/api/ym/auth/refresh", srv.handle_ym_refresh)
     app.router.add_get("/api/ym/account", srv.handle_ym_account)
     app.router.add_get("/api/ym/chart", srv.handle_ym_chart)
     app.router.add_get("/api/ym/search", srv.handle_ym_search)
@@ -781,12 +865,15 @@ def create_app() -> web.Application:
     app.router.add_get("/{path:.*}", srv.handle_static)
 
     async def on_startup(app_inst):
+        srv.http_session = ClientSession(connector=TCPConnector(limit=40, ttl_dns_cache=300))
         app_inst["cleanup_task"] = asyncio.create_task(srv.cleanup_loop())
 
     async def on_cleanup(app_inst):
         task = app_inst.get("cleanup_task")
         if task:
             task.cancel()
+        if srv.http_session and not srv.http_session.closed:
+            await srv.http_session.close()
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)

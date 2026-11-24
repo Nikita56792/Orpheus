@@ -527,8 +527,12 @@ async def poll_device_auth(
             },
             session=session,
         )
-    except YandexMusicError:
-        return {"status": "pending"}
+    except YandexAuthError as err:
+        return {"status": "failed", "error": str(err), "code": err.code or "auth_error"}
+    except YandexMusicError as err:
+        if err.status is not None and err.status >= 500:
+            return {"status": "pending"}
+        return {"status": "failed", "error": str(err), "code": err.code or "oauth_error"}
 
     access_token = data.get("access_token")
     if isinstance(access_token, str) and access_token:
@@ -1008,11 +1012,25 @@ class YandexMusicClient:
             if tid:
                 missing_ids.append(tid)
 
-        # Fallback: large playlists often return only {id, albumId} stubs without embedded `track`
-        if not tracks and missing_ids:
-            fetched = await self.tracks_by_ids(missing_ids)
+        # Fallback: large/mixed playlists often embed only first batch and return {id, albumId} stubs for the rest
+        if missing_ids:
+            fetched = await self.tracks_by_ids(missing_ids[:500])
             by_id = {t["id"]: t for t in fetched}
-            tracks = [by_id[tid] for tid in missing_ids if tid in by_id]
+            existing_by_id = {t["id"]: t for t in tracks}
+            merged: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                embedded = entry.get("track")
+                tid = _as_str((embedded.get("id") if isinstance(embedded, dict) else None) or entry.get("id")).strip()
+                if not tid or tid in seen:
+                    continue
+                t_norm = existing_by_id.get(tid) or by_id.get(tid)
+                if t_norm is not None:
+                    seen.add(tid)
+                    merged.append(t_norm)
+            tracks = merged
 
         return {
             "uid": meta["uid"],

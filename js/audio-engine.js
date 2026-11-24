@@ -62,6 +62,7 @@ class AudioEngine {
 
     this.lastDriftMs = 0;
     this._driftStrikeCount = 0;
+    this._hardDriftStrikes = 0;
     this._playingLatencyStrike = 0;
     this._lastReportedLatencySig = '';
     this._latencySamples = [];
@@ -166,7 +167,7 @@ class AudioEngine {
       } catch (_) {}
     }
 
-    if (this.ctx.state === 'suspended') {
+    if (this.ctx.state !== 'running') {
       try {
         await Promise.race([
           this.ctx.resume(),
@@ -212,7 +213,7 @@ class AudioEngine {
   }
 
   async ensureResumed() {
-    if (this.ctx && this.ctx.state === 'suspended') {
+    if (this.ctx && this.ctx.state !== 'running') {
       try {
         await this.ctx.resume();
       } catch (_) {}
@@ -554,9 +555,23 @@ class AudioEngine {
     }
     this.bufferCache.set(trackId, audioBuffer);
     while (this.bufferCache.size > AudioEngine.MAX_CACHED_BUFFERS) {
-      const oldestKey = this.bufferCache.keys().next().value;
-      if (oldestKey === this.currentTrackId) break;
-      this.bufferCache.delete(oldestKey);
+      let evictKey = null;
+      for (const k of this.bufferCache.keys()) {
+        if (k !== this.currentTrackId) {
+          evictKey = k;
+          break;
+        }
+      }
+      if (!evictKey) break;
+      this.bufferCache.delete(evictKey);
+    }
+    // Чистим устаревшие потоковые сегменты неактивных треков (защита от утечки RAM)
+    if (this.streamSegments.size > 3) {
+      for (const k of Array.from(this.streamSegments.keys())) {
+        if (k !== this.currentTrackId && k !== trackId) {
+          this.streamSegments.delete(k);
+        }
+      }
     }
   }
 
@@ -616,6 +631,9 @@ class AudioEngine {
   activateTrack(trackId) {
     const buf = this.bufferCache.get(trackId);
     if (!buf) return null;
+    // Переносим активный трек в конец LRU-кэша
+    this.bufferCache.delete(trackId);
+    this.bufferCache.set(trackId, buf);
     this.stopInternal();
     this.currentTrackId = trackId;
     this.buffer = buf;
@@ -904,7 +922,7 @@ class AudioEngine {
         return;
       }
 
-      if (totalDur > 0 && this.getCurrentPosition() >= totalDur - 0.2) {
+      if (!usingSegment || (totalDur > 0 && this.getCurrentPosition() >= totalDur - 0.25)) {
         this.pause(0);
         this.onEnded();
       }
@@ -1038,6 +1056,11 @@ class AudioEngine {
 
   checkDrift() {
     if (!this.isPlaying || !this.ctx || !this._getHostTimeFn) return;
+    if (this.ctx.state !== 'running') {
+      // Если AudioContext приостановлен (например, до клика после F5 или прерывание ОС) — не перезапускаем источник в цикле
+      this.ctx.resume().catch(() => {});
+      return;
+    }
 
     // Бесшовное подкачивание следующего потокового сегмента за 5.5 сек до исчерпания буфера
     if (this.playingFromSegment && !this.buffer && this.currentTrackId) {
@@ -1084,15 +1107,20 @@ class AudioEngine {
     // 3) При реальном крупном сдвиге (> 140 мс два раза подряд) делаем чистую пересинхронизацию с кроссфейдом.
     if (absDrift <= 18) {
       this._driftStrikeCount = 0;
+      this._hardDriftStrikes = 0;
       if (this.currentRate !== 1.0) this._setPlaybackRate(1.0);
       this.onDrift(driftMs, 'locked');
     } else if (absDrift <= 35) {
       this._driftStrikeCount = 0;
-      if (this.currentRate !== 1.0 && absDrift <= 22) {
+      this._hardDriftStrikes = 0;
+      // Сбрасываем rate обратно в 1.0, если ранее шла коррекция в противоположную сторону или дрейф уменьшился
+      const opposing = (driftMs > 0 && this.currentRate > 1.0) || (driftMs < 0 && this.currentRate < 1.0);
+      if (this.currentRate !== 1.0 && (absDrift <= 22 || opposing)) {
         this._setPlaybackRate(1.0);
       }
       this.onDrift(driftMs, 'locked');
     } else if (absDrift <= 140) {
+      this._hardDriftStrikes = 0;
       this._driftStrikeCount++;
       if (this._driftStrikeCount >= 3) {
         const correctionRate = driftMs > 0 ? 0.9985 : 1.0015;
@@ -1102,9 +1130,10 @@ class AudioEngine {
         this.onDrift(driftMs, 'locked');
       }
     } else {
-      this._driftStrikeCount++;
-      if (this._driftStrikeCount >= 2) {
+      this._hardDriftStrikes++;
+      if (this._hardDriftStrikes >= 2) {
         this._driftStrikeCount = 0;
+        this._hardDriftStrikes = 0;
         this._stopSourceNode(true);
         this._startSourceAligned();
         this.onDrift(driftMs, 'resynced');

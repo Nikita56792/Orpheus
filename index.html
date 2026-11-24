@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="color-scheme" content="light dark" />
   <meta name="theme-color" content="#F5F5F7" media="(prefers-color-scheme: light)" />
   <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
@@ -10,15 +10,15 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   <title>Orpheus Sync — Синхронная музыка</title>
   <link rel="preconnect" href="https://158.160.205.107" crossorigin />
-  <link rel="stylesheet" href="styles.css?v=21" />
-  <script defer src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js" onerror="var s=document.createElement('script');s.src='https://unpkg.com/qrcode-generator@1.4.4/qrcode.min.js';document.head.appendChild(s);"></script>
-  <script defer src="js/wake-lock.js?v=21"></script>
-  <script defer src="js/clock-sync.js?v=21"></script>
-  <script defer src="js/audio-engine.js?v=21"></script>
-  <script defer src="js/network.js?v=21"></script>
-  <script defer src="js/floor-map.js?v=21"></script>
-  <script defer src="js/yandex-music.js?v=21"></script>
-  <script defer src="js/app.js?v=21"></script>
+  <link rel="stylesheet" href="styles.css?v=22" />
+  <script defer src="js/qrcode.min.js?v=22"></script>
+  <script defer src="js/wake-lock.js?v=22"></script>
+  <script defer src="js/clock-sync.js?v=22"></script>
+  <script defer src="js/audio-engine.js?v=22"></script>
+  <script defer src="js/network.js?v=22"></script>
+  <script defer src="js/floor-map.js?v=22"></script>
+  <script defer src="js/yandex-music.js?v=22"></script>
+  <script defer src="js/app.js?v=22"></script>
 </head>
 <body>
   <script>
@@ -223,7 +223,10 @@
             </form>
 
             <form id="ymSearchForm" class="ym-search-form">
-              <input id="ymSearchInput" class="input" type="search" placeholder="Поиск треков, исполнителей, альбомов..." autocomplete="off" />
+              <div class="ym-search-wrap">
+                <input id="ymSearchInput" class="input" type="search" placeholder="Поиск треков, исполнителей, альбомов..." autocomplete="off" />
+                <button type="button" id="btnYmClearSearch" class="ym-search-clear hidden" aria-label="Очистить поиск">✕</button>
+              </div>
               <button class="btn btn-secondary btn-sm" type="submit">Найти</button>
             </form>
 
@@ -258,6 +261,8 @@
               <div class="floor-pills" id="mapFloorPills"></div>
               <span class="map-hint">Выделяйте рамкой по этажам или кликайте с Shift/Cmd</span>
             </div>
+
+            <div class="map-zones-legend hidden" id="mapZonesLegend"></div>
 
             <div class="floor-grid" id="mapFloorGrid"></div>
 
@@ -295,9 +300,15 @@
             </div>
 
             <div class="track-header">
-              <div class="track-info">
-                <div class="track-title" id="trackTitle">Плейлист пуст</div>
-                <div class="track-sub" id="trackSub">Добавьте треки ниже</div>
+              <div class="track-header-left">
+                <img id="trackCoverImg" class="player-cover hidden" alt="" />
+                <div class="track-info">
+                  <div class="track-title-row">
+                    <div class="track-title" id="trackTitle">Плейлист пуст</div>
+                    <span class="preview-pill hidden" id="trackPreviewBadge" title="Без подписки Яндекс Плюс доступен 30-секундный фрагмент">Превью 30с</span>
+                  </div>
+                  <div class="track-sub" id="trackSub">Добавьте треки ниже</div>
+                </div>
               </div>
               <div class="countdown-badge hidden" id="countdownBadge">0.5с</div>
             </div>

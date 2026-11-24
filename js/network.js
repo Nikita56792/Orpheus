@@ -608,11 +608,24 @@ class NetworkManager {
           this.roomCode = msg.code;
           this.selfId = msg.peerId || this.selfId;
           this.hostSecret = msg.hostSecret || hostSecret || this.hostSecret;
-          // Если восстановились после перезагрузки страницы — сразу подхватываем подключённых слушателей!
-          if (Array.isArray(msg.listeners) && msg.listeners.length > 0) {
-            for (const l of msg.listeners) {
-              this._hostAddServerClient(l.peerId, l.deviceName || 'Устройство', l.location || null);
+          // Если восстановились после перезагрузки страницы или обрыва WS — мягко сверяем список слушателей
+          if (Array.isArray(msg.listeners)) {
+            const aliveIds = new Set(msg.listeners.map((l) => l.peerId));
+            for (const existingId of Array.from(this.clients.keys())) {
+              if (!aliveIds.has(existingId)) {
+                this._hostRemoveClient(existingId, false);
+              }
             }
+            for (const l of msg.listeners) {
+              const existing = this.clients.get(l.peerId);
+              if (existing) {
+                existing.open = true;
+                if (l.location && !existing.location) existing.location = l.location;
+              } else {
+                this._hostAddServerClient(l.peerId, l.deviceName || 'Устройство', l.location || null);
+              }
+            }
+            this._emitPeers();
           }
           resolve({
             code: msg.code,
@@ -643,19 +656,29 @@ class NetworkManager {
           reject(new Error('Соединение с сервером разорвано'));
           return;
         }
-        // Авто-переподключение Хоста к серверу с тем же кодом и секретом комнаты
+        // Авто-переподключение Хоста к серверу с экспоненциальным backoff и сохранением комнаты
         if (this.role === 'host' && this._serverMode && this.roomCode) {
           const keepCode = this.roomCode;
           const keepSecret = this.hostSecret;
-          this._serverReconnectTimer = setTimeout(async () => {
+          const scheduleRetry = (attempt) => {
             if (this.role !== 'host' || this.roomCode !== keepCode) return;
-            try {
-              const freshUrl = await this._resolveServerUrl();
-              if (freshUrl && this.role === 'host') {
-                await this._startHostOnServer(freshUrl, keepCode, keepSecret, false);
+            const delay = Math.min(12000, 1800 * Math.pow(1.6, attempt));
+            this._serverReconnectTimer = setTimeout(async () => {
+              if (this.role !== 'host' || this.roomCode !== keepCode) return;
+              try {
+                const freshUrl = await this._resolveServerUrl();
+                if (freshUrl && this.role === 'host') {
+                  await this._startHostOnServer(freshUrl, keepCode, keepSecret, false);
+                }
+              } catch (err) {
+                if (!err?._roomExpired && this.role === 'host' && this.roomCode === keepCode && attempt < 12) {
+                  this._serverMode = true;
+                  scheduleRetry(attempt + 1);
+                }
               }
-            } catch (_) {}
-          }, 2500);
+            }, delay);
+          };
+          scheduleRetry(0);
         }
       };
 
@@ -730,12 +753,15 @@ class NetworkManager {
       isSendingFile: false,
       latency: { totalLatencyMs: 0, systemLatencyMs: 0, isBluetooth: false, outputDeviceLabel: '' },
       location: initialLocation || null,
-      playback: {
-        trackId: this.activeTrackId,
-        playing: false,
-        hostStartTime: 0,
-        trackOffset: 0,
-      },
+      playback:
+        this.playbackState && this.playbackState.trackId === this.activeTrackId
+          ? { ...this.playbackState }
+          : {
+              trackId: this.activeTrackId,
+              playing: false,
+              hostStartTime: 0,
+              trackOffset: 0,
+            },
       volumeState: {
         volume: this.volumeState.volume,
         muted: this.volumeState.muted,
@@ -931,12 +957,15 @@ class NetworkManager {
       isSendingFile: false,
       latency: { totalLatencyMs: 0, systemLatencyMs: 0, isBluetooth: false, outputDeviceLabel: '' },
       location: null,
-      playback: {
-        trackId: this.activeTrackId,
-        playing: false,
-        hostStartTime: 0,
-        trackOffset: 0,
-      },
+      playback:
+        this.playbackState && this.playbackState.trackId === this.activeTrackId
+          ? { ...this.playbackState }
+          : {
+              trackId: this.activeTrackId,
+              playing: false,
+              hostStartTime: 0,
+              trackOffset: 0,
+            },
       volumeState: {
         volume: this.volumeState.volume,
         muted: this.volumeState.muted,
@@ -1168,15 +1197,28 @@ class NetworkManager {
           this.playbackState.hostStartTime - performance.now() > 150 &&
           this.playbackState.hostStartTime - newMax < performance.now() + 250
         ) {
-          const shiftedStart = performance.now() + newMax + 600;
+          const oldStart = this.playbackState.hostStartTime;
+          const shiftedStart = performance.now() + newMax + 260;
           this.playbackState.hostStartTime = shiftedStart;
-          this._broadcast('ctrl', {
+          const cmd = {
             type: 'CMD_PLAY',
             trackId: this.playbackState.trackId,
             hostStartTime: shiftedStart,
             trackOffset: this.playbackState.trackOffset,
             roomMaxLatencyMs: newMax,
-          });
+          };
+          // Перепланируем только устройства, участвующие в этом же старте/треке (не трогаем другие зоны!)
+          for (const c of this.clients.values()) {
+            if (
+              c.playback &&
+              c.playback.playing &&
+              c.playback.trackId === this.playbackState.trackId &&
+              Math.abs(c.playback.hostStartTime - oldStart) < 50
+            ) {
+              c.playback.hostStartTime = shiftedStart;
+              this._sendToClient(c, 'ctrl', cmd);
+            }
+          }
           if (this.cb.onHostRescheduleNeeded) {
             this.cb.onHostRescheduleNeeded(this.playbackState);
           }
@@ -1282,6 +1324,12 @@ class NetworkManager {
       }
 
       case 'TRACK_ERROR': {
+        // Сбрасываем кэш URL на сервере, чтобы при повторной попытке файл перезалился, если был вытеснен из RAM
+        const failedTrack = this.playlist.find((t) => t.id === msg.trackId);
+        if (failedTrack && failedTrack._serverTrackUrl) {
+          failedTrack._serverTrackUrl = null;
+          failedTrack._serverUploadPromise = null;
+        }
         const expectedTrackId = client.playback?.trackId || this.activeTrackId;
         if (msg.trackId === expectedTrackId) {
           client.phase = 'error';
@@ -1601,12 +1649,13 @@ class NetworkManager {
 
     // 2. Для активного файла > 350 КБ ПЕРВЫМ делом отдаём стартовый 8.5-сек сегмент — музыка стартует за ~0.5 сек!
     if (isActive && totalBytes > NetworkManager.STREAM_THRESHOLD_BYTES && this.cb.onBuildStreamSegment) {
+      const pb = client.playback?.trackId === track.id ? client.playback : this.playbackState;
       let startSec = 0;
-      if (this.playbackState.playing && this.playbackState.trackId === track.id) {
-        const elapsed = Math.max(0, (performance.now() - this.playbackState.hostStartTime) / 1000);
-        startSec = Math.max(0, Math.floor(this.playbackState.trackOffset + elapsed + 0.5));
+      if (pb && pb.playing && pb.trackId === track.id) {
+        const elapsed = Math.max(0, (performance.now() - pb.hostStartTime) / 1000);
+        startSec = Math.max(0, Math.floor((pb.trackOffset || 0) + elapsed + 0.5));
       } else {
-        startSec = Math.max(0, Math.floor(this.playbackState.trackOffset || 0));
+        startSec = Math.max(0, Math.floor(pb?.trackOffset || 0));
       }
 
       client.progress = Math.max(client.progress, 5);
@@ -1634,8 +1683,9 @@ class NetworkManager {
 
   _queueTrackForClient(client, track, highPriority) {
     if (!client.open || !track) return;
+    const clientTrackId = client.playback?.trackId || this.activeTrackId;
     if (client.readyTracks.has(track.id)) {
-      if (track.id === this.activeTrackId) {
+      if (track.id === clientTrackId) {
         client.progress = 100;
         client.phase = 'ready';
         client.status = 'Готово';
@@ -1751,7 +1801,8 @@ class NetworkManager {
 
   async _sendTrackToClient(client, track) {
     if (!client.open) return;
-    const isActive = track.id === this.activeTrackId;
+    const clientTrackId = client.playback?.trackId || this.activeTrackId;
+    const isActive = track.id === clientTrackId;
 
     if (track.type === 'demo' || track.type === 'pulse') {
       if (isActive) {
@@ -1816,12 +1867,13 @@ class NetworkManager {
       const totalBytes = track.buffer.byteLength;
 
       if (isActive && totalBytes > NetworkManager.STREAM_THRESHOLD_BYTES && this.cb.onBuildStreamSegment) {
+        const pb = client.playback?.trackId === track.id ? client.playback : this.playbackState;
         let startSec = 0;
-        if (this.playbackState.playing && this.playbackState.trackId === track.id) {
-          const elapsed = Math.max(0, (performance.now() - this.playbackState.hostStartTime) / 1000);
-          startSec = Math.max(0, Math.floor(this.playbackState.trackOffset + elapsed + 0.7));
+        if (pb && pb.playing && pb.trackId === track.id) {
+          const elapsed = Math.max(0, (performance.now() - pb.hostStartTime) / 1000);
+          startSec = Math.max(0, Math.floor((pb.trackOffset || 0) + elapsed + 0.7));
         } else {
-          startSec = Math.max(0, Math.floor(this.playbackState.trackOffset || 0));
+          startSec = Math.max(0, Math.floor(pb?.trackOffset || 0));
         }
 
         client.progress = 5;
@@ -2264,7 +2316,7 @@ class NetworkManager {
           this._listenerHandleSignal({ ...msg.data, from: msg.from });
         } else if (msg.t === 'HOST_RECONNECTED') {
           this.hostPeerId = msg.hostPeerId || this.hostPeerId;
-          // Старый P2P-канал принадлежал прошлой вкладке Хоста — аккуратно переустанавливаем в фоне
+          // Старый P2P-канал и незавершённые загрузки принадлежали прошлой вкладке Хоста — чистим и переустанавливаем
           if (this.hostPc) {
             try { this.hostPc.close(); } catch (_) {}
             this.hostPc = null;
@@ -2272,6 +2324,10 @@ class NetworkManager {
           this.hostChannels = { ntp: null, ctrl: null, stream: null, data: null };
           this._listenerP2pReady = false;
           this.hostTransport = 'server';
+          this.incomingTransfers.clear();
+          this.earlyChunks.clear();
+          this._downloadingTracks.clear();
+          this._downloadingSegments.clear();
           if (this.cb.onHostReconnected) this.cb.onHostReconnected();
           this._startListenerBackgroundP2PUpgrade();
         } else if (msg.t === 'HOST_LEFT') {

@@ -15,26 +15,18 @@ import android.os.HandlerThread
 import android.os.SystemClock
 import org.json.JSONArray
 
-/**
- * Wi-Fi-only scanner ported from navigator/app's battle-tested LiveSource.
- *
- * - Strictly Wi-Fi BSSID + RSSI (no steps, no barometer, no GPS, no cell).
- * - Unthrottled phones (Developer Option "Wi-Fi scan throttling" OFF): scans back-to-back (~2 s).
- * - Throttled Android 9+ phones (4 scans / 2 min limit):
- *   1) Requests own startScan() evenly every 30 s.
- *   2) Requests NETWORK_PROVIDER updates so Android's system WifiScanner refreshes scanResults.
- *   3) Polls wifi.scanResults every 1 s (free, unthrottled) and emits whenever newer results land.
- */
 class WifiScanner(
-    private val ctx: Context,
+    ctx: Context,
     private val onScanJson: (String) -> Unit,
 ) {
-    private val wifi = ctx.applicationContext.getSystemService(WifiManager::class.java)
-    private val lm = ctx.applicationContext.getSystemService(LocationManager::class.java)
+    private val appCtx = ctx.applicationContext
+    private val wifi = appCtx.getSystemService(WifiManager::class.java)
+    private val lm = appCtx.getSystemService(LocationManager::class.java)
     private val thread = HandlerThread("orpheus-wifi").also { it.start() }
     private val h = Handler(thread.looper)
 
     @Volatile private var running = false
+    @Volatile private var registered = false
     @Volatile var lastScanJson: String = "[]"
         private set
 
@@ -75,15 +67,26 @@ class WifiScanner(
         }
     }
 
+    fun isLocationEnabled(): Boolean {
+        return runCatching { lm?.isLocationEnabled ?: true }.getOrDefault(true)
+    }
+
     fun start() {
         if (running) return
         running = true
         h.post {
-            try {
-                ctx.registerReceiver(receiver, IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION), null, h)
-            } catch (_: Throwable) {}
+            if (!registered) {
+                try {
+                    val filter = IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        appCtx.registerReceiver(receiver, filter, null, h, Context.RECEIVER_EXPORTED)
+                    } else {
+                        appCtx.registerReceiver(receiver, filter, null, h)
+                    }
+                    registered = true
+                } catch (_: Throwable) {}
+            }
             checkLimited()
-            // Immediately emit any fresh cached results so map position locks instantly
             emitCachedIfPresent()
             requestScanInternal()
             h.post(tick)
@@ -92,16 +95,20 @@ class WifiScanner(
 
     fun stop() {
         running = false
+        retryScheduled = false
         h.post {
-            runCatching { ctx.unregisterReceiver(receiver) }
+            h.removeCallbacksAndMessages(null)
+            if (registered) {
+                runCatching { appCtx.unregisterReceiver(receiver) }
+                registered = false
+            }
             stopSysScans()
-            h.removeCallbacks(tick)
         }
     }
 
     fun destroy() {
         stop()
-        thread.quitSafely()
+        h.post { thread.quitSafely() }
     }
 
     fun triggerImmediateRead() {
@@ -158,7 +165,7 @@ class WifiScanner(
         if (limited) return
         if (!ok) {
             retryScheduled = true
-            h.postDelayed({ if (retryScheduled) requestScanInternal() }, 2000L)
+            h.postDelayed({ if (running && retryScheduled) requestScanInternal() }, 2000L)
         }
     }
 

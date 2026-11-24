@@ -1,10 +1,11 @@
 /**
- * YandexMusicPanel — встроенный модуль Яндекс Музыки (на базе протокола SpolzerMod/yamusic-rs)
- * для поиска, «Чарта», «Моей волны», «Мне нравится», плейлистов и прямой трансляции
- * аудио в комнату Orpheus (веб и Android).
+ * YandexMusicPanel v2 — встроенный модуль Яндекс Музыки (протокол SpolzerMod/yamusic-rs)
+ * с авто-обновлением OAuth refreshToken, защитой от гонок запросов (AbortController + seq),
+ * отображением активного трека / «в плейлисте», и чистым Apple HIG интерфейсом.
  */
 (() => {
   const STORAGE_KEY = 'orpheus_ym_token_v1';
+  const REFRESH_KEY = 'orpheus_ym_refresh_v1';
 
   function esc(str) {
     return String(str || '')
@@ -19,25 +20,34 @@
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
   }
 
+  function fmtArtists(raw) {
+    return Array.isArray(raw) ? raw.join(', ') : String(raw || '');
+  }
+
   class YandexMusicPanel {
-    constructor({ rootEl, getServerBaseUrl, onPlayTrack, onAddTrack, onAddManyTracks, onToast }) {
+    constructor({ rootEl, getServerBaseUrl, getPlaylistContext, onPlayTrack, onAddTrack, onAddManyTracks, onToast }) {
       this.rootEl = rootEl;
       this.getServerBaseUrl = getServerBaseUrl;
+      this.getPlaylistContext = getPlaylistContext || (() => ({ activeTrackId: null, playing: false, trackIds: new Set() }));
       this.onPlayTrack = onPlayTrack || (() => {});
       this.onAddTrack = onAddTrack || (() => {});
       this.onAddManyTracks = onAddManyTracks || (() => {});
       this.onToast = onToast || (() => {});
 
-      this.token = this._loadToken();
+      this.token = this._loadKey(STORAGE_KEY);
+      this.refreshToken = this._loadKey(REFRESH_KEY);
       this.account = null;
-      this.activeTab = 'chart'; // 'chart' | 'search' | 'wave' | 'likes' | 'playlists'
+      this.activeTab = 'chart';
       this.deviceAuth = null;
       this._pollTimer = null;
       this._searchTimer = null;
       this._loadedOnce = false;
       this._currentTracks = [];
-      this._collectionStack = null; // { title, tracks } when viewing a playlist or album
+      this._collectionStack = null;
       this._loadingTrackId = null;
+      this._addingAll = false;
+      this._reqSeq = 0;
+      this._activeAbort = null;
 
       this._cache = {
         chart: null,
@@ -49,19 +59,22 @@
       this._bindDOM();
     }
 
-    _loadToken() {
+    _loadKey(k) {
       try {
-        return (localStorage.getItem(STORAGE_KEY) || '').trim();
+        return (localStorage.getItem(k) || '').trim();
       } catch (_) {
         return '';
       }
     }
 
-    _saveToken(tok) {
-      this.token = (tok || '').trim();
+    _saveTokens(accessTok, refreshTok = null) {
+      this.token = (accessTok || '').trim();
+      if (refreshTok !== null) this.refreshToken = (refreshTok || '').trim();
       try {
         if (this.token) localStorage.setItem(STORAGE_KEY, this.token);
         else localStorage.removeItem(STORAGE_KEY);
+        if (this.refreshToken) localStorage.setItem(REFRESH_KEY, this.refreshToken);
+        else localStorage.removeItem(REFRESH_KEY);
       } catch (_) {}
     }
 
@@ -74,7 +87,24 @@
       return `${base}${path}`;
     }
 
-    async _api(path, { method = 'GET', body = null } = {}) {
+    async _tryRefreshToken() {
+      if (!this.refreshToken) return false;
+      try {
+        const resp = await fetch(this._apiUrl('/api/ym/auth/refresh'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refreshToken: this.refreshToken }),
+        });
+        const data = await resp.json().catch(() => null);
+        if (resp.ok && data?.ok && data.accessToken) {
+          this._saveTokens(data.accessToken, data.refreshToken || this.refreshToken);
+          return true;
+        }
+      } catch (_) {}
+      return false;
+    }
+
+    async _api(path, { method = 'GET', body = null, signal = undefined, allowRefresh = true } = {}) {
       const headers = {};
       if (this.token) headers['X-YM-Token'] = this.token;
       if (body !== null) headers['Content-Type'] = 'application/json';
@@ -82,8 +112,15 @@
         method,
         headers,
         body: body !== null ? JSON.stringify(body) : undefined,
+        signal,
       });
       const data = await resp.json().catch(() => ({ ok: false, error: `HTTP ${resp.status}` }));
+      if (resp.status === 401 && allowRefresh && this.refreshToken) {
+        const refreshed = await this._tryRefreshToken();
+        if (refreshed) {
+          return this._api(path, { method, body, signal, allowRefresh: false });
+        }
+      }
       if (!resp.ok || data.ok === false) {
         const err = new Error(data.error || `Ошибка ${resp.status}`);
         err.status = resp.status;
@@ -91,6 +128,14 @@
         throw err;
       }
       return data;
+    }
+
+    _nextRequestSignal() {
+      if (this._activeAbort) {
+        try { this._activeAbort.abort(); } catch (_) {}
+      }
+      this._activeAbort = new AbortController();
+      return { seq: ++this._reqSeq, signal: this._activeAbort.signal };
     }
 
     _bindDOM() {
@@ -101,6 +146,7 @@
       this.elTokenInput = this.rootEl.querySelector('#ymTokenInput');
       this.elSearchForm = this.rootEl.querySelector('#ymSearchForm');
       this.elSearchInput = this.rootEl.querySelector('#ymSearchInput');
+      this.elClearSearch = this.rootEl.querySelector('#btnYmClearSearch');
       this.elTabs = Array.from(this.rootEl.querySelectorAll('[data-ym-tab]'));
       this.elContent = this.rootEl.querySelector('#ymContent');
 
@@ -110,6 +156,22 @@
           if (tab) this.selectTab(tab);
         });
       }
+
+      const syncClearBtn = () => {
+        const hasText = Boolean((this.elSearchInput?.value || '').trim());
+        this.elClearSearch?.classList.toggle('hidden', !hasText);
+      };
+
+      this.elClearSearch?.addEventListener('click', () => {
+        if (this.elSearchInput) {
+          this.elSearchInput.value = '';
+          this.elSearchInput.focus();
+        }
+        syncClearBtn();
+        if (this.activeTab === 'search') {
+          this.elContent.innerHTML = `<div class="ym-empty">Введите название трека, исполнителя или альбома выше.</div>`;
+        }
+      });
 
       this.elSearchForm?.addEventListener('submit', (e) => {
         e.preventDefault();
@@ -122,21 +184,46 @@
       });
 
       this.elSearchInput?.addEventListener('input', () => {
+        syncClearBtn();
         const q = (this.elSearchInput?.value || '').trim();
         clearTimeout(this._searchTimer);
-        if (!q) return;
+        if (!q) {
+          if (this.activeTab === 'search') {
+            this.elContent.innerHTML = `<div class="ym-empty">Введите название трека, исполнителя или альбома выше.</div>`;
+          }
+          return;
+        }
         this._searchTimer = setTimeout(() => {
           this.activeTab = 'search';
           this._updateTabButtons();
           this.runSearch(q);
-        }, 420);
+        }, 400);
       });
 
       this.elTokenForm?.addEventListener('submit', async (e) => {
         e.preventDefault();
         const tok = (this.elTokenInput?.value || '').trim();
         if (!tok) return;
-        await this.applyToken(tok);
+        await this.applyToken(tok, '');
+      });
+    }
+
+    syncPlaybackState() {
+      if (!this.elContent || this._currentTracks.length === 0) return;
+      const ctx = this.getPlaylistContext();
+      this.elContent.querySelectorAll('.ym-track-item').forEach((row) => {
+        const idx = Number(row.dataset.ymIdx);
+        const tr = this._currentTracks[idx];
+        if (!tr) return;
+        const fullId = `ym-${tr.id}`;
+        const isCurrent = ctx.activeTrackId === fullId;
+        const inPl = ctx.trackIds.has(fullId);
+        row.classList.toggle('active', isCurrent);
+        const addBtn = row.querySelector('[data-ym-add]');
+        if (addBtn && !addBtn.disabled) {
+          addBtn.textContent = inPl ? '✓' : '+';
+          addBtn.classList.toggle('is-added', inPl);
+        }
       });
     }
 
@@ -145,6 +232,8 @@
         this._loadedOnce = true;
         this._renderAuthBar();
         await Promise.all([this.refreshAccount(), this.selectTab(this.activeTab)]);
+      } else {
+        this.syncPlaybackState();
       }
     }
 
@@ -159,22 +248,21 @@
         this.account = data.authenticated ? data : null;
       } catch (err) {
         if (err.authRequired) {
-          this._saveToken('');
+          this._saveTokens('', '');
           this.account = null;
         }
       }
       this._renderAuthBar();
     }
 
-    async applyToken(rawToken) {
-      // Поддерживаем вставку как чистого токена, так и URL с #access_token=...
+    async applyToken(rawToken, refreshTok = null) {
       let tok = String(rawToken || '').trim();
       const m = tok.match(/access_token=([^&#\s]+)/i);
       if (m) tok = decodeURIComponent(m[1]);
       tok = tok.replace(/^OAuth\s+/i, '').trim();
       if (!tok) return;
 
-      this._saveToken(tok);
+      this._saveTokens(tok, refreshTok);
       this._cache = { chart: null, likes: null, playlists: null, wave: null };
       try {
         const data = await this._api('/api/ym/account');
@@ -187,7 +275,7 @@
         this.onToast(`Яндекс Музыка: ${data.displayName || data.login}`, 'success');
         await this.selectTab(this.activeTab);
       } catch (err) {
-        this._saveToken('');
+        this._saveTokens('', '');
         this.account = null;
         this._renderAuthBar();
         this.onToast(err.message || 'Не удалось войти в Яндекс Музыку', 'error');
@@ -201,19 +289,19 @@
         this.elDeviceModal.innerHTML = `<div class="ym-device-status">Запрос кода авторизации...</div>`;
       }
       try {
-        const res = await this._api('/api/ym/auth/device/start', { method: 'POST' });
+        const res = await this._api('/api/ym/auth/device/start', { method: 'POST', allowRefresh: false });
         this.deviceAuth = res;
         if (this.elDeviceModal) {
           const url = res.verificationUrl || 'https://ya.ru/device';
           this.elDeviceModal.innerHTML = `
             <div class="ym-device-head">
               <strong>Вход через Яндекс (ya.ru/device)</strong>
-              <button type="button" class="mini-btn" id="btnYmCancelDevice">✕</button>
+              <button type="button" class="mini-btn" id="btnYmCancelDevice" aria-label="Закрыть">✕</button>
             </div>
             <div class="ym-device-body">
               <div class="ym-device-code mono">${esc(res.userCode)}</div>
               <div class="ym-device-hint">
-                Откройте <a href="${esc(url)}" target="_blank" rel="noopener" class="listener-apk-link">${esc(url)}</a> и введите код выше — вход произойдёт автоматически.
+                Откройте <a href="${esc(url)}" target="_blank" rel="noopener" class="listener-apk-link">${esc(url)}</a> и введите код — вход произойдёт автоматически.
               </div>
               <div class="ym-device-actions">
                 <a href="${esc(url)}" target="_blank" rel="noopener" class="btn btn-primary btn-xs">Открыть ya.ru/device</a>
@@ -244,9 +332,10 @@
             const p = await this._api('/api/ym/auth/device/poll', {
               method: 'POST',
               body: { deviceCode: this.deviceAuth.deviceCode },
+              allowRefresh: false,
             });
             if (p.status === 'done' && p.accessToken) {
-              await this.applyToken(p.accessToken);
+              await this.applyToken(p.accessToken, p.refreshToken || '');
               return;
             }
             if (p.status === 'failed') {
@@ -275,7 +364,7 @@
 
     logout() {
       this.stopDeviceAuth();
-      this._saveToken('');
+      this._saveTokens('', '');
       this.account = null;
       this._cache = { chart: null, likes: null, playlists: null, wave: null };
       this._renderAuthBar();
@@ -301,10 +390,10 @@
         this.elAuthBar.innerHTML = `
           <div class="ym-auth-info">
             <span class="ym-logo-badge">Я</span>
-            <span class="ym-auth-hint">Чарт и поиск готовы · для полных треков и «Моей волны» войдите</span>
+            <span class="ym-auth-hint">Без входа доступны превью 30 с · войдите для полных HQ-треков и «Моей волны»</span>
           </div>
           <div class="ym-auth-btns">
-            <button type="button" class="btn btn-primary btn-xs" id="btnYmDeviceLogin">Войти через Яндекс</button>
+            <button type="button" class="btn btn-primary btn-xs" id="btnYmDeviceLogin">Войти</button>
             <button type="button" class="btn btn-secondary btn-xs" id="btnYmToggleToken">Токен</button>
           </div>
         `;
@@ -317,7 +406,9 @@
 
     _updateTabButtons() {
       for (const btn of this.elTabs) {
-        btn.classList.toggle('active', btn.dataset.ymTab === this.activeTab);
+        const active = btn.dataset.ymTab === this.activeTab;
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-selected', String(active));
       }
     }
 
@@ -344,13 +435,15 @@
           this._renderTrackList(this._cache.chart, { heading: 'Чарт Яндекс Музыки' });
           return;
         }
+        const { seq, signal } = this._nextRequestSignal();
         this._setLoading('Загрузка чарта...');
         try {
-          const data = await this._api('/api/ym/chart');
+          const data = await this._api('/api/ym/chart', { signal });
+          if (seq !== this._reqSeq) return;
           this._cache.chart = data.tracks || [];
           this._renderTrackList(this._cache.chart, { heading: 'Чарт Яндекс Музыки' });
         } catch (err) {
-          this._setError(err.message);
+          if (err.name !== 'AbortError' && seq === this._reqSeq) this._setError(err.message);
         }
         return;
       }
@@ -361,12 +454,15 @@
       }
 
       if (tab === 'wave') {
+        const { seq, signal } = this._nextRequestSignal();
         this._setLoading('Настройка «Моей волны»...');
         try {
-          const data = await this._api('/api/ym/wave');
+          const data = await this._api('/api/ym/wave', { signal });
+          if (seq !== this._reqSeq) return;
           this._cache.wave = data.tracks || [];
           this._renderTrackList(this._cache.wave, { heading: 'Моя волна', showRefreshWave: true });
         } catch (err) {
+          if (err.name === 'AbortError' || seq !== this._reqSeq) return;
           if (err.authRequired) this._setAuthNeeded();
           else this._setError(err.message);
         }
@@ -378,12 +474,15 @@
           this._renderTrackList(this._cache.likes, { heading: 'Мне нравится' });
           return;
         }
+        const { seq, signal } = this._nextRequestSignal();
         this._setLoading('Загрузка любимых треков...');
         try {
-          const data = await this._api('/api/ym/likes?limit=100');
+          const data = await this._api('/api/ym/likes?limit=100', { signal });
+          if (seq !== this._reqSeq) return;
           this._cache.likes = data.tracks || [];
           this._renderTrackList(this._cache.likes, { heading: 'Мне нравится' });
         } catch (err) {
+          if (err.name === 'AbortError' || seq !== this._reqSeq) return;
           if (err.authRequired) this._setAuthNeeded();
           else this._setError(err.message);
         }
@@ -395,12 +494,15 @@
           this._renderPlaylistsGrid(this._cache.playlists);
           return;
         }
+        const { seq, signal } = this._nextRequestSignal();
         this._setLoading('Загрузка плейлистов...');
         try {
-          const data = await this._api('/api/ym/playlists');
+          const data = await this._api('/api/ym/playlists', { signal });
+          if (seq !== this._reqSeq) return;
           this._cache.playlists = data.playlists || [];
           this._renderPlaylistsGrid(this._cache.playlists);
         } catch (err) {
+          if (err.name === 'AbortError' || seq !== this._reqSeq) return;
           if (err.authRequired) this._setAuthNeeded();
           else this._setError(err.message);
         }
@@ -409,9 +511,11 @@
 
     async runSearch(query) {
       this._collectionStack = null;
+      const { seq, signal } = this._nextRequestSignal();
       this._setLoading(`Поиск «${query}»...`);
       try {
-        const data = await this._api(`/api/ym/search?q=${encodeURIComponent(query)}`);
+        const data = await this._api(`/api/ym/search?q=${encodeURIComponent(query)}`, { signal });
+        if (seq !== this._reqSeq) return;
         const tracks = data.tracks || [];
         const albums = data.albums || [];
         const playlists = data.playlists || [];
@@ -436,7 +540,7 @@
               <button type="button" class="ym-col-card" data-ym-album="${esc(a.id)}">
                 ${a.coverUrl ? `<img class="ym-col-cover" src="${esc(a.coverUrl)}" alt="" loading="lazy" />` : `<div class="ym-col-cover ym-cover-ph">♪</div>`}
                 <div class="ym-col-title">${esc(a.title)}</div>
-                <div class="ym-col-sub">${esc((Array.isArray(a.artists) ? a.artists.join(', ') : String(a.artists || '')) || (a.year ? String(a.year) : ''))}</div>
+                <div class="ym-col-sub">${esc(fmtArtists(a.artists) || (a.year ? String(a.year) : ''))}</div>
               </button>`
             )
             .join('');
@@ -461,35 +565,39 @@
         this.elContent.innerHTML = html;
         this._bindContentEvents();
       } catch (err) {
-        this._setError(err.message);
+        if (err.name !== 'AbortError' && seq === this._reqSeq) this._setError(err.message);
       }
     }
 
     async openPlaylist(uid, kind) {
+      const { seq, signal } = this._nextRequestSignal();
       this._setLoading('Загрузка плейлиста...');
       try {
-        const data = await this._api(`/api/ym/playlists/${encodeURIComponent(uid)}/${encodeURIComponent(kind)}`);
+        const data = await this._api(`/api/ym/playlists/${encodeURIComponent(uid)}/${encodeURIComponent(kind)}`, { signal });
+        if (seq !== this._reqSeq) return;
         this._collectionStack = { title: data.title || 'Плейлист', tracks: data.tracks || [] };
         this._renderTrackList(this._collectionStack.tracks, {
           heading: this._collectionStack.title,
           showBack: true,
         });
       } catch (err) {
-        this._setError(err.message);
+        if (err.name !== 'AbortError' && seq === this._reqSeq) this._setError(err.message);
       }
     }
 
     async openAlbum(albumId) {
+      const { seq, signal } = this._nextRequestSignal();
       this._setLoading('Загрузка альбома...');
       try {
-        const data = await this._api(`/api/ym/albums/${encodeURIComponent(albumId)}`);
+        const data = await this._api(`/api/ym/albums/${encodeURIComponent(albumId)}`, { signal });
+        if (seq !== this._reqSeq) return;
         this._collectionStack = { title: data.title || 'Альбом', tracks: data.tracks || [] };
         this._renderTrackList(this._collectionStack.tracks, {
           heading: this._collectionStack.title,
           showBack: true,
         });
       } catch (err) {
-        this._setError(err.message);
+        if (err.name !== 'AbortError' && seq === this._reqSeq) this._setError(err.message);
       }
     }
 
@@ -512,12 +620,16 @@
     }
 
     _buildTrackListHtml(tracks) {
+      const ctx = this.getPlaylistContext();
       return `<ul class="ym-track-list">${tracks
         .map((t, idx) => {
-          const artists = Array.isArray(t.artists) ? t.artists.join(', ') : String(t.artists || '');
+          const artists = fmtArtists(t.artists);
+          const fullId = `ym-${t.id}`;
           const busy = this._loadingTrackId === String(t.id);
+          const isCurrent = ctx.activeTrackId === fullId;
+          const inPl = ctx.trackIds.has(fullId);
           return `
-            <li class="ym-track-item ${busy ? 'loading' : ''}" data-ym-idx="${idx}">
+            <li class="ym-track-item ${busy ? 'loading' : ''} ${isCurrent ? 'active' : ''}" data-ym-idx="${idx}">
               ${
                 t.coverUrl
                   ? `<img class="ym-cover" src="${esc(t.coverUrl)}" alt="" loading="lazy" />`
@@ -528,10 +640,10 @@
                 <div class="ym-track-sub">${esc(artists || t.album || 'Яндекс Музыка')} · <span class="mono">${fmtDur(t.durationSec)}</span></div>
               </div>
               <div class="ym-track-actions">
-                <button type="button" class="btn btn-primary btn-xs ym-play-btn" data-ym-play="${idx}" title="Транслировать выбранным устройствам">
-                  ${busy ? '...' : '▶'}
+                <button type="button" class="ym-icon-btn ym-icon-play" data-ym-play="${idx}" title="Транслировать выбранным устройствам" aria-label="Воспроизвести">
+                  ${busy ? '…' : '▶'}
                 </button>
-                <button type="button" class="btn btn-secondary btn-xs" data-ym-add="${idx}" title="Добавить в плейлист комнаты">+</button>
+                <button type="button" class="ym-icon-btn ym-icon-add ${inPl ? 'is-added' : ''}" data-ym-add="${idx}" title="Добавить в плейлист комнаты" aria-label="Добавить в плейлист">${inPl ? '✓' : '+'}</button>
               </div>
             </li>
           `;
@@ -552,7 +664,8 @@
       const refreshBtn = showRefreshWave
         ? `<button type="button" class="btn btn-secondary btn-xs" id="btnYmWaveNext">Обновить волну</button>`
         : '';
-      const addAllBtn = `<button type="button" class="btn btn-secondary btn-xs" id="btnYmAddAll">+ Все в плейлист</button>`;
+      const batchCount = Math.min(12, this._currentTracks.length);
+      const addAllBtn = `<button type="button" class="btn btn-secondary btn-xs" id="btnYmAddAll">+ ${batchCount} в плейлист</button>`;
 
       this.elContent.innerHTML = `
         <div class="ym-subhead">
@@ -574,26 +687,52 @@
         this._cache.wave = null;
         this.selectTab('wave');
       });
-      this.elContent.querySelector('#btnYmAddAll')?.addEventListener('click', () => {
-        const subset = this._currentTracks.slice(0, 15);
-        if (subset.length) this.onAddManyTracks(subset);
+      const addAllBtn = this.elContent.querySelector('#btnYmAddAll');
+      addAllBtn?.addEventListener('click', async () => {
+        if (this._addingAll) return;
+        const subset = this._currentTracks.slice(0, 12);
+        if (!subset.length) return;
+        this._addingAll = true;
+        addAllBtn.disabled = true;
+        const origText = addAllBtn.textContent;
+        try {
+          await this.onAddManyTracks(subset, (done, total) => {
+            addAllBtn.textContent = `Добавление ${done}/${total}...`;
+          });
+        } finally {
+          this._addingAll = false;
+          addAllBtn.disabled = false;
+          addAllBtn.textContent = origText;
+          this.syncPlaybackState();
+        }
       });
 
-      this.elContent.querySelectorAll('[data-ym-play]').forEach((btn) => {
-        btn.addEventListener('click', async (e) => {
-          e.stopPropagation();
-          const tr = this._currentTracks[Number(btn.dataset.ymPlay)];
-          if (!tr) return;
-          this._loadingTrackId = String(tr.id);
-          btn.textContent = '...';
-          btn.disabled = true;
-          try {
-            await this.onPlayTrack(tr);
-          } finally {
-            this._loadingTrackId = null;
-            btn.textContent = '▶';
-            btn.disabled = false;
+      const triggerPlayRow = async (idx, playBtn) => {
+        const tr = this._currentTracks[idx];
+        if (!tr || this._loadingTrackId === String(tr.id)) return;
+        this._loadingTrackId = String(tr.id);
+        if (playBtn) {
+          playBtn.textContent = '…';
+          playBtn.disabled = true;
+        }
+        try {
+          await this.onPlayTrack(tr);
+        } finally {
+          this._loadingTrackId = null;
+          if (playBtn) {
+            playBtn.textContent = '▶';
+            playBtn.disabled = false;
           }
+          this.syncPlaybackState();
+        }
+      };
+
+      this.elContent.querySelectorAll('.ym-track-item').forEach((row) => {
+        row.addEventListener('click', (e) => {
+          if (e.target.closest('[data-ym-add]')) return;
+          const idx = Number(row.dataset.ymIdx);
+          const playBtn = row.querySelector('[data-ym-play]');
+          triggerPlayRow(idx, playBtn);
         });
       });
 
@@ -602,11 +741,12 @@
           e.stopPropagation();
           const tr = this._currentTracks[Number(btn.dataset.ymAdd)];
           if (!tr) return;
-          btn.textContent = '...';
+          btn.textContent = '…';
           btn.disabled = true;
           try {
             await this.onAddTrack(tr);
             btn.textContent = '✓';
+            btn.classList.add('is-added');
           } catch (_) {
             btn.textContent = '+';
           } finally {

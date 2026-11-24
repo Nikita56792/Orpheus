@@ -1,14 +1,7 @@
 /**
- * FloorMapPanel v2 — сверхбыстрый GPU-рендерер (единый общий WebGL2-контекст
- * + постоянный кэш растровых тайлов по этажам и зданиям + фоновая предзагрузка).
- *
- * Почему работает мгновенно (< 5 мс на переключение даже на ГМЦ со 180 000+ треугольников):
- * 1. Один общий offscreen WebGL2-контекст рисует геометрию любого этажа на GPU за ~1–2 мс
- *    (без превышения лимита WebGL-контекстов браузера и без тормозов CPU Canvas 2D).
- * 2. VAO-буферы и готовые растровые слои (staticBitmapCache) сохраняются при переключении
- *    между «Рекордов 15» ↔ «ГМЦ» и «Все этажи» ↔ «1/2/3 этаж».
- * 3. Нет холостого 60fps requestAnimationFrame в простое; перерисовка — только по изменению
- *    данных, выделения или при активной пульсации играющих устройств.
+ * FloorMapPanel v3 — GPU WebGL2 (1 общий контекст + автовосстановление контекста),
+ * zero-copy парсинг мешей, постоянный LRU-кэш растров, легенда активных зон,
+ * масштабирование отдельного этажа и дружелюбный к прокрутке мобильный touch-режим.
  */
 (() => {
   const TRACK_PALETTE = [
@@ -54,7 +47,13 @@
     for (const h of header) {
       const Ctor = types[h.dtype];
       if (!Ctor) continue;
-      out[h.k] = new Ctor(buffer.slice(base + h.off, base + h.off + h.len));
+      const byteOff = base + h.off;
+      // Zero-copy view при выравненном смещении (экономит ~5 МБ кучи на ГМЦ)
+      if (byteOff % Ctor.BYTES_PER_ELEMENT === 0) {
+        out[h.k] = new Ctor(buffer, byteOff, Math.floor(h.len / Ctor.BYTES_PER_ELEMENT));
+      } else {
+        out[h.k] = new Ctor(buffer.slice(byteOff, byteOff + h.len));
+      }
     }
     return out;
   }
@@ -68,17 +67,15 @@
     return TRACK_PALETTE[h % TRACK_PALETTE.length];
   }
 
-  /**
-   * Единый общий WebGL2-рендерер для всех этажей обоих зданий (1 контекст на всё приложение).
-   * Рисует 180 000 треугольников ГМЦ за ~1.5 мс на GPU и копирует результат в кэш-холст этажа.
-   */
   class SharedGpuFloorRenderer {
     constructor() {
       this.canvas = document.createElement('canvas');
       this.gl = null;
       this.program = null;
       this.uniforms = {};
-      this.meshVaos = new WeakMap(); // mesh -> Map<layerName, { vao, count, indexed, colored }>
+      this.meshVaos = new WeakMap();
+      this.onRestoredListeners = new Set();
+      this._boundEvents = false;
       this._init();
     }
 
@@ -115,7 +112,6 @@
             if (uUseCol == 1) {
               vec3 c = vCol;
               if (uDark == 1) {
-                // Преобразуем светлые пастельные помещения в аккуратную тёмную схему
                 c = vec3(0.11, 0.118, 0.137) + c * vec3(0.133, 0.141, 0.165);
               }
               outCol = vec4(c, 1.0);
@@ -151,10 +147,21 @@
           uColor: gl.getUniformLocation(prog, 'uColor'),
         };
 
-        this.canvas.addEventListener('webglcontextlost', (e) => {
-          e.preventDefault();
-          this.meshVaos = new WeakMap();
-        });
+        if (!this._boundEvents) {
+          this._boundEvents = true;
+          this.canvas.addEventListener('webglcontextlost', (e) => {
+            e.preventDefault();
+            this.meshVaos = new WeakMap();
+            this.program = null;
+          });
+          this.canvas.addEventListener('webglcontextrestored', () => {
+            this.meshVaos = new WeakMap();
+            this._init();
+            for (const fn of this.onRestoredListeners) {
+              try { fn(); } catch (_) {}
+            }
+          });
+        }
       } catch (err) {
         console.warn('[FloorMap] WebGL2 unavailable, falling back to 2D:', err);
         this.gl = null;
@@ -162,7 +169,7 @@
     }
 
     get available() {
-      return Boolean(this.gl && !this.gl.isContextLost());
+      return Boolean(this.gl && this.program && !this.gl.isContextLost());
     }
 
     _getLayers(mesh) {
@@ -233,7 +240,7 @@
 
     renderToContext(targetCtx, mesh, vp, dpr, isDark) {
       const gl = this.gl;
-      if (!gl || gl.isContextLost()) return false;
+      if (!gl || !this.program || gl.isContextLost()) return false;
 
       const pw = Math.max(1, Math.round(vp.w * dpr));
       const ph = Math.max(1, Math.round(vp.h * dpr));
@@ -251,7 +258,6 @@
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-      // Column-major mat3: world (lx, ly) -> NDC [-1, 1]
       const a = (2 * vp.scale) / vp.w;
       const d = (2 * vp.scale) / vp.h;
       const mat = new Float32Array([
@@ -287,7 +293,6 @@
 
       gl.bindVertexArray(null);
 
-      // Blit GPU-rendered image to target 2D canvas
       targetCtx.setTransform(1, 0, 0, 1, 0, 0);
       targetCtx.drawImage(this.canvas, 0, 0);
       return true;
@@ -305,6 +310,7 @@
       rootEl,
       gridEl,
       floorPillsEl,
+      zonesLegendEl,
       unlocatedWrapEl,
       unlocatedListEl,
       marqueeEl,
@@ -315,6 +321,7 @@
       this.rootEl = rootEl;
       this.gridEl = gridEl;
       this.floorPillsEl = floorPillsEl;
+      this.zonesLegendEl = zonesLegendEl;
       this.unlocatedWrapEl = unlocatedWrapEl;
       this.unlocatedListEl = unlocatedListEl;
       this.marqueeEl = marqueeEl;
@@ -324,11 +331,11 @@
 
       this.currentSite = 'rekordov15';
       this.viewFloor = 'all';
+      this.singleZoom = 1.0;
       this.siteCache = new Map();
       this.loadingSites = new Map();
-      // Постоянный LRU-кэш готовых растров этажей (переживает переключения зданий и этажей!)
       this.staticBitmapCache = new Map();
-      this.maxBitmapCacheEntries = 32;
+      this.maxBitmapCacheEntries = window.innerWidth < 768 ? 14 : 32;
 
       this.devices = [];
       this.playlist = [];
@@ -344,6 +351,11 @@
         this.darkQuery.addEventListener('change', this._darkHandler);
       }
 
+      getSharedGpu().onRestoredListeners.add(() => {
+        this.staticBitmapCache.clear();
+        this._scheduleRender();
+      });
+
       this._resizeTimer = null;
       this._lastGridWidth = 0;
       this._resizeObserver = new ResizeObserver((entries) => {
@@ -351,7 +363,10 @@
         if (w <= 0 || w === this._lastGridWidth) return;
         this._lastGridWidth = w;
         clearTimeout(this._resizeTimer);
-        this._resizeTimer = setTimeout(() => this._scheduleRender(), 90);
+        this._resizeTimer = setTimeout(() => {
+          this._measureTileSizes();
+          this._scheduleRender();
+        }, 90);
       });
       if (this.gridEl) this._resizeObserver.observe(this.gridEl);
 
@@ -362,6 +377,7 @@
       this._renderQueued = false;
       this._lastUnlocSig = '';
       this._lastBadgeSig = '';
+      this._lastLegendSig = '';
       this._siteSwitchSeq = 0;
 
       this._bindSiteButtons();
@@ -380,20 +396,29 @@
             this.setSite(site, true);
           }
         });
+        // Предзагружаем другое здание при наведении на кнопку переключения
+        btn.addEventListener('pointerenter', () => {
+          const site = btn.dataset.site;
+          if (site && site !== this.currentSite && !this.siteCache.has(site)) {
+            this._ensureSiteLoaded(site, true).catch(() => {});
+          }
+        });
       }
     }
 
     async init() {
       await this.setSite(this.currentSite, false);
-      // Тихо предзагружаем второе здание в фоне через 300 мс, чтобы даже первое переключение было мгновенным!
-      const prefetch = () => {
-        const other = this.currentSite === 'rekordov15' ? 'gmc' : 'rekordov15';
-        this._ensureSiteLoaded(other, true).catch(() => {});
-      };
-      if (typeof window.requestIdleCallback === 'function') {
-        setTimeout(() => window.requestIdleCallback(prefetch, { timeout: 1000 }), 250);
-      } else {
-        setTimeout(prefetch, 300);
+      const saveData = Boolean(navigator.connection && navigator.connection.saveData);
+      if (!saveData) {
+        const prefetch = () => {
+          const other = this.currentSite === 'rekordov15' ? 'gmc' : 'rekordov15';
+          this._ensureSiteLoaded(other, true).catch(() => {});
+        };
+        if (typeof window.requestIdleCallback === 'function') {
+          setTimeout(() => window.requestIdleCallback(prefetch, { timeout: 2500 }), 1200);
+        } else {
+          setTimeout(prefetch, 1400);
+        }
       }
     }
 
@@ -403,9 +428,12 @@
       const mySeq = ++this._siteSwitchSeq;
       this.currentSite = siteId;
       this.viewFloor = 'all';
+      this.singleZoom = 1.0;
 
       for (const btn of this.siteButtons) {
-        btn.classList.toggle('active', btn.dataset.site === siteId);
+        const active = btn.dataset.site === siteId;
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-selected', String(active));
       }
       this.onSiteChange(siteId);
 
@@ -415,7 +443,7 @@
       }
 
       await this._ensureSiteLoaded(siteId, false);
-      if (mySeq !== this._siteSwitchSeq) return; // пользователь уже переключил обратно
+      if (mySeq !== this._siteSwitchSeq) return;
 
       this._buildFloorPills();
       this._buildFloorGrid();
@@ -428,14 +456,14 @@
       if (this.loadingSites.has(siteId)) return this.loadingSites.get(siteId);
 
       const p = (async () => {
-        const metaResp = await fetch(`maps/${siteId}/meta.json?v=20`);
+        const metaResp = await fetch(`maps/${siteId}/meta.json?v=22`);
         if (!metaResp.ok) throw new Error(`Map meta ${siteId} HTTP ${metaResp.status}`);
         const meta = await metaResp.json();
 
         const floorsMap = new Map();
         await Promise.all(
           meta.floors.map(async (fl) => {
-            const resp = await fetch(`maps/${siteId}/floor${fl.n}.bin?v=20`);
+            const resp = await fetch(`maps/${siteId}/floor${fl.n}.bin?v=22`);
             if (!resp.ok) return;
             const buf = await resp.arrayBuffer();
             const mesh = readMesh(buf);
@@ -479,6 +507,7 @@
       }
 
       this._updateFloorBadges();
+      this._renderZonesLegend();
       this._renderUnlocatedStrip();
       this._scheduleRender();
       this._syncPulseLoopState();
@@ -517,6 +546,7 @@
           const next = raw === 'all' ? 'all' : Number(raw);
           if (next === this.viewFloor) return;
           this.viewFloor = next;
+          this.singleZoom = 1.0;
           this._buildFloorPills();
           this._buildFloorGrid();
           this.renderAll();
@@ -549,6 +579,12 @@
         tile.className = 'floor-tile';
         tile.dataset.floor = String(fl.n);
 
+        const zoomControls =
+          this.viewFloor !== 'all'
+            ? `<button type="button" class="floor-mini-btn" data-zoom-delta="-0.35" title="Уменьшить">−</button>` +
+              `<button type="button" class="floor-mini-btn" data-zoom-delta="0.35" title="Увеличить">+</button>`
+            : '';
+
         const head = document.createElement('div');
         head.className = 'floor-tile-head';
         head.innerHTML = `
@@ -557,10 +593,11 @@
             <span class="floor-dev-badge hidden" data-floor-badge="${fl.n}">0</span>
           </div>
           <div class="floor-tile-actions">
+            ${zoomControls}
             <button type="button" class="floor-mini-btn" data-select-floor="${fl.n}" title="Выбрать все устройства на этаже">Выбрать</button>
             ${
               this.viewFloor === 'all'
-                ? `<button type="button" class="floor-mini-btn" data-focus-floor="${fl.n}" title="Открыть этаж крупно">⤢</button>`
+                ? `<button type="button" class="floor-mini-btn" data-focus-floor="${fl.n}" title="Открыть этаж крупно" aria-label="Открыть этаж крупно">⤢</button>`
                 : `<button type="button" class="floor-mini-btn" data-focus-floor="all" title="Вернуться ко всем этажам">Все этажи</button>`
             }
           </div>
@@ -575,6 +612,15 @@
         tile.appendChild(head);
         tile.appendChild(canvasWrap);
         frag.appendChild(tile);
+
+        head.querySelectorAll('[data-zoom-delta]').forEach((zbtn) => {
+          zbtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const delta = Number(zbtn.dataset.zoomDelta || 0);
+            this.singleZoom = Math.max(1.0, Math.min(3.5, Number((this.singleZoom + delta).toFixed(2))));
+            this._scheduleRender();
+          });
+        });
 
         head.querySelector('[data-select-floor]')?.addEventListener('click', (e) => {
           e.stopPropagation();
@@ -597,10 +643,25 @@
           e.stopPropagation();
           const target = e.currentTarget.dataset.focusFloor;
           this.viewFloor = target === 'all' ? 'all' : Number(target);
+          this.singleZoom = 1.0;
           this._buildFloorPills();
           this._buildFloorGrid();
           this.renderAll();
         });
+
+        if (this.viewFloor !== 'all') {
+          canvasWrap.addEventListener(
+            'wheel',
+            (e) => {
+              if (!e.ctrlKey && !e.metaKey) return;
+              e.preventDefault();
+              const step = e.deltaY < 0 ? 0.2 : -0.2;
+              this.singleZoom = Math.max(1.0, Math.min(3.5, Number((this.singleZoom + step).toFixed(2))));
+              this._scheduleRender();
+            },
+            { passive: false }
+          );
+        }
 
         this.floorTiles.set(fl.n, {
           floorN: fl.n,
@@ -609,6 +670,8 @@
           canvasWrap,
           canvas,
           ctx: canvas.getContext('2d'),
+          cachedW: 0,
+          cachedH: 0,
           vp: { cx: 0, cy: 0, scale: 1, w: 1, h: 1 },
           dotHitboxes: [],
         });
@@ -616,9 +679,21 @@
 
       this.gridEl.innerHTML = '';
       this.gridEl.appendChild(frag);
+      this._measureTileSizes();
       this._lastBadgeSig = '';
       this._updateFloorBadges();
+      this._renderZonesLegend();
       this._renderUnlocatedStrip();
+    }
+
+    _measureTileSizes() {
+      for (const tile of this.floorTiles.values()) {
+        const rect = tile.canvasWrap.getBoundingClientRect();
+        if (rect.width >= 10 && rect.height >= 10) {
+          tile.cachedW = rect.width;
+          tile.cachedH = rect.height;
+        }
+      }
     }
 
     _devicesOnFloor(floorN) {
@@ -640,7 +715,10 @@
           counts.set(d.location.floor, (counts.get(d.location.floor) || 0) + 1);
         }
       }
-      const sig = `${this.currentSite}|${this.viewFloor}|${Array.from(counts.entries()).sort((a, b) => a[0] - b[0]).map((e) => e.join(':')).join(',')}`;
+      const sig = `${this.currentSite}|${this.viewFloor}|${Array.from(counts.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map((e) => e.join(':'))
+        .join(',')}`;
       if (sig === this._lastBadgeSig) return;
       this._lastBadgeSig = sig;
 
@@ -659,7 +737,67 @@
           el.textContent = String(c);
           el.classList.toggle('hidden', c === 0);
         });
+        this.gridEl.querySelectorAll('[data-select-floor]').forEach((btn) => {
+          const n = Number(btn.dataset.selectFloor);
+          btn.disabled = (counts.get(n) || 0) === 0;
+        });
       }
+    }
+
+    _renderZonesLegend() {
+      if (!this.zonesLegendEl) return;
+      const groups = new Map(); // trackId -> { name, color, ids, playing }
+      for (const d of this.devices) {
+        if (!d.trackId) continue;
+        let g = groups.get(d.trackId);
+        if (!g) {
+          const tr = this.playlist.find((t) => t.id === d.trackId);
+          g = {
+            trackId: d.trackId,
+            name: d.trackName || tr?.name || 'Трек',
+            color: getTrackColor(d.trackId, this.playlist),
+            ids: [],
+            playing: false,
+          };
+          groups.set(d.trackId, g);
+        }
+        g.ids.push(d.id);
+        if (d.playing) g.playing = true;
+      }
+
+      const list = Array.from(groups.values());
+      const sig = list.map((g) => `${g.trackId}:${g.ids.length}:${g.playing ? 1 : 0}`).join('|');
+      if (sig === this._lastLegendSig) return;
+      this._lastLegendSig = sig;
+
+      this.zonesLegendEl.classList.toggle('hidden', list.length === 0);
+      if (list.length === 0) return;
+
+      this.zonesLegendEl.innerHTML = list
+        .map(
+          (g) => `
+          <button type="button" class="zone-legend-pill" data-legend-track="${g.trackId.replace(/"/g, '&quot;')}" title="Выбрать устройства с этим треком">
+            <span class="zone-legend-dot" style="background:${g.color}"></span>
+            <span class="zone-legend-name">${g.playing ? '▶ ' : ''}${g.name.replace(/</g, '&lt;')}</span>
+            <span class="zone-legend-cnt">${g.ids.length}</span>
+          </button>`
+        )
+        .join('');
+
+      this.zonesLegendEl.querySelectorAll('[data-legend-track]').forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const tid = btn.dataset.legendTrack;
+          const ids = this.devices.filter((d) => d.trackId === tid).map((d) => d.id);
+          if (!ids.length) return;
+          const next = e.shiftKey || e.metaKey || e.ctrlKey ? new Set(this.selectedIds) : new Set();
+          for (const id of ids) next.add(id);
+          this.selectedIds = next;
+          this.onSelectionChange(new Set(this.selectedIds));
+          this._renderUnlocatedStrip();
+          this._scheduleRender();
+        });
+      });
     }
 
     _renderUnlocatedStrip() {
@@ -711,7 +849,8 @@
       const bw = Math.max(1, bb[2] - bb[0]);
       const bh = Math.max(1, bb[3] - bb[1]);
       const margin = this.viewFloor === 'all' ? 0.90 : 0.93;
-      const scale = Math.min(w / bw, h / bh) * margin;
+      const zoom = this.viewFloor === 'all' ? 1.0 : this.singleZoom;
+      const scale = Math.min(w / bw, h / bh) * margin * zoom;
       tile.vp = {
         cx: (bb[0] + bb[2]) / 2,
         cy: (bb[1] + bb[3]) / 2,
@@ -743,7 +882,7 @@
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       let drawn = 0;
-      const maxLabels = this.viewFloor !== 'all' ? 110 : 28;
+      const maxLabels = this.viewFloor !== 'all' ? 120 : 28;
 
       for (const l of sortedLabels) {
         if (drawn >= maxLabels) break;
@@ -819,12 +958,11 @@
     _getOrRenderStaticFloor(tile, dpr) {
       const { vp, floorObj, floorN } = tile;
       const isDark = this.darkQuery.matches;
-      const mode = this.viewFloor === 'all' ? 'g' : 's';
+      const mode = this.viewFloor === 'all' ? 'g' : `s${this.singleZoom}`;
       const key = `${this.currentSite}|${floorN}|${mode}|${Math.round(vp.w)}x${Math.round(vp.h)}|${dpr.toFixed(2)}|${isDark ? 'd' : 'l'}`;
 
       const cached = this.staticBitmapCache.get(key);
       if (cached) {
-        // LRU touch
         this.staticBitmapCache.delete(key);
         this.staticBitmapCache.set(key, cached);
         return cached;
@@ -867,6 +1005,7 @@
       const anyPlaying =
         this.rootEl &&
         !this.rootEl.classList.contains('hidden') &&
+        document.visibilityState === 'visible' &&
         this.devices.some((d) => d.playing && d.location?.site === this.currentSite);
 
       if (anyPlaying && !this._animRaf) {
@@ -874,15 +1013,23 @@
           const stillPlaying =
             this.rootEl &&
             !this.rootEl.classList.contains('hidden') &&
+            document.visibilityState === 'visible' &&
             this.devices.some((d) => d.playing && d.location?.site === this.currentSite);
           if (!stillPlaying) {
             this._animRaf = null;
             return;
           }
-          // 25 FPS достаточно для плавного кольца пульсации при минимальной нагрузке CPU
-          if (now - this._lastPulseFrame >= 40) {
+          if (now - this._lastPulseFrame >= 45) {
             this._lastPulseFrame = now;
-            this.renderAll();
+            // Перерисовываем ТОЛЬКО этажи, на которых реально есть играющие устройства!
+            const dpr = Math.min(2, window.devicePixelRatio || 1);
+            const isDark = this.darkQuery.matches;
+            for (const tile of this.floorTiles.values()) {
+              const devs = this._devicesOnFloor(tile.floorN);
+              if (devs.some((d) => d.playing)) {
+                this._renderTile(tile, dpr, now, isDark, devs);
+              }
+            }
           }
           this._animRaf = requestAnimationFrame(tick);
         };
@@ -899,140 +1046,187 @@
       const isDark = this.darkQuery.matches;
 
       for (const tile of this.floorTiles.values()) {
-        const rect = tile.canvasWrap.getBoundingClientRect();
-        if (rect.width < 10 || rect.height < 10) continue;
-
-        const w = rect.width;
-        const h = rect.height;
-        const targetW = Math.round(w * dpr);
-        const targetH = Math.round(h * dpr);
-        if (tile.canvas.width !== targetW || tile.canvas.height !== targetH) {
-          tile.canvas.width = targetW;
-          tile.canvas.height = targetH;
-        }
-
-        this._computeViewport(tile, w, h);
-        const staticImg = this._getOrRenderStaticFloor(tile, dpr);
-
-        const ctx = tile.ctx;
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.drawImage(staticImg, 0, 0);
-
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-        const devs = this._devicesOnFloor(tile.floorN);
-        tile.dotHitboxes = [];
-
-        for (const dev of devs) {
-          const loc = dev.location;
-          const [sx, sy] = this._toScreen(tile.vp, loc.lx, loc.ly);
-          const clampedX = Math.max(10, Math.min(w - 10, sx));
-          const clampedY = Math.max(10, Math.min(h - 10, sy));
-          const color = getTrackColor(dev.trackId, this.playlist);
-          const isSelected = this.selectedIds.has(dev.id);
-          const isPreview = this._marqueeState?.previewIds?.has(dev.id);
-          const highlighted = isSelected || isPreview;
-
-          const accPx = Math.max(8, Math.min(34, (loc.accuracy || 2.5) * tile.vp.scale));
-          ctx.beginPath();
-          ctx.arc(clampedX, clampedY, accPx, 0, Math.PI * 2);
-          ctx.fillStyle = highlighted ? 'rgba(0, 122, 255, 0.14)' : 'rgba(0, 122, 255, 0.07)';
-          ctx.fill();
-
-          if (dev.playing) {
-            const phase = (now % 1400) / 1400;
-            const pulseR = 7 + phase * 15;
-            ctx.beginPath();
-            ctx.arc(clampedX, clampedY, pulseR, 0, Math.PI * 2);
-            ctx.strokeStyle = color;
-            ctx.globalAlpha = (1 - phase) * 0.65;
-            ctx.lineWidth = 2;
-            ctx.stroke();
-            ctx.globalAlpha = 1;
-          }
-
-          if (highlighted) {
-            ctx.beginPath();
-            ctx.arc(clampedX, clampedY, 12, 0, Math.PI * 2);
-            ctx.fillStyle = 'rgba(0, 122, 255, 0.24)';
-            ctx.fill();
-            ctx.strokeStyle = '#007aff';
-            ctx.lineWidth = 2.2;
-            ctx.stroke();
-          }
-
-          ctx.beginPath();
-          ctx.arc(clampedX, clampedY, highlighted ? 7.5 : 6.5, 0, Math.PI * 2);
-          ctx.fillStyle = '#ffffff';
-          ctx.fill();
-
-          ctx.beginPath();
-          ctx.arc(clampedX, clampedY, highlighted ? 5.5 : 4.8, 0, Math.PI * 2);
-          ctx.fillStyle = color;
-          ctx.fill();
-
-          const labelText = `${dev.playing ? '▶ ' : ''}${dev.label}`;
-          ctx.font = '600 10.5px -apple-system, system-ui, sans-serif';
-          const tw = ctx.measureText(labelText).width;
-          const px = 6;
-          const pillW = tw + px * 2;
-          const pillH = 18;
-          const pillX = Math.max(4, Math.min(w - pillW - 4, clampedX - pillW / 2));
-          const pillY = clampedY - 27 > 4 ? clampedY - 27 : clampedY + 12;
-
-          ctx.fillStyle = highlighted
-            ? '#007aff'
-            : (isDark ? 'rgba(28, 28, 30, 0.92)' : 'rgba(255, 255, 255, 0.94)');
-          ctx.strokeStyle = highlighted
-            ? '#007aff'
-            : (isDark ? 'rgba(255,255,255,0.16)' : 'rgba(0,0,0,0.12)');
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          if (typeof ctx.roundRect === 'function') {
-            ctx.roundRect(pillX, pillY, pillW, pillH, 9);
-          } else {
-            ctx.rect(pillX, pillY, pillW, pillH);
-          }
-          ctx.fill();
-          ctx.stroke();
-
-          ctx.fillStyle = highlighted ? '#ffffff' : (isDark ? '#f5f5f7' : '#1d1d1f');
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillText(labelText, pillX + pillW / 2, pillY + pillH / 2 + 0.5);
-
-          tile.dotHitboxes.push({
-            id: dev.id,
-            x: clampedX,
-            y: clampedY,
-            r: 15,
-            pillX,
-            pillY,
-            pillW,
-            pillH,
-          });
-        }
+        this._renderTile(tile, dpr, now, isDark, this._devicesOnFloor(tile.floorN));
       }
     }
 
-    /* ==================== DESKTOP MARQUEE MULTI-SELECT ACROSS ALL FLOORS ==================== */
+    _renderTile(tile, dpr, now, isDark, devs) {
+      if (tile.cachedW < 10 || tile.cachedH < 10) {
+        const rect = tile.canvasWrap.getBoundingClientRect();
+        if (rect.width < 10 || rect.height < 10) return;
+        tile.cachedW = rect.width;
+        tile.cachedH = rect.height;
+      }
+
+      const w = tile.cachedW;
+      const h = tile.cachedH;
+      const targetW = Math.round(w * dpr);
+      const targetH = Math.round(h * dpr);
+      if (tile.canvas.width !== targetW || tile.canvas.height !== targetH) {
+        tile.canvas.width = targetW;
+        tile.canvas.height = targetH;
+      }
+
+      this._computeViewport(tile, w, h);
+      const staticImg = this._getOrRenderStaticFloor(tile, dpr);
+
+      const ctx = tile.ctx;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.drawImage(staticImg, 0, 0);
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      tile.dotHitboxes = [];
+
+      const accentBlue = isDark ? '#0a84ff' : '#007aff';
+      const usedPills = [];
+
+      for (const dev of devs) {
+        const loc = dev.location;
+        const [sx, sy] = this._toScreen(tile.vp, loc.lx, loc.ly);
+        const clampedX = Math.max(10, Math.min(w - 10, sx));
+        const clampedY = Math.max(10, Math.min(h - 10, sy));
+        const color = getTrackColor(dev.trackId, this.playlist);
+        const isSelected = this.selectedIds.has(dev.id);
+        const isPreview = this._marqueeState?.previewIds?.has(dev.id);
+        const highlighted = isSelected || isPreview;
+
+        const accPx = Math.max(8, Math.min(34, (loc.accuracy || 2.5) * tile.vp.scale));
+        ctx.beginPath();
+        ctx.arc(clampedX, clampedY, accPx, 0, Math.PI * 2);
+        ctx.fillStyle = highlighted ? 'rgba(0, 122, 255, 0.16)' : 'rgba(0, 122, 255, 0.08)';
+        ctx.fill();
+
+        if (dev.playing) {
+          const phase = (now % 1400) / 1400;
+          const pulseR = 7 + phase * 15;
+          ctx.beginPath();
+          ctx.arc(clampedX, clampedY, pulseR, 0, Math.PI * 2);
+          ctx.strokeStyle = color;
+          ctx.globalAlpha = (1 - phase) * 0.65;
+          ctx.lineWidth = 2;
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+
+        if (highlighted) {
+          ctx.beginPath();
+          ctx.arc(clampedX, clampedY, 12, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(0, 122, 255, 0.24)';
+          ctx.fill();
+          ctx.strokeStyle = accentBlue;
+          ctx.lineWidth = 2.2;
+          ctx.stroke();
+        }
+
+        ctx.beginPath();
+        ctx.arc(clampedX, clampedY, highlighted ? 7.5 : 6.5, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.arc(clampedX, clampedY, highlighted ? 5.5 : 4.8, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+
+        const labelText = `${dev.playing ? '▶ ' : ''}${dev.label}`;
+        ctx.font = '600 10.5px -apple-system, system-ui, sans-serif';
+        const tw = ctx.measureText(labelText).width;
+        const px = 6;
+        const pillW = tw + px * 2;
+        const pillH = 18;
+        const pillX = Math.max(4, Math.min(w - pillW - 4, clampedX - pillW / 2));
+        let pillY = clampedY - 27 > 4 ? clampedY - 27 : clampedY + 12;
+
+        // Разводим перекрывающиеся плашки устройств в одной комнате по вертикали
+        for (let attempt = 0; attempt < 4; attempt++) {
+          const overlaps = usedPills.some(
+            (b) => pillX < b[2] + 2 && pillX + pillW > b[0] - 2 && pillY < b[3] + 2 && pillY + pillH > b[1] - 2
+          );
+          if (!overlaps) break;
+          pillY = pillY + pillH + 3 <= h - 4 ? pillY + pillH + 3 : Math.max(4, pillY - pillH - 3);
+        }
+        usedPills.push([pillX, pillY, pillX + pillW, pillY + pillH]);
+
+        ctx.fillStyle = highlighted
+          ? accentBlue
+          : (isDark ? 'rgba(28, 28, 30, 0.92)' : 'rgba(255, 255, 255, 0.94)');
+        ctx.strokeStyle = highlighted
+          ? accentBlue
+          : (isDark ? 'rgba(255,255,255,0.16)' : 'rgba(0,0,0,0.12)');
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(pillX, pillY, pillW, pillH, 9);
+        } else {
+          ctx.rect(pillX, pillY, pillW, pillH);
+        }
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = highlighted ? '#ffffff' : (isDark ? '#f5f5f7' : '#1d1d1f');
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(labelText, pillX + pillW / 2, pillY + pillH / 2 + 0.5);
+
+        tile.dotHitboxes.push({
+          id: dev.id,
+          x: clampedX,
+          y: clampedY,
+          r: 16,
+          pillX,
+          pillY,
+          pillW,
+          pillH,
+        });
+      }
+    }
+
+    /* ==================== DESKTOP MARQUEE MULTI-SELECT + TOUCH TAP ==================== */
 
     _bindMarqueeAndClicks() {
       if (!this.rootEl) return;
 
       const onPointerDown = (e) => {
-        if (e.button !== 0) return;
-        if (e.target.closest('button, input, select, .map-toolbar, .floor-pills')) {
+        if (e.button !== 0 && e.pointerType === 'mouse') return;
+        if (e.target.closest('button, input, select, .map-toolbar, .floor-pills, .map-zones-legend')) {
           return;
         }
         const insideArea = e.target.closest('.floor-grid, .map-unlocated-wrap');
         if (!insideArea) return;
 
+        const isTouch = e.pointerType === 'touch';
         const startX = e.clientX;
         const startY = e.clientY;
-        const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+        const additive = isTouch || e.shiftKey || e.metaKey || e.ctrlKey;
         const baseSelection = additive ? new Set(this.selectedIds) : new Set();
         const hitId = this._hitTestCanvasDot(e.clientX, e.clientY);
+
+        // На тач-экранах НЕ перехватываем drag (оставляем нативную прокрутку страницы), обрабатываем только тап по точке!
+        if (isTouch) {
+          if (hitId) {
+            const next = new Set(this.selectedIds);
+            if (next.has(hitId)) next.delete(hitId);
+            else next.add(hitId);
+            this.selectedIds = next;
+            this.onSelectionChange(new Set(this.selectedIds));
+            this._renderUnlocatedStrip();
+            this._scheduleRender();
+          }
+          return;
+        }
+
+        // Снимаем координаты всех тайлов и чипов ОДИН раз в момент pointerdown (без layout thrashing в pointermove!)
+        const tileRects = [];
+        for (const tile of this.floorTiles.values()) {
+          const r = tile.canvas.getBoundingClientRect();
+          tileRects.push({ rect: r, hitboxes: tile.dotHitboxes });
+        }
+        const chipRects = [];
+        if (this.unlocatedListEl) {
+          this.unlocatedListEl.querySelectorAll('[data-unloc-id]').forEach((el) => {
+            chipRects.push({ id: el.dataset.unlocId, rect: el.getBoundingClientRect() });
+          });
+        }
 
         this._marqueeState = {
           pointerId: e.pointerId,
@@ -1044,6 +1238,8 @@
           additive,
           baseSelection,
           hitId,
+          tileRects,
+          chipRects,
           previewIds: new Set(),
         };
 
@@ -1078,9 +1274,27 @@
           this.marqueeEl.style.height = `${height}px`;
         }
 
-        const inBox = this._collectDevicesInClientRect(left, top, left + width, top + height);
-        st.previewIds = new Set(st.baseSelection);
-        for (const id of inBox) st.previewIds.add(id);
+        const x1 = left + width;
+        const y1 = top + height;
+        const nextPreview = new Set(st.baseSelection);
+        for (const item of st.tileRects) {
+          const r = item.rect;
+          if (r.right < left || r.left > x1 || r.bottom < top || r.top > y1) continue;
+          for (const hb of item.hitboxes) {
+            const cx = r.left + hb.x;
+            const cy = r.top + hb.y;
+            if (cx >= left - 6 && cx <= x1 + 6 && cy >= top - 6 && cy <= y1 + 6) {
+              nextPreview.add(hb.id);
+            }
+          }
+        }
+        for (const ch of st.chipRects) {
+          const r = ch.rect;
+          if (r.right >= left && r.left <= x1 && r.bottom >= top && r.top <= y1) {
+            nextPreview.add(ch.id);
+          }
+        }
+        st.previewIds = nextPreview;
 
         if (this.unlocatedListEl) {
           this.unlocatedListEl.querySelectorAll('[data-unloc-id]').forEach((el) => {
@@ -1153,30 +1367,6 @@
         }
       }
       return null;
-    }
-
-    _collectDevicesInClientRect(x0, y0, x1, y1) {
-      const found = [];
-      for (const tile of this.floorTiles.values()) {
-        const rect = tile.canvas.getBoundingClientRect();
-        if (rect.right < x0 || rect.left > x1 || rect.bottom < y0 || rect.top > y1) continue;
-        for (const hb of tile.dotHitboxes) {
-          const cx = rect.left + hb.x;
-          const cy = rect.top + hb.y;
-          if (cx >= x0 - 6 && cx <= x1 + 6 && cy >= y0 - 6 && cy <= y1 + 6) {
-            found.push(hb.id);
-          }
-        }
-      }
-      if (this.unlocatedListEl) {
-        this.unlocatedListEl.querySelectorAll('[data-unloc-id]').forEach((el) => {
-          const r = el.getBoundingClientRect();
-          if (r.right >= x0 && r.left <= x1 && r.bottom >= y0 && r.top <= y1) {
-            found.push(el.dataset.unlocId);
-          }
-        });
-      }
-      return found;
     }
   }
 
