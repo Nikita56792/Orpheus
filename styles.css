@@ -91,7 +91,11 @@ body {
   display: none !important;
 }
 
-/* Предотвращаем мелькание стартового экрана при переходе по ?room=CODE */
+/* Предотвращаем мелькание стартового экрана во время проверки комнаты или восстановления Хоста */
+html.is-checking-room #viewLanding,
+html.is-checking-room #viewInviteUnlock {
+  display: none !important;
+}
 html.has-invite-room #viewLanding {
   display: none !important;
 }

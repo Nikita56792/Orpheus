@@ -223,6 +223,13 @@
       }
     },
 
+    onHostReconnected: () => {
+      if (state.role !== 'listener') return;
+      if (clock && !clock.isHost) clock.reburst();
+      sendLocalLatencyToHost();
+      requestNativeWifiScanIfAvailable();
+    },
+
     onHostDisconnected: () => {
       audio.pause();
       if (clock) clock.stop();
@@ -354,6 +361,7 @@
 
   function showView(name) {
     document.documentElement.classList.remove('has-invite-room');
+    document.documentElement.classList.remove('is-checking-room');
     ui.viewLanding.classList.toggle('hidden', name !== 'landing');
     ui.viewInviteUnlock.classList.toggle('hidden', name !== 'invite');
     ui.viewRoom.classList.toggle('hidden', name !== 'room');
@@ -450,7 +458,133 @@
     }
   }
 
-  /* ==================== ЗАПУСК ХОСТА ==================== */
+  /* ==================== СОХРАНЕНИЕ И ВОССТАНОВЛЕНИЕ СЕССИИ ХОСТА (5 МИН) ==================== */
+
+  const HOST_SESSION_KEY = 'orpheus_host_session_v1';
+  const HOST_SESSION_TTL_MS = 5 * 60 * 1000;
+  let hostSessionHeartbeat = null;
+  let pendingGestureUnlockBound = false;
+
+  function saveHostSession(code, hostSecret) {
+    if (!code || !hostSecret) return;
+    try {
+      localStorage.setItem(
+        HOST_SESSION_KEY,
+        JSON.stringify({ code: NetworkManager.normalizeCode(code), hostSecret, savedAt: Date.now() })
+      );
+    } catch (_) {}
+  }
+
+  function touchHostSession() {
+    if (state.role === 'host' && state.roomCode && network.hostSecret) {
+      saveHostSession(state.roomCode, network.hostSecret);
+    }
+  }
+
+  function loadHostSession() {
+    try {
+      const raw = localStorage.getItem(HOST_SESSION_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      const code = NetworkManager.normalizeCode(parsed?.code || '');
+      const secret = String(parsed?.hostSecret || '').trim();
+      const savedAt = Number(parsed?.savedAt || 0);
+      if (code.length < 4 || !secret || !savedAt) return null;
+      if (Date.now() - savedAt >= HOST_SESSION_TTL_MS) {
+        clearHostSession();
+        return null;
+      }
+      return { code, hostSecret: secret, savedAt };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function clearHostSession() {
+    try {
+      localStorage.removeItem(HOST_SESSION_KEY);
+    } catch (_) {}
+    if (hostSessionHeartbeat) {
+      clearInterval(hostSessionHeartbeat);
+      hostSessionHeartbeat = null;
+    }
+  }
+
+  function startHostSessionHeartbeat() {
+    if (hostSessionHeartbeat) clearInterval(hostSessionHeartbeat);
+    touchHostSession();
+    hostSessionHeartbeat = setInterval(() => {
+      touchHostSession();
+    }, 25000);
+  }
+
+  function bindDeferredAudioUnlock() {
+    if (pendingGestureUnlockBound) return;
+    pendingGestureUnlockBound = true;
+    const unlockOnce = async () => {
+      pendingGestureUnlockBound = false;
+      window.removeEventListener('pointerdown', unlockOnce, true);
+      window.removeEventListener('keydown', unlockOnce, true);
+      try {
+        await audio.unlock();
+        wakeLock.acquire();
+        if (state.role) sendLocalLatencyToHost();
+      } catch (_) {}
+    };
+    window.addEventListener('pointerdown', unlockOnce, { capture: true, passive: true });
+    window.addEventListener('keydown', unlockOnce, { capture: true, passive: true });
+  }
+
+  function setupHostRoomUI(code, { isResumed = false, restoredPeers = [] } = {}) {
+    state.role = 'host';
+    state.roomCode = code;
+    state.playlist = [];
+    state.activeTrackId = null;
+
+    clock = new ClockSync({ isHost: true });
+
+    const shareUrl = buildShareUrl(code);
+    window.history.replaceState({}, '', `?room=${code}`);
+    renderQR(shareUrl);
+
+    ui.roleBadge.textContent = 'ХОСТ';
+    ui.roleBadge.className = 'role-badge';
+    ui.displayRoomCode.textContent = NetworkManager.formatCode(code);
+    if (ui.appShell) ui.appShell.classList.add('is-host-room');
+
+    ui.hostShareActions.classList.remove('hidden');
+    ui.hostMapSection.classList.remove('hidden');
+    ui.zoneTargetBar.classList.remove('hidden');
+    ui.hostTrackSection.classList.remove('hidden');
+    ui.hostPlaybackControls.classList.remove('hidden');
+    ui.hostPeersSection.classList.remove('hidden');
+    ui.loopToggleWrap.classList.remove('hidden');
+    ui.listenerPlaybackBanner.classList.add('hidden');
+    ui.listenerLocationRow.classList.add('hidden');
+    // При восстановлении после перезагрузки QR можно свернуть, если уже есть подключённые устройства
+    ui.qrPanel.classList.toggle('hidden', isResumed && restoredPeers.length > 0);
+
+    setStatusMetric('Активна', 'metric-good');
+    ui.metricRtt.textContent = '0 мс';
+    ui.metricDrift.textContent = '0 мс';
+
+    state.peers = restoredPeers;
+    state.selectedDeviceIds.clear();
+    state.hostPlayback = { trackId: null, playing: false, hostStartTime: 0, trackOffset: 0 };
+
+    startHostSessionHeartbeat();
+    sendLocalLatencyToHost();
+    network.broadcastVolume({ volume: audio.volume, muted: audio.muted });
+    renderPlaylist();
+    renderPeerList(state.peers);
+    showView('room');
+    ensureFloorMapInitialized();
+    refreshHostPlayerForSelection();
+    startRenderLoop();
+    requestNativeWifiScanIfAvailable();
+  }
+
+  /* ==================== ЗАПУСК И ВОССТАНОВЛЕНИЕ ХОСТА ==================== */
 
   async function enterAsHost() {
     ui.btnCreateRoom.disabled = true;
@@ -461,56 +595,48 @@
       wakeLock.acquire();
 
       const code = await network.startHost();
-      state.role = 'host';
-      state.roomCode = code;
-      state.playlist = [];
-      state.activeTrackId = null;
-
-      clock = new ClockSync({ isHost: true });
-
-      const shareUrl = buildShareUrl(code);
-      window.history.replaceState({}, '', `?room=${code}`);
-      renderQR(shareUrl);
-
-      ui.roleBadge.textContent = 'ХОСТ';
-      ui.roleBadge.className = 'role-badge';
-      ui.displayRoomCode.textContent = NetworkManager.formatCode(code);
-      if (ui.appShell) ui.appShell.classList.add('is-host-room');
-
-      ui.hostShareActions.classList.remove('hidden');
-      ui.hostMapSection.classList.remove('hidden');
-      ui.zoneTargetBar.classList.remove('hidden');
-      ui.hostTrackSection.classList.remove('hidden');
-      ui.hostPlaybackControls.classList.remove('hidden');
-      ui.hostPeersSection.classList.remove('hidden');
-      ui.loopToggleWrap.classList.remove('hidden');
-      ui.listenerPlaybackBanner.classList.add('hidden');
-      ui.listenerLocationRow.classList.add('hidden');
-      ui.qrPanel.classList.remove('hidden');
-
-      setStatusMetric('Активна', 'metric-good');
-      ui.metricRtt.textContent = '0 мс';
-      ui.metricDrift.textContent = '0 мс';
-
-      state.peers = [];
-      state.selectedDeviceIds.clear();
-      state.hostPlayback = { trackId: null, playing: false, hostStartTime: 0, trackOffset: 0 };
-
-      sendLocalLatencyToHost();
-      network.broadcastVolume({ volume: audio.volume, muted: audio.muted });
-      renderPlaylist();
-      renderPeerList([]);
-      showView('room');
-      ensureFloorMapInitialized();
-      refreshHostPlayerForSelection();
-      startRenderLoop();
-      requestNativeWifiScanIfAvailable();
+      setupHostRoomUI(code, { isResumed: false, restoredPeers: [] });
       showToast(`Комната ${NetworkManager.formatCode(code)} создана`, 'success');
     } catch (err) {
       showToast(err.message || 'Не удалось создать комнату', 'error');
     } finally {
       ui.btnCreateRoom.disabled = false;
       ui.btnCreateRoom.textContent = 'Создать комнату';
+    }
+  }
+
+  async function resumeHostSession(session) {
+    try {
+      const res = await network.resumeHost(session.code, session.hostSecret);
+      // После F5 браузер может не разрешать AudioContext.resume() до первого клика — разблокируем мягко
+      audio.unlock().catch(() => {});
+      bindDeferredAudioUnlock();
+
+      const restoredPeers = Array.from(network.clients.values()).map((c) => ({
+        id: c.id,
+        label: c.label,
+        rttMs: c.rttMs,
+        status: c.status,
+        phase: c.phase,
+        progress: c.progress,
+        transport: c.transport,
+        transportLabel: c.transportLabel,
+        ready: c.phase === 'ready',
+        streaming: c.phase === 'streaming',
+        latencyMs: c.latency?.totalLatencyMs || 0,
+        isBluetooth: Boolean(c.latency?.isBluetooth),
+        outputDeviceLabel: c.latency?.outputDeviceLabel || '',
+        location: c.location || null,
+        playback: c.playback ? { ...c.playback } : { trackId: null, playing: false, hostStartTime: 0, trackOffset: 0 },
+        volumeState: c.volumeState ? { ...c.volumeState } : { volume: 1, muted: false },
+      }));
+
+      setupHostRoomUI(res.code, { isResumed: true, restoredPeers });
+      return true;
+    } catch (err) {
+      clearHostSession();
+      network.destroy(false);
+      return false;
     }
   }
 
@@ -1629,6 +1755,9 @@
 
   function leaveRoom() {
     clearPendingPlay();
+    if (state.role === 'host') {
+      clearHostSession();
+    }
     if (state.reconnectTimer) {
       clearTimeout(state.reconnectTimer);
       state.reconnectTimer = null;
@@ -1646,7 +1775,7 @@
     audio.buffer = null;
     audio.currentTrackId = null;
     audio.currentTrackDuration = 0;
-    network.destroy();
+    network.destroy(true);
     wakeLock.release();
 
     state.role = null;
@@ -2029,11 +2158,18 @@
 
   document.addEventListener('visibilitychange', async () => {
     if (document.visibilityState === 'visible' && state.role) {
+      touchHostSession();
       await audio.ensureResumed();
       audio.measureSystemLatency(true);
       if (clock && !clock.isHost) clock.reburst();
       if (audio.isPlaying) audio.checkDrift();
+    } else if (document.visibilityState === 'hidden' && state.role === 'host') {
+      touchHostSession();
     }
+  });
+
+  window.addEventListener('pagehide', () => {
+    if (state.role === 'host') touchHostSession();
   });
 
   ui.inputRoomCode.addEventListener('input', () => {
@@ -2050,25 +2186,55 @@
     setSelection,
     enterAsHost,
     enterAsListener,
+    leaveRoom,
     hostAddSynthTrack,
     hostSchedulePlay,
     hostPause,
     handleNativeWifiScan,
   };
 
-  const params = new URLSearchParams(window.location.search);
-  const hashMatch = window.location.hash.match(/room=([A-Za-z0-9-]+)/i);
-  const urlRoom = NetworkManager.normalizeCode(
-    window.__initialRoomCode || params.get('room') || (hashMatch ? hashMatch[1] : '')
-  );
-  if (urlRoom.length >= 4) {
-    const formatted = NetworkManager.formatCode(urlRoom);
-    ui.inviteRoomCode.textContent = formatted;
-    ui.inviteRoomCode.dataset.code = urlRoom;
-    ui.inputRoomCode.value = formatted;
-    ui.btnUnlockAndJoin.textContent = `Подключиться к ${formatted}`;
-    showView('invite');
-  } else {
+  async function bootstrapInitialView() {
+    const params = new URLSearchParams(window.location.search);
+    const hashMatch = window.location.hash.match(/room=([A-Za-z0-9-]+)/i);
+    const urlRoom = NetworkManager.normalizeCode(
+      window.__initialRoomCode || params.get('room') || (hashMatch ? hashMatch[1] : '')
+    );
+
+    // 1. Если в этом браузере есть активная хост-сессия (< 5 минут) и URL пуст или указывает на эту же комнату —
+    //    автоматически восстанавливаем комнату Хоста (НЕ предлагаем «Создать комнату» и НЕ кидаем в приглашение!).
+    const savedHost = window.__resumeHostSession || loadHostSession();
+    if (savedHost && (!urlRoom || urlRoom === savedHost.code)) {
+      const ok = await resumeHostSession(savedHost);
+      if (ok) return;
+      // Комната на сервере уже истекла (> 5 мин) — очищаем URL и показываем главное меню
+      if (urlRoom) {
+        window.history.replaceState({}, '', window.location.pathname);
+      }
+      showView('landing');
+      return;
+    }
+
+    // 2. Если перешли по ссылке ?room=CODE (на телефоне или другом устройстве) —
+    //    СНАЧАЛА проверяем на сервере, существует ли комната!
+    //    Если комнаты нет -> сразу перебрасываем в главное меню; если есть -> предлагаем подключиться.
+    if (urlRoom.length >= 4) {
+      const check = await network.checkRoomExists(urlRoom);
+      if (check.exists === false) {
+        window.history.replaceState({}, '', window.location.pathname);
+        showView('landing');
+        return;
+      }
+      const formatted = NetworkManager.formatCode(urlRoom);
+      ui.inviteRoomCode.textContent = formatted;
+      ui.inviteRoomCode.dataset.code = urlRoom;
+      ui.inputRoomCode.value = formatted;
+      ui.btnUnlockAndJoin.textContent = `Подключиться к ${formatted}`;
+      showView('invite');
+      return;
+    }
+
     showView('landing');
   }
+
+  bootstrapInitialView();
 })();

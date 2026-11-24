@@ -29,7 +29,8 @@ from wifi_locator import DeviceWifiTracker, MultiSiteWifiLocator
 PORT = int(os.environ.get("PORT", "8765"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "60")) * 1024 * 1024
-ROOM_IDLE_TTL_SEC = 7200  # 2 часа
+ROOM_IDLE_TTL_SEC = 7200   # 2 часа неактивности
+HOST_GRACE_TTL_SEC = 300   # 5 минут после ухода/перезагрузки Хоста, пока комната сохраняется
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
@@ -45,12 +46,14 @@ def normalize_code(raw: str) -> str:
 
 
 class Room:
-    def __init__(self, code: str, host_id: str, host_ws: web.WebSocketResponse, host_name: str):
+    def __init__(self, code: str, host_id: str, host_ws: web.WebSocketResponse, host_name: str, host_secret: Optional[str] = None):
         self.code = code
         self.host_id = host_id
-        self.host_ws = host_ws
+        self.host_ws: Optional[web.WebSocketResponse] = host_ws
         self.host_name = host_name
-        self.listeners: Dict[str, dict] = {}  # peer_id -> { ws, deviceName }
+        self.host_secret = host_secret or secrets.token_hex(16)
+        self.host_disconnected_at: Optional[float] = None
+        self.listeners: Dict[str, dict] = {}  # peer_id -> { ws, deviceName, location }
         self.tracks: Dict[str, dict] = {}     # track_id -> { data: bytes, mime: str, name: str, ts: float }
         self.segments: Dict[str, dict] = {}   # seg_key -> { data: bytes, ts: float }
         self.created_at = time.time()
@@ -58,6 +61,17 @@ class Room:
 
     def touch(self):
         self.last_activity = time.time()
+
+    def is_host_online(self) -> bool:
+        return bool(self.host_ws is not None and not self.host_ws.closed)
+
+    def is_expired(self, now: Optional[float] = None) -> bool:
+        t = now if now is not None else time.time()
+        if self.host_disconnected_at is not None and (t - self.host_disconnected_at) >= HOST_GRACE_TTL_SEC:
+            return True
+        if (t - self.last_activity) > ROOM_IDLE_TTL_SEC:
+            return True
+        return False
 
     def prune_segments(self):
         if len(self.segments) > 24:
@@ -80,18 +94,20 @@ class OrpheusServer:
         except Exception:
             pass
 
+    async def _close_room(self, room: Room):
+        if self.rooms.get(room.code) is room:
+            self.rooms.pop(room.code, None)
+        tasks = [self.safe_send(l["ws"], {"t": "HOST_LEFT"}) for l in list(room.listeners.values())]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def cleanup_loop(self):
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(10)
             now = time.time()
-            dead = [
-                code
-                for code, room in self.rooms.items()
-                if (room.host_ws.closed and len(room.listeners) == 0)
-                or (now - room.last_activity > ROOM_IDLE_TTL_SEC)
-            ]
-            for code in dead:
-                self.rooms.pop(code, None)
+            expired = [room for room in list(self.rooms.values()) if room.is_expired(now)]
+            for room in expired:
+                await self._close_room(room)
 
     # ==================== HTTP API ====================
 
@@ -108,6 +124,24 @@ class OrpheusServer:
 
     async def handle_sites(self, request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "sites": self.wifi_locator.list_sites()})
+
+    async def handle_room_exists(self, request: web.Request) -> web.Response:
+        code = normalize_code(request.match_info["code"])
+        room = self.rooms.get(code)
+        if room and room.is_expired():
+            await self._close_room(room)
+            room = None
+        if not room:
+            return web.json_response({"ok": True, "exists": False, "code": code})
+        return web.json_response(
+            {
+                "ok": True,
+                "exists": True,
+                "code": room.code,
+                "hostOnline": room.is_host_online(),
+                "listeners": len(room.listeners),
+            }
+        )
 
     async def handle_locate(self, request: web.Request) -> web.Response:
         try:
@@ -236,6 +270,7 @@ class OrpheusServer:
         peer_id = secrets.token_hex(6)
         room: Optional[Room] = None
         wifi_tracker = DeviceWifiTracker()
+        explicit_close = False
 
         try:
             async for msg in ws:
@@ -250,23 +285,102 @@ class OrpheusServer:
 
                 mtype = data.get("t")
 
-                if mtype == "CREATE_ROOM":
-                    # Закрываем старую комнату если была
+                if mtype == "CREATE_ROOM" or mtype == "RESUME_HOST":
                     preferred = normalize_code(data.get("code", ""))
+                    req_secret = str(data.get("hostSecret") or "").strip()
+                    device_name = str(data.get("deviceName") or "Хост")[:48]
+
+                    existing = self.rooms.get(preferred) if len(preferred) >= 4 else None
+                    if existing and existing.is_expired():
+                        await self._close_room(existing)
+                        existing = None
+
+                    if existing and req_secret and existing.host_secret == req_secret:
+                        # Бесшовное восстановление существующей комнаты Хоста (например, после F5 или возврата в течение 5 мин)
+                        old_ws = existing.host_ws
+                        existing.host_id = peer_id
+                        existing.host_ws = ws
+                        existing.host_name = device_name
+                        existing.host_disconnected_at = None
+                        existing.touch()
+                        room = existing
+                        role = "host"
+                        if old_ws and old_ws is not ws and not old_ws.closed:
+                            try:
+                                await old_ws.close()
+                            except Exception:
+                                pass
+
+                        listeners_snapshot = [
+                            {
+                                "peerId": lid,
+                                "deviceName": l.get("deviceName") or "Устройство",
+                                "location": l.get("location"),
+                            }
+                            for lid, l in room.listeners.items()
+                            if l.get("ws") and not l["ws"].closed
+                        ]
+                        await self.safe_send(
+                            ws,
+                            {
+                                "t": "ROOM_CREATED",
+                                "code": room.code,
+                                "peerId": peer_id,
+                                "hostSecret": room.host_secret,
+                                "resumed": True,
+                                "listeners": listeners_snapshot,
+                            },
+                        )
+                        # Сообщаем уже подключённым слушателям, что Хост вернулся (пересинхронизируют часы и задержки)
+                        notify_tasks = [
+                            self.safe_send(
+                                l["ws"],
+                                {"t": "HOST_RECONNECTED", "hostPeerId": peer_id, "hostDeviceName": device_name},
+                            )
+                            for l in list(room.listeners.values())
+                        ]
+                        if notify_tasks:
+                            await asyncio.gather(*notify_tasks, return_exceptions=True)
+                        continue
+
+                    if mtype == "RESUME_HOST":
+                        await self.safe_send(
+                            ws,
+                            {
+                                "t": "RESUME_ERROR",
+                                "code": preferred,
+                                "message": "Комната уже закрыта или истекла",
+                            },
+                        )
+                        continue
+
+                    # Создаём новую комнату
                     code = preferred if (len(preferred) >= 4 and preferred not in self.rooms) else generate_code()
                     while code in self.rooms:
                         code = generate_code()
 
-                    device_name = str(data.get("deviceName") or "Хост")[:48]
-                    room = Room(code, peer_id, ws, device_name)
+                    room = Room(code, peer_id, ws, device_name, req_secret or None)
                     self.rooms[code] = room
                     role = "host"
-                    await self.safe_send(ws, {"t": "ROOM_CREATED", "code": code, "peerId": peer_id})
+                    await self.safe_send(
+                        ws,
+                        {
+                            "t": "ROOM_CREATED",
+                            "code": code,
+                            "peerId": peer_id,
+                            "hostSecret": room.host_secret,
+                            "resumed": False,
+                            "listeners": [],
+                        },
+                    )
 
                 elif mtype == "JOIN_ROOM":
                     code = normalize_code(data.get("code", ""))
                     target = self.rooms.get(code)
-                    if not target or target.host_ws.closed:
+                    if target and target.is_expired():
+                        await self._close_room(target)
+                        target = None
+                    if not target:
                         await self.safe_send(
                             ws,
                             {
@@ -279,7 +393,7 @@ class OrpheusServer:
                     device_name = str(data.get("deviceName") or "Устройство")[:48]
                     room = target
                     role = "listener"
-                    room.listeners[peer_id] = {"ws": ws, "deviceName": device_name}
+                    room.listeners[peer_id] = {"ws": ws, "deviceName": device_name, "location": None}
                     room.touch()
 
                     await self.safe_send(
@@ -355,6 +469,8 @@ class OrpheusServer:
                         await self.safe_send(ws, {"t": "LOCATION_UPDATE", "location": loc})
                         if room and role == "listener":
                             room.touch()
+                            if peer_id in room.listeners:
+                                room.listeners[peer_id]["location"] = loc
                             await self.safe_send(
                                 room.host_ws,
                                 {
@@ -373,6 +489,10 @@ class OrpheusServer:
                             },
                         )
 
+                elif mtype == "CLOSE_ROOM":
+                    explicit_close = True
+                    break
+
                 elif mtype == "LEAVE":
                     break
 
@@ -382,9 +502,12 @@ class OrpheusServer:
                     room.listeners.pop(peer_id, None)
                     await self.safe_send(room.host_ws, {"t": "PEER_LEFT", "peerId": peer_id})
                 elif role == "host" and room.host_id == peer_id:
-                    for l in list(room.listeners.values()):
-                        await self.safe_send(l["ws"], {"t": "HOST_LEFT"})
-                    self.rooms.pop(room.code, None)
+                    if explicit_close:
+                        await self._close_room(room)
+                    else:
+                        # Хост перезагрузил страницу или временно ушёл: держим комнату живой 5 минут!
+                        room.host_ws = None
+                        room.host_disconnected_at = time.time()
 
         return ws
 
@@ -424,6 +547,7 @@ def create_app() -> web.Application:
     app.router.add_get("/health", srv.handle_health)
     app.router.add_get("/api/sites", srv.handle_sites)
     app.router.add_post("/api/locate", srv.handle_locate)
+    app.router.add_get("/api/rooms/{code}/exists", srv.handle_room_exists)
     app.router.add_get("/ws", srv.handle_ws)
     app.router.add_put("/api/rooms/{code}/tracks/{track_id}", srv.handle_put_track)
     app.router.add_get("/api/rooms/{code}/tracks/{track_id}", srv.handle_get_track)

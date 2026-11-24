@@ -10,18 +10,20 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   <title>Orpheus Sync — Синхронная музыка</title>
   <link rel="preconnect" href="https://158.160.205.107" crossorigin />
-  <link rel="stylesheet" href="styles.css?v=19" />
+  <link rel="stylesheet" href="styles.css?v=20" />
   <script defer src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js" onerror="var s=document.createElement('script');s.src='https://unpkg.com/qrcode-generator@1.4.4/qrcode.min.js';document.head.appendChild(s);"></script>
-  <script defer src="js/wake-lock.js?v=19"></script>
-  <script defer src="js/clock-sync.js?v=19"></script>
-  <script defer src="js/audio-engine.js?v=19"></script>
-  <script defer src="js/network.js?v=19"></script>
-  <script defer src="js/floor-map.js?v=19"></script>
-  <script defer src="js/app.js?v=19"></script>
+  <script defer src="js/wake-lock.js?v=20"></script>
+  <script defer src="js/clock-sync.js?v=20"></script>
+  <script defer src="js/audio-engine.js?v=20"></script>
+  <script defer src="js/network.js?v=20"></script>
+  <script defer src="js/floor-map.js?v=20"></script>
+  <script defer src="js/app.js?v=20"></script>
 </head>
 <body>
   <script>
-    // Мгновенно (до отрисовки) определяем ?room=CODE в ссылке, чтобы сразу показать экран подключения без «Создать комнату»
+    // Мгновенно (до отрисовки) определяем:
+    // 1) Есть ли сохранённая активная хост-сессия (< 5 мин) в этом браузере -> сразу восстанавливаем комнату Хоста без «Создать комнату»
+    // 2) Иначе если открыта ссылка ?room=CODE -> скрываем стартовый экран до быстрой проверки существования комнаты на сервере
     (function () {
       try {
         var params = new URLSearchParams(window.location.search);
@@ -31,9 +33,24 @@
           if (m) raw = m[1];
         }
         var clean = raw.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+
+        var hostRaw = localStorage.getItem('orpheus_host_session_v1');
+        if (hostRaw) {
+          var hs = JSON.parse(hostRaw);
+          var ageMs = Date.now() - Number(hs && hs.savedAt || 0);
+          var hsCode = String(hs && hs.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+          if (hsCode.length >= 4 && hs.hostSecret && ageMs >= 0 && ageMs < 5 * 60 * 1000) {
+            if (!clean || clean === hsCode) {
+              window.__resumeHostSession = { code: hsCode, hostSecret: String(hs.hostSecret) };
+              document.documentElement.classList.add('is-checking-room');
+              return;
+            }
+          }
+        }
+
         if (clean.length >= 4) {
           window.__initialRoomCode = clean;
-          document.documentElement.classList.add('has-invite-room');
+          document.documentElement.classList.add('is-checking-room');
         }
       } catch (_) {}
     })();

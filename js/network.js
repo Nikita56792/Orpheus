@@ -53,6 +53,7 @@ class NetworkManager {
     this.cb = callbacks;
     this.role = null;
     this.roomCode = null;
+    this.hostSecret = null;
     this.selfId = NetworkManager.generatePeerId();
     this.deviceName = NetworkManager.detectDeviceName();
 
@@ -511,10 +512,35 @@ class NetworkManager {
 
   /* ==================== ХОСТ ==================== */
 
-  async startHost(preferredCode = null) {
-    this.destroy();
+  async checkRoomExists(rawCode) {
+    const code = NetworkManager.normalizeCode(rawCode);
+    if (code.length < 4) return { exists: false, code };
+    try {
+      const serverUrl = await this._resolveServerUrl();
+      if (!serverUrl) return { exists: null, code };
+      const resp = await fetch(`${serverUrl}/api/rooms/${encodeURIComponent(code)}/exists`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(2500),
+      });
+      if (!resp.ok) return { exists: null, code };
+      const data = await resp.json();
+      if (data && data.ok && typeof data.exists === 'boolean') {
+        return {
+          exists: data.exists,
+          code: data.code || code,
+          hostOnline: Boolean(data.hostOnline),
+          listeners: Number(data.listeners || 0),
+        };
+      }
+    } catch (_) {}
+    return { exists: null, code };
+  }
+
+  async startHost(preferredCode = null, hostSecret = null) {
+    this.destroy(false);
     this.role = 'host';
     this.selfId = NetworkManager.generatePeerId();
+    this.hostSecret = hostSecret || null;
     const wantedCode = preferredCode
       ? NetworkManager.normalizeCode(preferredCode)
       : NetworkManager.generateRoomCode();
@@ -523,8 +549,8 @@ class NetworkManager {
     const serverUrl = await this._resolveServerUrl();
     if (serverUrl) {
       try {
-        const code = await this._startHostOnServer(serverUrl, wantedCode);
-        return code;
+        const res = await this._startHostOnServer(serverUrl, wantedCode, this.hostSecret, false);
+        return res.code;
       } catch (err) {
         console.warn('[Network/Host] Dedicated server failed, falling back to P2P cluster:', err);
         this._closeServerWs();
@@ -537,7 +563,25 @@ class NetworkManager {
     return wantedCode;
   }
 
-  async _startHostOnServer(serverUrl, wantedCode) {
+  async resumeHost(code, hostSecret) {
+    const clean = NetworkManager.normalizeCode(code);
+    if (clean.length < 4 || !hostSecret) {
+      throw new Error('Нет данных для восстановления комнаты');
+    }
+    this.destroy(false);
+    this.role = 'host';
+    this.selfId = NetworkManager.generatePeerId();
+    this.hostSecret = hostSecret;
+
+    const serverUrl = await this._resolveServerUrl();
+    if (!serverUrl) {
+      throw new Error('Сервер недоступен');
+    }
+    const res = await this._startHostOnServer(serverUrl, clean, hostSecret, true);
+    return res;
+  }
+
+  async _startHostOnServer(serverUrl, wantedCode, hostSecret = null, resumeOnly = false) {
     const ws = await this._openServerWs(serverUrl, 4500);
     this._serverWs = ws;
     this._serverBaseUrl = serverUrl;
@@ -563,7 +607,29 @@ class NetworkManager {
           clearTimeout(timeout);
           this.roomCode = msg.code;
           this.selfId = msg.peerId || this.selfId;
-          resolve(msg.code);
+          this.hostSecret = msg.hostSecret || hostSecret || this.hostSecret;
+          // Если восстановились после перезагрузки страницы — сразу подхватываем подключённых слушателей!
+          if (Array.isArray(msg.listeners) && msg.listeners.length > 0) {
+            for (const l of msg.listeners) {
+              this._hostAddServerClient(l.peerId, l.deviceName || 'Устройство', l.location || null);
+            }
+          }
+          resolve({
+            code: msg.code,
+            hostSecret: this.hostSecret,
+            resumed: Boolean(msg.resumed),
+            listenersCount: Array.isArray(msg.listeners) ? msg.listeners.length : 0,
+          });
+          return;
+        }
+
+        if (msg.t === 'RESUME_ERROR' && !created) {
+          created = true;
+          clearTimeout(timeout);
+          this._closeServerWs();
+          const err = new Error(msg.message || 'Комната уже истекла');
+          err._roomExpired = true;
+          reject(err);
           return;
         }
 
@@ -577,15 +643,16 @@ class NetworkManager {
           reject(new Error('Соединение с сервером разорвано'));
           return;
         }
-        // Авто-переподключение Хоста к серверу с тем же кодом комнаты
+        // Авто-переподключение Хоста к серверу с тем же кодом и секретом комнаты
         if (this.role === 'host' && this._serverMode && this.roomCode) {
           const keepCode = this.roomCode;
+          const keepSecret = this.hostSecret;
           this._serverReconnectTimer = setTimeout(async () => {
             if (this.role !== 'host' || this.roomCode !== keepCode) return;
             try {
               const freshUrl = await this._resolveServerUrl();
               if (freshUrl && this.role === 'host') {
-                await this._startHostOnServer(freshUrl, keepCode);
+                await this._startHostOnServer(freshUrl, keepCode, keepSecret, false);
               }
             } catch (_) {}
           }, 2500);
@@ -593,8 +660,9 @@ class NetworkManager {
       };
 
       this._sendServerWs({
-        t: 'CREATE_ROOM',
+        t: resumeOnly ? 'RESUME_HOST' : 'CREATE_ROOM',
         code: wantedCode,
+        hostSecret: hostSecret || undefined,
         deviceName: this.deviceName,
       });
     });
@@ -636,7 +704,7 @@ class NetworkManager {
     }
   }
 
-  _hostAddServerClient(peerId, deviceName) {
+  _hostAddServerClient(peerId, deviceName, initialLocation = null) {
     if (this.clients.has(peerId)) {
       this._hostRemoveClient(peerId, false);
     }
@@ -661,7 +729,7 @@ class NetworkManager {
       transferQueue: [],
       isSendingFile: false,
       latency: { totalLatencyMs: 0, systemLatencyMs: 0, isBluetooth: false, outputDeviceLabel: '' },
-      location: null,
+      location: initialLocation || null,
       playback: {
         trackId: this.activeTrackId,
         playing: false,
@@ -2194,6 +2262,18 @@ class NetworkManager {
           }
         } else if (msg.t === 'SIGNAL' && msg.data) {
           this._listenerHandleSignal({ ...msg.data, from: msg.from });
+        } else if (msg.t === 'HOST_RECONNECTED') {
+          this.hostPeerId = msg.hostPeerId || this.hostPeerId;
+          // Старый P2P-канал принадлежал прошлой вкладке Хоста — аккуратно переустанавливаем в фоне
+          if (this.hostPc) {
+            try { this.hostPc.close(); } catch (_) {}
+            this.hostPc = null;
+          }
+          this.hostChannels = { ntp: null, ctrl: null, stream: null, data: null };
+          this._listenerP2pReady = false;
+          this.hostTransport = 'server';
+          if (this.cb.onHostReconnected) this.cb.onHostReconnected();
+          this._startListenerBackgroundP2PUpgrade();
         } else if (msg.t === 'HOST_LEFT') {
           if (this._listenerConnected) {
             this._listenerConnected = false;
@@ -2961,9 +3041,13 @@ class NetworkManager {
     } catch (_) {}
   }
 
-  destroy() {
+  destroy(explicitClose = false) {
     if (this._serverMode) {
-      this._sendServerWs({ t: 'LEAVE' });
+      if (this.role === 'host' && explicitClose) {
+        this._sendServerWs({ t: 'CLOSE_ROOM' });
+      } else if (this.role === 'listener') {
+        this._sendServerWs({ t: 'LEAVE' });
+      }
     } else if (this.role === 'listener' && this.hostPeerId) {
       this._sendSignal({ sig: 'LEAVE', to: this.hostPeerId }).catch(() => {});
     }
@@ -2996,6 +3080,7 @@ class NetworkManager {
     this.activeTrackId = null;
     this.role = null;
     this.roomCode = null;
+    this.hostSecret = null;
   }
 }
 
