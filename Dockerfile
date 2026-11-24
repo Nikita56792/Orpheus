@@ -7,6 +7,8 @@ RUN pip install --no-cache-dir -r server/requirements.txt
 
 COPY index.html styles.css ./
 COPY js ./js
+COPY maps ./maps
+COPY dist ./dist
 COPY server ./server
 
 ENV HOST=0.0.0.0

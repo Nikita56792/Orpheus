@@ -626,6 +626,13 @@ class NetworkManager {
         }
         break;
       }
+
+      case 'LOCATION_UPDATE': {
+        if (this.cb.onLocalLocation) {
+          this.cb.onLocalLocation(msg.location || null, msg.totalAps || 0);
+        }
+        break;
+      }
     }
   }
 
@@ -654,6 +661,17 @@ class NetworkManager {
       transferQueue: [],
       isSendingFile: false,
       latency: { totalLatencyMs: 0, systemLatencyMs: 0, isBluetooth: false, outputDeviceLabel: '' },
+      location: null,
+      playback: {
+        trackId: this.activeTrackId,
+        playing: false,
+        hostStartTime: 0,
+        trackOffset: 0,
+      },
+      volumeState: {
+        volume: this.volumeState.volume,
+        muted: this.volumeState.muted,
+      },
       syncedOnce: true,
     };
     this.clients.set(peerId, client);
@@ -844,6 +862,17 @@ class NetworkManager {
       transferQueue: [],
       isSendingFile: false,
       latency: { totalLatencyMs: 0, systemLatencyMs: 0, isBluetooth: false, outputDeviceLabel: '' },
+      location: null,
+      playback: {
+        trackId: this.activeTrackId,
+        playing: false,
+        hostStartTime: 0,
+        trackOffset: 0,
+      },
+      volumeState: {
+        volume: this.volumeState.volume,
+        muted: this.volumeState.muted,
+      },
       syncedOnce: false,
     };
 
@@ -1088,8 +1117,18 @@ class NetworkManager {
         break;
       }
 
+      case 'DEVICE_LOCATION': {
+        client.location = msg.location || null;
+        if (this.cb.onPeerLocation) {
+          this.cb.onPeerLocation(client.id, client.location);
+        }
+        this._emitPeers();
+        break;
+      }
+
       case 'TRACK_PROGRESS': {
-        if (msg.trackId === this.activeTrackId) {
+        const expectedTrackId = client.playback?.trackId || this.activeTrackId;
+        if (msg.trackId === expectedTrackId) {
           const p = Math.max(0, Math.min(99, Math.round(msg.progress || 0)));
           client.progress = Math.max(client.progress, p);
           const streaming = client.streamReadyTracks.has(msg.trackId);
@@ -1107,18 +1146,20 @@ class NetworkManager {
 
       case 'TRACK_STREAM_READY': {
         client.streamReadyTracks.add(msg.trackId);
-        if (msg.trackId === this.activeTrackId && !client.readyTracks.has(msg.trackId)) {
+        const pb = client.playback || this.playbackState;
+        const expectedTrackId = pb?.trackId || this.activeTrackId;
+        if (msg.trackId === expectedTrackId && !client.readyTracks.has(msg.trackId)) {
           client.phase = 'streaming';
           client.progress = Math.max(client.progress, 12);
           client.status = `Поток · кэш ${client.progress}%`;
           this._emitPeers();
 
-          if (this.playbackState.playing && this.playbackState.trackId === msg.trackId) {
+          if (pb && pb.playing && pb.trackId === msg.trackId) {
             this._sendToClient(client, 'ctrl', {
               type: 'CMD_PLAY',
-              trackId: this.playbackState.trackId,
-              hostStartTime: this.playbackState.hostStartTime,
-              trackOffset: this.playbackState.trackOffset,
+              trackId: pb.trackId,
+              hostStartTime: pb.hostStartTime,
+              trackOffset: pb.trackOffset,
               roomMaxLatencyMs: this.roomLatencyState.roomMaxLatencyMs,
               isLateJoin: true,
             });
@@ -1150,18 +1191,20 @@ class NetworkManager {
       case 'TRACK_READY': {
         client.readyTracks.add(msg.trackId);
         client.streamReadyTracks.add(msg.trackId);
-        if (msg.trackId === this.activeTrackId) {
+        const pb = client.playback || this.playbackState;
+        const expectedTrackId = pb?.trackId || this.activeTrackId;
+        if (msg.trackId === expectedTrackId) {
           client.progress = 100;
           client.phase = 'ready';
           client.status = 'Готово';
           this._emitPeers();
 
-          if (this.playbackState.playing && this.playbackState.trackId === msg.trackId) {
+          if (pb && pb.playing && pb.trackId === msg.trackId) {
             this._sendToClient(client, 'ctrl', {
               type: 'CMD_PLAY',
-              trackId: this.playbackState.trackId,
-              hostStartTime: this.playbackState.hostStartTime,
-              trackOffset: this.playbackState.trackOffset,
+              trackId: pb.trackId,
+              hostStartTime: pb.hostStartTime,
+              trackOffset: pb.trackOffset,
               roomMaxLatencyMs: this.roomLatencyState.roomMaxLatencyMs,
               isLateJoin: true,
             });
@@ -1171,7 +1214,8 @@ class NetworkManager {
       }
 
       case 'TRACK_ERROR': {
-        if (msg.trackId === this.activeTrackId) {
+        const expectedTrackId = client.playback?.trackId || this.activeTrackId;
+        if (msg.trackId === expectedTrackId) {
           client.phase = 'error';
           client.status = 'Ошибка';
           this._emitPeers();
@@ -1274,42 +1318,116 @@ class NetworkManager {
       };
     }
 
-    this._broadcast('ctrl', {
-      type: 'PLAYLIST_STATE',
-      activeTrackId: this.activeTrackId,
-      tracks: this._serializePlaylistMeta(),
-    });
-
-    const activeTrack = this.playlist.find((t) => t.id === activeTrackId);
-    const nextTrack = this._getNextPlaylistTrack(activeTrackId);
-
-    // Если активен наш сервер — сразу пре-загружаем файл в RAM сервера, чтобы даже новые устройства забирали мгновенно!
-    if (this._serverMode && activeTrack && activeTrack.type === 'file' && activeTrack.buffer) {
-      this._ensureTrackUploadedToServer(activeTrack).catch(() => {});
-    }
-
-    for (const client of this.clients.values()) {
-      if (activeTrack) {
-        if (client.readyTracks.has(activeTrack.id)) {
-          client.progress = 100;
-          client.phase = 'ready';
-          client.status = 'Готово';
-        } else {
-          client.progress = 0;
-          client.phase = 'loading';
-          client.status = 'Загрузка 0%';
-        }
-        this._queueTrackForClient(client, activeTrack, true);
-      } else {
+    if (activeTrackId) {
+      this.assignTrackToTargets(activeTrackId, null);
+    } else {
+      this.updatePlaylistCatalog(tracks);
+      for (const client of this.clients.values()) {
+        client.playback = { trackId: null, playing: false, hostStartTime: 0, trackOffset: 0 };
         client.progress = 100;
         client.phase = 'ready';
         client.status = 'Готово';
       }
-      if (nextTrack && nextTrack.id !== activeTrackId) {
+      this._emitPeers();
+    }
+  }
+
+  updatePlaylistCatalog(tracks) {
+    this.playlist = tracks;
+    const meta = this._serializePlaylistMeta();
+    for (const client of this.clients.values()) {
+      const assignedId = client.playback?.trackId || this.activeTrackId;
+      this._sendToClient(client, 'ctrl', {
+        type: 'PLAYLIST_STATE',
+        activeTrackId: assignedId,
+        tracks: meta,
+      });
+    }
+    if (this._serverMode) {
+      for (const tr of tracks) {
+        if (tr.type === 'file' && tr.buffer && !tr._serverTrackUrl) {
+          this._ensureTrackUploadedToServer(tr).catch(() => {});
+        }
+      }
+    }
+  }
+
+  assignTrackToTargets(trackId, targetIds = null) {
+    const track = this.playlist.find((t) => t.id === trackId);
+    if (!track) return;
+    const isAll = !targetIds;
+    const idSet = targetIds ? new Set(targetIds) : null;
+
+    if (isAll) {
+      this.activeTrackId = trackId;
+      this.playbackState = {
+        playing: false,
+        hostStartTime: 0,
+        trackOffset: 0,
+        trackId,
+      };
+    }
+
+    if (this._serverMode && track.type === 'file' && track.buffer) {
+      this._ensureTrackUploadedToServer(track).catch(() => {});
+    }
+
+    const meta = this._serializePlaylistMeta();
+    const nextTrack = this._getNextPlaylistTrack(trackId);
+
+    for (const client of this.clients.values()) {
+      if (idSet && !idSet.has(client.id)) continue;
+
+      client.playback = {
+        trackId,
+        playing: false,
+        hostStartTime: 0,
+        trackOffset: 0,
+      };
+
+      this._sendToClient(client, 'ctrl', {
+        type: 'CMD_PAUSE',
+        trackOffset: 0,
+      });
+      this._sendToClient(client, 'ctrl', {
+        type: 'PLAYLIST_STATE',
+        activeTrackId: trackId,
+        tracks: meta,
+      });
+
+      if (client.readyTracks.has(track.id)) {
+        client.progress = 100;
+        client.phase = 'ready';
+        client.status = 'Готово';
+      } else {
+        client.progress = 0;
+        client.phase = 'loading';
+        client.status = 'Загрузка 0%';
+      }
+      this._queueTrackForClient(client, track, true);
+      if (nextTrack && nextTrack.id !== trackId && !client.readyTracks.has(nextTrack.id)) {
         this._queueTrackForClient(client, nextTrack, false);
       }
     }
     this._emitPeers();
+  }
+
+  getTargetLatencyStats(targetIds = null, includeHost = true) {
+    const idSet = targetIds ? new Set(targetIds) : null;
+    let maxLatencyMs = includeHost ? (this.hostLatencyProfile.totalLatencyMs || 0) : 0;
+    let maxRttMs = 0;
+    let count = includeHost ? 1 : 0;
+
+    for (const client of this.clients.values()) {
+      if (idSet && !idSet.has(client.id)) continue;
+      count++;
+      const lat = client.latency?.totalLatencyMs || 0;
+      if (lat > maxLatencyMs) maxLatencyMs = lat;
+      if (typeof client.rttMs === 'number' && client.rttMs > maxRttMs) {
+        maxRttMs = client.rttMs;
+      }
+    }
+    return { maxLatencyMs, maxRttMs, count };
   }
 
   async _ensureTrackUploadedToServer(track) {
@@ -1798,36 +1916,123 @@ class NetworkManager {
     });
   }
 
-  broadcastPlay({ hostStartTime, trackOffset, trackId }) {
-    this.playbackState = { playing: true, hostStartTime, trackOffset, trackId };
-    this._broadcast('ctrl', {
+  broadcastPlay({ hostStartTime, trackOffset, trackId, targetIds = null }) {
+    const isAll = !targetIds;
+    const idSet = targetIds ? new Set(targetIds) : null;
+    const targetTrack = this.playlist.find((t) => t.id === trackId);
+
+    if (isAll) {
+      this.playbackState = { playing: true, hostStartTime, trackOffset, trackId };
+    }
+
+    const cmd = {
       type: 'CMD_PLAY',
       hostStartTime,
       trackOffset,
       trackId,
       roomMaxLatencyMs: this.roomLatencyState.roomMaxLatencyMs,
-    });
-  }
-
-  broadcastPause({ trackOffset }) {
-    this.playbackState.playing = false;
-    this.playbackState.trackOffset = trackOffset;
-    this._broadcast('ctrl', {
-      type: 'CMD_PAUSE',
-      trackOffset,
-    });
-  }
-
-  broadcastVolume({ volume, muted }) {
-    this.volumeState = {
-      volume: Math.max(0, Math.min(1, Number(volume))),
-      muted: Boolean(muted),
     };
-    this._broadcast('ctrl', {
-      type: 'CMD_VOLUME',
-      volume: this.volumeState.volume,
-      muted: this.volumeState.muted,
-    });
+
+    for (const client of this.clients.values()) {
+      if (idSet && !idSet.has(client.id)) continue;
+      const trackChanged = client.playback?.trackId !== trackId;
+      client.playback = { playing: true, hostStartTime, trackOffset, trackId };
+
+      if (trackChanged && targetTrack) {
+        this._sendToClient(client, 'ctrl', {
+          type: 'PLAYLIST_STATE',
+          activeTrackId: trackId,
+          tracks: this._serializePlaylistMeta(),
+        });
+        if (!client.readyTracks.has(trackId)) {
+          client.progress = 0;
+          client.phase = 'loading';
+          client.status = 'Загрузка 0%';
+          this._queueTrackForClient(client, targetTrack, true);
+        }
+      }
+      if (!isAll) {
+        this._sendToClient(client, 'ctrl', cmd);
+      }
+    }
+
+    if (isAll) {
+      this._broadcast('ctrl', cmd);
+    }
+    this._emitPeers();
+  }
+
+  broadcastPause({ trackOffset, targetIds = null }) {
+    const isAll = !targetIds;
+    const idSet = targetIds ? new Set(targetIds) : null;
+
+    if (isAll) {
+      this.playbackState.playing = false;
+      this.playbackState.trackOffset = trackOffset;
+    }
+
+    const cmd = { type: 'CMD_PAUSE', trackOffset };
+    for (const client of this.clients.values()) {
+      if (idSet && !idSet.has(client.id)) continue;
+      if (!client.playback) {
+        client.playback = { trackId: this.activeTrackId, playing: false, hostStartTime: 0, trackOffset };
+      } else {
+        client.playback.playing = false;
+        client.playback.trackOffset = trackOffset;
+      }
+      if (!isAll) {
+        this._sendToClient(client, 'ctrl', cmd);
+      }
+    }
+
+    if (isAll) {
+      this._broadcast('ctrl', cmd);
+    }
+    this._emitPeers();
+  }
+
+  broadcastVolume({ volume, muted, targetIds = null }) {
+    const v = Math.max(0, Math.min(1, Number(volume)));
+    const m = Boolean(muted);
+    const isAll = !targetIds;
+    const idSet = targetIds ? new Set(targetIds) : null;
+
+    if (isAll) {
+      this.volumeState = { volume: v, muted: m };
+    }
+    const cmd = { type: 'CMD_VOLUME', volume: v, muted: m };
+    for (const client of this.clients.values()) {
+      if (idSet && !idSet.has(client.id)) continue;
+      client.volumeState = { volume: v, muted: m };
+      if (!isAll) this._sendToClient(client, 'ctrl', cmd);
+    }
+    if (isAll) {
+      this._broadcast('ctrl', cmd);
+    }
+  }
+
+  async sendWifiScan(aps, site = null) {
+    if (!aps || (Array.isArray(aps) && aps.length === 0)) return;
+    if (this._serverMode && this._serverWs && this._serverWs.readyState === WebSocket.OPEN) {
+      this._sendServerWs({ t: 'WIFI_SCAN', aps, site: site || undefined });
+      return;
+    }
+    // Fallback via REST API if WS is in fallback cluster mode
+    try {
+      const base = this._serverBaseUrl || NetworkManager.DEFAULT_SERVER_URL;
+      const resp = await fetch(`${base}/api/locate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ aps, site: site || undefined }),
+      });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const loc = data?.location || null;
+      if (this.cb.onLocalLocation) this.cb.onLocalLocation(loc, Array.isArray(aps) ? aps.length : 0);
+      if (loc && this.role === 'listener') {
+        this.sendToHost({ type: 'DEVICE_LOCATION', location: loc }, 'ctrl');
+      }
+    } catch (_) {}
   }
 
   _sendToClient(client, channelName, payload) {
@@ -1895,6 +2100,9 @@ class NetworkManager {
       latencyMs: c.latency?.totalLatencyMs || 0,
       isBluetooth: Boolean(c.latency?.isBluetooth),
       outputDeviceLabel: c.latency?.outputDeviceLabel || '',
+      location: c.location || null,
+      playback: c.playback ? { ...c.playback } : { trackId: this.activeTrackId, playing: false, hostStartTime: 0, trackOffset: 0 },
+      volumeState: c.volumeState ? { ...c.volumeState } : { ...this.volumeState },
     }));
     this.cb.onPeersChanged(list);
   }
@@ -1980,6 +2188,10 @@ class NetworkManager {
 
         if (msg.t === 'FROM_HOST' && msg.payload) {
           this._listenerHandleHostMessage(msg.payload);
+        } else if (msg.t === 'LOCATION_UPDATE') {
+          if (this.cb.onLocalLocation) {
+            this.cb.onLocalLocation(msg.location || null, msg.totalAps || 0);
+          }
         } else if (msg.t === 'SIGNAL' && msg.data) {
           this._listenerHandleSignal({ ...msg.data, from: msg.from });
         } else if (msg.t === 'HOST_LEFT') {

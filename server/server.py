@@ -24,6 +24,8 @@ from typing import Dict, Optional
 
 from aiohttp import web, WSMsgType
 
+from wifi_locator import DeviceWifiTracker, MultiSiteWifiLocator
+
 PORT = int(os.environ.get("PORT", "8765"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "60")) * 1024 * 1024
@@ -68,6 +70,7 @@ class OrpheusServer:
     def __init__(self):
         self.rooms: Dict[str, Room] = {}
         self.started_at = time.time()
+        self.wifi_locator = MultiSiteWifiLocator(ROOT_DIR)
 
     async def safe_send(self, ws: Optional[web.WebSocketResponse], payload: dict):
         if not ws or ws.closed:
@@ -99,8 +102,24 @@ class OrpheusServer:
                 "service": "orpheus-sync",
                 "rooms": len(self.rooms),
                 "uptimeSec": round(time.time() - self.started_at, 1),
+                "wifiSites": list(self.wifi_locator.sites.keys()),
             }
         )
+
+    async def handle_sites(self, request: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "sites": self.wifi_locator.list_sites()})
+
+    async def handle_locate(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+        aps = body.get("aps") if isinstance(body, dict) else None
+        preferred = body.get("site") if isinstance(body, dict) else None
+        if not aps:
+            return web.json_response({"ok": True, "location": None})
+        loc = self.wifi_locator.locate(aps, preferred_site=preferred)
+        return web.json_response({"ok": True, "location": loc})
 
     async def handle_put_track(self, request: web.Request) -> web.Response:
         code = normalize_code(request.match_info["code"])
@@ -216,6 +235,7 @@ class OrpheusServer:
         role: Optional[str] = None
         peer_id = secrets.token_hex(6)
         room: Optional[Room] = None
+        wifi_tracker = DeviceWifiTracker()
 
         try:
             async for msg in ws:
@@ -327,6 +347,32 @@ class OrpheusServer:
                         if listener:
                             await self.safe_send(listener["ws"], {"t": "SIGNAL", "from": peer_id, "data": sig_data})
 
+                elif mtype == "WIFI_SCAN":
+                    aps = data.get("aps")
+                    preferred = data.get("site")
+                    loc = self.wifi_locator.locate(aps, tracker=wifi_tracker, preferred_site=preferred)
+                    if loc:
+                        await self.safe_send(ws, {"t": "LOCATION_UPDATE", "location": loc})
+                        if room and role == "listener":
+                            room.touch()
+                            await self.safe_send(
+                                room.host_ws,
+                                {
+                                    "t": "FROM_PEER",
+                                    "from": peer_id,
+                                    "payload": {"type": "DEVICE_LOCATION", "location": loc},
+                                },
+                            )
+                    else:
+                        await self.safe_send(
+                            ws,
+                            {
+                                "t": "LOCATION_UPDATE",
+                                "location": None,
+                                "totalAps": len(self.wifi_locator.normalize_scan(aps)),
+                            },
+                        )
+
                 elif mtype == "LEAVE":
                     break
 
@@ -376,6 +422,8 @@ def create_app() -> web.Application:
     srv = OrpheusServer()
     app = web.Application(client_max_size=MAX_FILE_BYTES + 1024 * 1024, middlewares=[cors_middleware])
     app.router.add_get("/health", srv.handle_health)
+    app.router.add_get("/api/sites", srv.handle_sites)
+    app.router.add_post("/api/locate", srv.handle_locate)
     app.router.add_get("/ws", srv.handle_ws)
     app.router.add_put("/api/rooms/{code}/tracks/{track_id}", srv.handle_put_track)
     app.router.add_get("/api/rooms/{code}/tracks/{track_id}", srv.handle_get_track)

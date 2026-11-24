@@ -61,6 +61,8 @@ class AudioEngine {
     this.roomMaxLatencyMs = 0;
 
     this.lastDriftMs = 0;
+    this._driftStrikeCount = 0;
+    this._playingLatencyStrike = 0;
     this._lastReportedLatencySig = '';
     this._latencySamples = [];
     this._outlierStreak = 0;
@@ -335,8 +337,23 @@ class AudioEngine {
 
     const warmingUp = Date.now() - this._unlockAt < 2500;
     const minJump = warmingUp ? 10 : 18;
-    if (this.systemLatencyMs === 0 || Math.abs(measured - this.systemLatencyMs) >= minJump) {
+    const deltaLat = Math.abs(measured - this.systemLatencyMs);
+
+    if (this.isPlaying && !forceEmit && this.systemLatencyMs > 0) {
+      // Во время активного воспроизведения аппаратная задержка вывода не меняется сама по себе:
+      // фиксируем её, если не было реальной смены аудиовыхода (>= 70 мс три замера подряд).
+      if (deltaLat >= 70) {
+        this._playingLatencyStrike++;
+        if (this._playingLatencyStrike >= 3) {
+          this.systemLatencyMs = measured;
+          this._playingLatencyStrike = 0;
+        }
+      } else {
+        this._playingLatencyStrike = 0;
+      }
+    } else if (this.systemLatencyMs === 0 || deltaLat >= minJump) {
       this.systemLatencyMs = measured;
+      this._playingLatencyStrike = 0;
     }
 
     const newTotal = this.getTotalOutputLatencyMs();
@@ -347,7 +364,7 @@ class AudioEngine {
       this._lastReportedLatencySig = sig;
       this.onLatencyChange(profile);
 
-      if (this.isPlaying && this.hasPlayableAudio() && Math.abs(newTotal - prevTotal) >= 18) {
+      if (this.isPlaying && this.hasPlayableAudio() && Math.abs(newTotal - prevTotal) >= 65) {
         this._stopSourceNode(true);
         this._startSourceAligned();
       }
@@ -800,6 +817,8 @@ class AudioEngine {
     this._getHostTimeFn = getHostTime;
     this.isPlaying = true;
     this.lastDriftMs = 0;
+    this._driftStrikeCount = 0;
+    this._playingLatencyStrike = 0;
     this._requestedNextSegAt = -1;
 
     this._startSourceAligned();
@@ -1058,17 +1077,40 @@ class AudioEngine {
 
     const absDrift = Math.abs(driftMs);
 
-    if (absDrift <= 8) {
+    // Защита от искажения тональности (pitch wobble):
+    // 1) Никогда не меняем playbackRate при обычном джиттере (<= 35 мс) — чистый 1.000x без изменения тональности.
+    // 2) При устойчивом реальном дрейфе (35..140 мс три проверки подряд) используем неслышимую микро-подстройку
+    //    ±0.15% (~2.5 цента, ниже порога слухового восприятия высоты тона) вместо заметных ±1.5%.
+    // 3) При реальном крупном сдвиге (> 140 мс два раза подряд) делаем чистую пересинхронизацию с кроссфейдом.
+    if (absDrift <= 18) {
+      this._driftStrikeCount = 0;
       if (this.currentRate !== 1.0) this._setPlaybackRate(1.0);
       this.onDrift(driftMs, 'locked');
+    } else if (absDrift <= 35) {
+      this._driftStrikeCount = 0;
+      if (this.currentRate !== 1.0 && absDrift <= 22) {
+        this._setPlaybackRate(1.0);
+      }
+      this.onDrift(driftMs, 'locked');
     } else if (absDrift <= 140) {
-      const correctionRate = driftMs > 0 ? 0.985 : 1.015;
-      this._setPlaybackRate(correctionRate);
-      this.onDrift(driftMs, 'nudging');
+      this._driftStrikeCount++;
+      if (this._driftStrikeCount >= 3) {
+        const correctionRate = driftMs > 0 ? 0.9985 : 1.0015;
+        this._setPlaybackRate(correctionRate);
+        this.onDrift(driftMs, 'nudging');
+      } else {
+        this.onDrift(driftMs, 'locked');
+      }
     } else {
-      this._stopSourceNode(true);
-      this._startSourceAligned();
-      this.onDrift(driftMs, 'resynced');
+      this._driftStrikeCount++;
+      if (this._driftStrikeCount >= 2) {
+        this._driftStrikeCount = 0;
+        this._stopSourceNode(true);
+        this._startSourceAligned();
+        this.onDrift(driftMs, 'resynced');
+      } else {
+        this.onDrift(driftMs, 'nudging');
+      }
     }
   }
 

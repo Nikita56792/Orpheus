@@ -169,15 +169,18 @@ class ClockSync {
         : 0;
     this.jitterMs = spread / 2;
 
-    if (!this.synced || this.samples.length <= 4) {
+    if (!this.synced || this.samples.length <= 5) {
       this.offsetMs = avgOffset;
     } else {
       const diff = avgOffset - this.offsetMs;
-      if (Math.abs(diff) > 100) {
+      if (Math.abs(diff) > 150) {
+        // Реальный скачок маршрута/часов — перезахват
         this.offsetMs = avgOffset;
-      } else {
-        this.offsetMs += diff * 0.28;
+      } else if (Math.abs(diff) > 15) {
+        // Очень мягкая подстройка медленного дрейфа кварца, игнорируя обычный Wi-Fi джиттер <= 15 мс
+        this.offsetMs += diff * 0.04;
       }
+      // При |diff| <= 15 мс — не дёргаем offsetMs, чтобы исключить ложные микро-рассинхроны и плавание тональности!
     }
 
     this.rttMs = avgRtt;

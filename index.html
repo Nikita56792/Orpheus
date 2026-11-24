@@ -10,13 +10,14 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   <title>Orpheus Sync — Синхронная музыка</title>
   <link rel="preconnect" href="https://158.160.205.107" crossorigin />
-  <link rel="stylesheet" href="styles.css?v=18" />
+  <link rel="stylesheet" href="styles.css?v=19" />
   <script defer src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js" onerror="var s=document.createElement('script');s.src='https://unpkg.com/qrcode-generator@1.4.4/qrcode.min.js';document.head.appendChild(s);"></script>
-  <script defer src="js/wake-lock.js?v=18"></script>
-  <script defer src="js/clock-sync.js?v=18"></script>
-  <script defer src="js/audio-engine.js?v=18"></script>
-  <script defer src="js/network.js?v=18"></script>
-  <script defer src="js/app.js?v=18"></script>
+  <script defer src="js/wake-lock.js?v=19"></script>
+  <script defer src="js/clock-sync.js?v=19"></script>
+  <script defer src="js/audio-engine.js?v=19"></script>
+  <script defer src="js/network.js?v=19"></script>
+  <script defer src="js/floor-map.js?v=19"></script>
+  <script defer src="js/app.js?v=19"></script>
 </head>
 <body>
   <script>
@@ -161,7 +162,10 @@
           <div class="qr-info">
             <p class="qr-title">Сканируйте для входа</p>
             <input id="shareLinkInput" class="input share-input" type="text" readonly />
-            <p class="hint">Новые устройства подключаются и синхронизируются автоматически даже во время игры.</p>
+            <p class="hint">
+              Новые устройства подключаются и синхронизируются автоматически даже во время игры.
+              <a class="listener-apk-link" href="dist/orpheus-sync.apk" download>Android APK (Wi-Fi карта)</a>
+            </p>
           </div>
         </div>
 
@@ -182,165 +186,221 @@
         </div>
       </section>
 
-      <!-- Плеер -->
-      <section class="card player-card">
-        <div class="track-header">
-          <div class="track-info">
-            <div class="track-title" id="trackTitle">Плейлист пуст</div>
-            <div class="track-sub" id="trackSub">Добавьте треки ниже</div>
-          </div>
-          <div class="countdown-badge hidden" id="countdownBadge">2.5с</div>
+      <!-- Рабочая область комнаты (2 колонки на широком экране для Хоста: Карта + Плеер) -->
+      <div class="room-workspace" id="roomWorkspace">
+        <div class="room-col-primary">
+          <!-- Интерактивная многоэтажная карта здания (только Хост) -->
+          <section id="hostMapSection" class="card map-card hidden">
+            <div class="map-header">
+              <div class="map-title-group">
+                <h3>Карта здания</h3>
+                <div class="segmented-control" role="tablist" aria-label="Выбор здания">
+                  <button type="button" class="seg-btn active" data-site="rekordov15">Рекордов 15</button>
+                  <button type="button" class="seg-btn" data-site="gmc">ГМЦ</button>
+                </div>
+              </div>
+              <div class="map-toolbar">
+                <button type="button" class="btn btn-secondary btn-xs" id="btnMapSelectAll">Выбрать всех</button>
+                <button type="button" class="btn btn-ghost btn-xs hidden" id="btnMapClearSel">Снять</button>
+              </div>
+            </div>
+
+            <div class="map-subbar">
+              <div class="floor-pills" id="mapFloorPills"></div>
+              <span class="map-hint">Выделяйте рамкой по этажам или кликайте с Shift/Cmd</span>
+            </div>
+
+            <div class="floor-grid" id="mapFloorGrid"></div>
+
+            <div class="map-unlocated-wrap hidden" id="mapUnlocatedWrap">
+              <div class="map-unlocated-label">Устройства вне плана (без Wi-Fi скана):</div>
+              <div class="map-unlocated-list" id="mapUnlocatedList"></div>
+            </div>
+          </section>
+
+          <!-- Устройства в сети с живыми процентами загрузки и зонами (только Хост) -->
+          <section id="hostPeersSection" class="card hidden">
+            <div class="section-head">
+              <h3>Устройства <span class="count-muted" id="peerCount">0</span></h3>
+              <span class="hint mono" id="peersOverallProgress">Ожидание</span>
+            </div>
+            <ul id="peerList" class="peer-list">
+              <li class="peer-empty">Пока никто не подключился. Покажите QR-код или отправьте ссылку.</li>
+            </ul>
+          </section>
         </div>
 
-        <!-- Прогресс загрузки трека -->
-        <div id="transferWrap" class="transfer-wrap hidden">
-          <div class="transfer-head">
-            <span id="transferLabel">Загрузка...</span>
-            <span class="mono" id="transferPct">0%</span>
-          </div>
-          <div class="progress-bar-bg">
-            <div class="progress-bar-fill" id="transferBar" style="width: 0%"></div>
-          </div>
+        <div class="room-col-controls">
+          <!-- Плеер -->
+          <section class="card player-card">
+            <!-- Баннер активного выделения (Хост) -->
+            <div id="zoneTargetBar" class="zone-target-bar hidden">
+              <div class="zone-target-info">
+                <span class="zone-target-dot" id="zoneTargetDot"></span>
+                <span id="zoneTargetText">Все устройства</span>
+              </div>
+              <div class="zone-target-actions">
+                <button type="button" class="zone-chip-btn" id="btnToggleHostTarget" title="Включить или исключить звук на самом Хосте">Хост</button>
+                <button type="button" class="zone-chip-btn hidden" id="btnZoneResetAll">Все</button>
+              </div>
+            </div>
+
+            <div class="track-header">
+              <div class="track-info">
+                <div class="track-title" id="trackTitle">Плейлист пуст</div>
+                <div class="track-sub" id="trackSub">Добавьте треки ниже</div>
+              </div>
+              <div class="countdown-badge hidden" id="countdownBadge">0.5с</div>
+            </div>
+
+            <!-- Прогресс загрузки трека -->
+            <div id="transferWrap" class="transfer-wrap hidden">
+              <div class="transfer-head">
+                <span id="transferLabel">Загрузка...</span>
+                <span class="mono" id="transferPct">0%</span>
+              </div>
+              <div class="progress-bar-bg">
+                <div class="progress-bar-fill" id="transferBar" style="width: 0%"></div>
+              </div>
+            </div>
+
+            <!-- Визуализатор -->
+            <div class="visualizer-wrap">
+              <canvas id="visualizerCanvas" width="600" height="80"></canvas>
+            </div>
+
+            <!-- Полоса прогресса -->
+            <div class="seek-wrap">
+              <span class="time-label mono" id="timeCurrent">0:00</span>
+              <input
+                id="seekSlider"
+                class="range-slider"
+                type="range"
+                min="0"
+                max="100"
+                step="0.1"
+                value="0"
+                disabled
+              />
+              <span class="time-label mono" id="timeDuration">0:00</span>
+            </div>
+
+            <!-- Управление (Хост) -->
+            <div id="hostPlaybackControls" class="playback-controls hidden">
+              <button id="btnPrevTrack" class="btn btn-secondary btn-circle" type="button" title="Предыдущий трек" disabled>
+                <svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor">
+                  <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" />
+                </svg>
+              </button>
+
+              <button id="btnPlayPause" class="btn btn-primary btn-play" type="button" disabled>
+                <svg id="iconPlay" viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
+                  <polygon points="7 4 20 12 7 20 7 4" />
+                </svg>
+                <svg id="iconPause" class="hidden" viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
+                  <rect x="6" y="4" width="4" height="16" rx="1.2" />
+                  <rect x="14" y="4" width="4" height="16" rx="1.2" />
+                </svg>
+                <span id="playPauseLabel">Воспроизвести</span>
+              </button>
+
+              <button id="btnNextTrack" class="btn btn-secondary btn-circle" type="button" title="Следующий трек" disabled>
+                <svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor">
+                  <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" />
+                </svg>
+              </button>
+
+              <button id="btnForceResync" class="btn btn-secondary btn-circle" type="button" title="Пересинхронизировать выбранных" disabled>
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="23 4 23 10 17 10" />
+                  <polyline points="1 20 1 14 7 14" />
+                  <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                </svg>
+              </button>
+            </div>
+
+            <!-- Статус воспроизведения (Слушатель) -->
+            <div id="listenerPlaybackBanner" class="listener-banner hidden">
+              <span class="pulse-dot" id="listenerPulse"></span>
+              <span id="listenerBannerText">Ожидание воспроизведения...</span>
+              <button id="btnListenerReconnect" class="btn btn-secondary btn-sm hidden" type="button">Повторить</button>
+            </div>
+
+            <!-- Wi-Fi позиция на Слушателе / APK-подсказка на Android -->
+            <div id="listenerLocationRow" class="listener-loc-row hidden">
+              <span class="listener-loc-badge" id="listenerLocationText">Wi-Fi позиция: поиск...</span>
+              <a id="listenerApkLink" class="listener-apk-link hidden" href="dist/orpheus-sync.apk" download>Скачать Android APK для Wi-Fi карты</a>
+            </div>
+
+            <!-- Локальная громкость -->
+            <div class="volume-row">
+              <button id="btnMute" class="icon-btn" type="button" title="Звук">
+                <svg id="iconVolOn" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                </svg>
+                <svg id="iconVolOff" class="hidden" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                  <line x1="23" y1="9" x2="17" y2="15" />
+                  <line x1="17" y1="9" x2="23" y2="15" />
+                </svg>
+              </button>
+              <input id="volumeSlider" class="range-slider" type="range" min="0" max="1" step="0.01" value="1" />
+              <span class="mono volume-pct" id="volumePct">100%</span>
+            </div>
+          </section>
+
+          <!-- Плейлист -->
+          <section id="playlistCard" class="card">
+            <div class="section-head">
+              <h3>Плейлист <span class="count-muted" id="playlistCount">0</span></h3>
+              <label class="toggle-chip hidden" id="loopToggleWrap" title="Повтор плейлиста">
+                <input type="checkbox" id="chkLoopPlaylist" checked />
+                <span>Повтор</span>
+              </label>
+            </div>
+
+            <!-- Добавление треков (только Хост) -->
+            <div id="hostTrackSection" class="host-add-wrap hidden">
+              <label class="file-dropzone" id="fileDropzone">
+                <input type="file" id="audioFileInput" accept="audio/*" multiple hidden />
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <polyline points="17 8 12 3 7 8" />
+                  <line x1="12" y1="3" x2="12" y2="15" />
+                </svg>
+                <span><strong>Выбрать аудиофайлы</strong> (MP3, WAV, M4A, OGG)</span>
+              </label>
+
+              <div class="quick-sources">
+                <button id="btnLoadDemoTrack" class="btn btn-secondary btn-sm" type="button">Тест-бит 120 BPM</button>
+                <button id="btnLoadPulseTrack" class="btn btn-secondary btn-sm" type="button">Метроном 1 Гц</button>
+                <button id="btnToggleUrlInput" class="btn btn-ghost btn-sm" type="button">По ссылке</button>
+              </div>
+
+              <form id="urlTrackForm" class="url-form hidden">
+                <input
+                  id="inputAudioUrl"
+                  class="input"
+                  type="url"
+                  placeholder="https://example.com/track.mp3"
+                  required
+                />
+                <button class="btn btn-secondary btn-sm" type="submit">Добавить</button>
+              </form>
+            </div>
+
+            <ul id="playlistList" class="playlist-list">
+              <li class="peer-empty">Плейлист пуст.</li>
+            </ul>
+          </section>
         </div>
-
-        <!-- Визуализатор -->
-        <div class="visualizer-wrap">
-          <canvas id="visualizerCanvas" width="600" height="80"></canvas>
-        </div>
-
-        <!-- Полоса прогресса -->
-        <div class="seek-wrap">
-          <span class="time-label mono" id="timeCurrent">0:00</span>
-          <input
-            id="seekSlider"
-            class="range-slider"
-            type="range"
-            min="0"
-            max="100"
-            step="0.1"
-            value="0"
-            disabled
-          />
-          <span class="time-label mono" id="timeDuration">0:00</span>
-        </div>
-
-        <!-- Управление (Хост) -->
-        <div id="hostPlaybackControls" class="playback-controls hidden">
-          <button id="btnPrevTrack" class="btn btn-secondary btn-circle" type="button" title="Предыдущий трек" disabled>
-            <svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor">
-              <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" />
-            </svg>
-          </button>
-
-          <button id="btnPlayPause" class="btn btn-primary btn-play" type="button" disabled>
-            <svg id="iconPlay" viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
-              <polygon points="7 4 20 12 7 20 7 4" />
-            </svg>
-            <svg id="iconPause" class="hidden" viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
-              <rect x="6" y="4" width="4" height="16" rx="1.2" />
-              <rect x="14" y="4" width="4" height="16" rx="1.2" />
-            </svg>
-            <span id="playPauseLabel">Воспроизвести</span>
-          </button>
-
-          <button id="btnNextTrack" class="btn btn-secondary btn-circle" type="button" title="Следующий трек" disabled>
-            <svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor">
-              <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" />
-            </svg>
-          </button>
-
-          <button id="btnForceResync" class="btn btn-secondary btn-circle" type="button" title="Пересинхронизировать всех" disabled>
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="23 4 23 10 17 10" />
-              <polyline points="1 20 1 14 7 14" />
-              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
-            </svg>
-          </button>
-        </div>
-
-        <!-- Статус воспроизведения (Слушатель) -->
-        <div id="listenerPlaybackBanner" class="listener-banner hidden">
-          <span class="pulse-dot" id="listenerPulse"></span>
-          <span id="listenerBannerText">Ожидание воспроизведения...</span>
-          <button id="btnListenerReconnect" class="btn btn-secondary btn-sm hidden" type="button">Повторить</button>
-        </div>
-
-        <!-- Локальная громкость -->
-        <div class="volume-row">
-          <button id="btnMute" class="icon-btn" type="button" title="Звук">
-            <svg id="iconVolOn" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-              <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-            </svg>
-            <svg id="iconVolOff" class="hidden" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-              <line x1="23" y1="9" x2="17" y2="15" />
-              <line x1="17" y1="9" x2="23" y2="15" />
-            </svg>
-          </button>
-          <input id="volumeSlider" class="range-slider" type="range" min="0" max="1" step="0.01" value="1" />
-          <span class="mono volume-pct" id="volumePct">100%</span>
-        </div>
-      </section>
-
-      <!-- Плейлист -->
-      <section id="playlistCard" class="card">
-        <div class="section-head">
-          <h3>Плейлист <span class="count-muted" id="playlistCount">0</span></h3>
-          <label class="toggle-chip hidden" id="loopToggleWrap" title="Повтор плейлиста">
-            <input type="checkbox" id="chkLoopPlaylist" checked />
-            <span>Повтор</span>
-          </label>
-        </div>
-
-        <!-- Добавление треков (только Хост) -->
-        <div id="hostTrackSection" class="host-add-wrap hidden">
-          <label class="file-dropzone" id="fileDropzone">
-            <input type="file" id="audioFileInput" accept="audio/*" multiple hidden />
-            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="17 8 12 3 7 8" />
-              <line x1="12" y1="3" x2="12" y2="15" />
-            </svg>
-            <span><strong>Выбрать аудиофайлы</strong> (MP3, WAV, M4A, OGG)</span>
-          </label>
-
-          <div class="quick-sources">
-            <button id="btnLoadDemoTrack" class="btn btn-secondary btn-sm" type="button">Тест-бит 120 BPM</button>
-            <button id="btnLoadPulseTrack" class="btn btn-secondary btn-sm" type="button">Метроном 1 Гц</button>
-            <button id="btnToggleUrlInput" class="btn btn-ghost btn-sm" type="button">По ссылке</button>
-          </div>
-
-          <form id="urlTrackForm" class="url-form hidden">
-            <input
-              id="inputAudioUrl"
-              class="input"
-              type="url"
-              placeholder="https://example.com/track.mp3"
-              required
-            />
-            <button class="btn btn-secondary btn-sm" type="submit">Добавить</button>
-          </form>
-        </div>
-
-        <ul id="playlistList" class="playlist-list">
-          <li class="peer-empty">Плейлист пуст.</li>
-        </ul>
-      </section>
-
-      <!-- Устройства в сети с живыми процентами загрузки (только Хост) -->
-      <section id="hostPeersSection" class="card hidden">
-        <div class="section-head">
-          <h3>Устройства <span class="count-muted" id="peerCount">0</span></h3>
-          <span class="hint mono" id="peersOverallProgress">Ожидание</span>
-        </div>
-        <ul id="peerList" class="peer-list">
-          <li class="peer-empty">Пока никто не подключился. Покажите QR-код или отправьте ссылку.</li>
-        </ul>
-      </section>
+      </div>
     </main>
   </div>
 
+  <!-- Рамка выделения как на рабочем столе -->
+  <div id="mapMarqueeBox" class="map-marquee-box hidden" aria-hidden="true"></div>
   <div id="toastContainer" class="toast-container" aria-live="polite"></div>
 </body>
 </html>
