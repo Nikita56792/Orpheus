@@ -711,35 +711,12 @@ html.has-invite-room #viewInviteUnlock {
 .listener-banner {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
   gap: 10px;
   padding: 11px 14px;
   border-radius: 12px;
   background: var(--bg-secondary);
   margin-bottom: 14px;
   font-size: 0.9rem;
-}
-
-.btn-bt-cal {
-  padding: 2px 8px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--bg-secondary);
-  color: var(--text-primary);
-  cursor: pointer;
-  transition: background 0.15s ease, opacity 0.15s ease;
-}
-
-.btn-bt-cal:hover:not(:disabled) {
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-
-.btn-bt-cal:disabled {
-  opacity: 0.5;
-  cursor: default;
 }
 
 .pulse-dot {

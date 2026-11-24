@@ -258,23 +258,6 @@
       ui.iconVolOff.classList.toggle('hidden', !m);
     },
 
-    onCmdCalibDuck: ({ ducked }) => {
-      audio.setCalibrationDuck(Boolean(ducked));
-    },
-
-    onCmdCalibChirp: ({ hostTimes }) => {
-      if (clock && Array.isArray(hostTimes) && hostTimes.length > 0) {
-        audio.scheduleCalibrationChirps(hostTimes, () => clock.hostNow());
-      }
-    },
-
-    onSetCalibratedLatency: ({ totalLatencyMs }) => {
-      if (Number.isFinite(totalLatencyMs)) {
-        const profile = audio.applyExternalCalibration(totalLatencyMs);
-        showToast(`Задержка синхронизирована: ${profile.totalLatencyMs} мс`, 'success');
-      }
-    },
-
     onError: (err) => {
       showToast(err.message || 'Сетевая ошибка', 'error');
     },
@@ -399,38 +382,6 @@
     qr.addData(url);
     qr.make();
     ui.qrCanvasWrap.innerHTML = qr.createSvgTag({ scalable: true, margin: 2 });
-  }
-
-  let _calibratingPeerId = null;
-
-  async function hostCalibratePeer(peerId) {
-    if (state.role !== 'host' || !clock || _calibratingPeerId) return;
-    const client = network.clients.get(peerId);
-    if (!client) return;
-
-    _calibratingPeerId = peerId;
-    network._emitPeers();
-    showToast(`Замер задержки ${client.label} (~3 сек)...`, 'info');
-
-    try {
-      network.broadcastCalibDuck(true);
-      const res = await audio.hostCalibrateRemotePeer({
-        peerCurrentLatencyMs: client.latency?.totalLatencyMs || 0,
-        sendPeerChirps: (hostTimes) => network.sendCalibChirpsToPeer(peerId, hostTimes),
-        getHostTime: () => clock.hostNow(),
-      });
-      network.sendCalibratedLatencyToPeer(peerId, res.newTotalLatencyMs);
-      showToast(
-        `${client.label}: откалибровано ${res.newTotalLatencyMs} мс (${res.deltaMs >= 0 ? '+' : ''}${res.deltaMs} мс)`,
-        'success'
-      );
-    } catch (err) {
-      showToast(err.message || 'Не удалось откалибровать устройство', 'error');
-    } finally {
-      network.broadcastCalibDuck(false);
-      _calibratingPeerId = null;
-      network._emitPeers();
-    }
   }
 
   function sendLocalLatencyToHost() {
@@ -1188,10 +1139,6 @@
         const dotCls = p.phase === 'error' ? 'error' : (p.ready || p.streaming) ? 'ready' : '';
         const btChip = p.isBluetooth ? `<span class="peer-chip peer-chip-bt">BT ${p.latencyMs} мс</span>` : '';
         const netChip = p.transportLabel ? `<span class="peer-chip">${escapeHtml(p.transportLabel)}</span>` : '';
-        const isCalThis = _calibratingPeerId === p.id;
-        const calBtn = `<button class="btn-bt-cal" type="button" data-cal-peer="${escapeHtml(p.id)}" ${
-          _calibratingPeerId ? 'disabled' : ''
-        } title="Акустическая синхронизация колонки через микрофон Хоста">${isCalThis ? 'Замер...' : 'Калибр.'}</button>`;
 
         return `
           <li class="peer-item">
@@ -1202,7 +1149,6 @@
                   <strong>${escapeHtml(p.label)}</strong>
                   ${netChip}
                   ${btChip}
-                  ${calBtn}
                 </div>
               </div>
               <div class="peer-right mono">
@@ -1506,13 +1452,6 @@
 
   ui.btnListenerReconnect.addEventListener('click', () => {
     if (state.roomCode) enterAsListener(state.roomCode);
-  });
-
-  ui.peerList.addEventListener('click', (e) => {
-    const btn = e.target.closest('[data-cal-peer]');
-    if (btn && state.role === 'host') {
-      hostCalibratePeer(btn.dataset.calPeer);
-    }
   });
 
   let _volSyncTimer = null;

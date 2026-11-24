@@ -1830,27 +1830,6 @@ class NetworkManager {
     });
   }
 
-  broadcastCalibDuck(ducked) {
-    this._broadcast('ctrl', { type: 'CMD_CALIB_DUCK', ducked: Boolean(ducked) });
-  }
-
-  sendCalibChirpsToPeer(peerId, hostTimes) {
-    const client = this.clients.get(peerId);
-    if (!client || !client.open) return false;
-    this._sendToClient(client, 'ctrl', { type: 'CMD_CALIB_CHIRP', hostTimes });
-    return true;
-  }
-
-  sendCalibratedLatencyToPeer(peerId, totalLatencyMs) {
-    const client = this.clients.get(peerId);
-    if (!client || !client.open) return false;
-    this._sendToClient(client, 'ctrl', {
-      type: 'SET_CALIBRATED_LATENCY',
-      totalLatencyMs: Math.max(10, Math.min(1200, Math.round(totalLatencyMs))),
-    });
-    return true;
-  }
-
   _sendToClient(client, channelName, payload) {
     if (!client) return;
     // Если есть прямой открытый P2P-канал для NTP (или LAN ctrl) — используем прямой UDP-путь!
@@ -2620,18 +2599,6 @@ class NetworkManager {
 
       case 'CMD_VOLUME':
         if (this.cb.onCmdVolume) this.cb.onCmdVolume(msg);
-        break;
-
-      case 'CMD_CALIB_DUCK':
-        if (this.cb.onCmdCalibDuck) this.cb.onCmdCalibDuck(msg);
-        break;
-
-      case 'CMD_CALIB_CHIRP':
-        if (this.cb.onCmdCalibChirp) this.cb.onCmdCalibChirp(msg);
-        break;
-
-      case 'SET_CALIBRATED_LATENCY':
-        if (this.cb.onSetCalibratedLatency) this.cb.onSetCalibratedLatency(msg);
         break;
     }
   }
