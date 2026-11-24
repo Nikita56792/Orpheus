@@ -43,6 +43,8 @@
     metricDrift: $('metricDrift'),
 
     hostMapSection: $('hostMapSection'),
+    hostNavBar: $('hostNavBar'),
+    hostYandexSection: $('hostYandexSection'),
     btnMapSelectAll: $('btnMapSelectAll'),
     btnMapClearSel: $('btnMapClearSel'),
     mapFloorPills: $('mapFloorPills'),
@@ -137,6 +139,8 @@
 
   const darkThemeQuery = window.matchMedia('(prefers-color-scheme: dark)');
   let floorMap = null;
+  let yandexPanel = null;
+  let activeHostTab = 'map';
 
   /* ==================== ПОДСИСТЕМЫ ==================== */
 
@@ -553,7 +557,8 @@
     if (ui.appShell) ui.appShell.classList.add('is-host-room');
 
     ui.hostShareActions.classList.remove('hidden');
-    ui.hostMapSection.classList.remove('hidden');
+    ui.hostNavBar.classList.remove('hidden');
+    setHostTab('map');
     ui.zoneTargetBar.classList.remove('hidden');
     ui.hostTrackSection.classList.remove('hidden');
     ui.hostPlaybackControls.classList.remove('hidden');
@@ -579,6 +584,7 @@
     renderPeerList(state.peers);
     showView('room');
     ensureFloorMapInitialized();
+    ensureYandexPanelInitialized();
     refreshHostPlayerForSelection();
     startRenderLoop();
     requestNativeWifiScanIfAvailable();
@@ -699,6 +705,8 @@
       if (ui.appShell) ui.appShell.classList.remove('is-host-room');
 
       ui.hostShareActions.classList.add('hidden');
+      ui.hostNavBar.classList.add('hidden');
+      ui.hostYandexSection.classList.add('hidden');
       ui.hostMapSection.classList.add('hidden');
       ui.zoneTargetBar.classList.add('hidden');
       ui.qrPanel.classList.add('hidden');
@@ -817,6 +825,128 @@
     } catch (_) {
       showTransfer(false);
       showToast('Ошибка генерации тест-трека', 'error');
+    }
+  }
+
+  function setHostTab(tab) {
+    activeHostTab = tab === 'yandex' ? 'yandex' : 'map';
+    ui.hostMapSection.classList.toggle('hidden', activeHostTab !== 'map');
+    ui.hostYandexSection.classList.toggle('hidden', activeHostTab !== 'yandex');
+    ui.hostNavBar?.querySelectorAll('[data-host-view]').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.hostView === activeHostTab);
+    });
+    if (activeHostTab === 'yandex') {
+      ensureYandexPanelInitialized();
+      yandexPanel?.onOpen();
+    } else if (floorMap) {
+      floorMap.renderAll();
+    }
+  }
+
+  function ensureYandexPanelInitialized() {
+    if (!window.YandexMusicPanel || !ui.hostYandexSection || yandexPanel) return;
+    yandexPanel = new window.YandexMusicPanel({
+      rootEl: ui.hostYandexSection,
+      getServerBaseUrl: () => network._serverBaseUrl || NetworkManager.DEFAULT_SERVER_URL,
+      onPlayTrack: (ymTrack) => hostAddYandexTrack(ymTrack, { playNow: true }),
+      onAddTrack: (ymTrack) => hostAddYandexTrack(ymTrack, { playNow: false }),
+      onAddManyTracks: async (list) => {
+        let added = 0;
+        for (const tr of list) {
+          const ok = await hostAddYandexTrack(tr, { playNow: false, silent: true });
+          if (ok) added++;
+        }
+        if (added > 0) showToast(`Добавлено из Яндекс Музыки: ${added}`, 'success');
+      },
+      onToast: (msg, type) => showToast(msg, type),
+    });
+  }
+
+  async function hostAddYandexTrack(ymTrack, { playNow = false, silent = false } = {}) {
+    if (!ymTrack || !ymTrack.id) return false;
+    const trackId = `ym-${ymTrack.id}`;
+    const artists = Array.isArray(ymTrack.artists) ? ymTrack.artists.join(', ') : String(ymTrack.artists || '');
+    const displayName = artists ? `${artists} — ${ymTrack.title}` : ymTrack.title || `Трек ${ymTrack.id}`;
+
+    // Если трек уже загружен в плейлист — сразу играем без повторной загрузки!
+    const existing = state.playlist.find((t) => t.id === trackId);
+    if (existing) {
+      if (playNow) {
+        await hostSelectTrack(trackId, true);
+      } else if (!silent) {
+        showToast('Трек уже в плейлисте');
+      }
+      return true;
+    }
+
+    if (!silent) showTransfer(true, `Яндекс Музыка: ${ymTrack.title || 'загрузка'}...`, 35);
+    try {
+      const baseUrl = (network._serverBaseUrl || NetworkManager.DEFAULT_SERVER_URL).replace(/\/+$/, '');
+      const safeHash = encodeURIComponent(String(NetworkManager.hashKey(trackId)));
+      const qs = new URLSearchParams({
+        quality: 'hq',
+        room: state.roomCode || '',
+        trackHash: safeHash,
+        name: displayName,
+      });
+      const headers = {};
+      const ymTok = yandexPanel?.getToken?.() || '';
+      if (ymTok) headers['X-YM-Token'] = ymTok;
+
+      const resp = await fetch(`${baseUrl}/api/ym/track/${encodeURIComponent(ymTrack.id)}/audio?${qs.toString()}`, {
+        headers,
+      });
+      if (!resp.ok) {
+        let errMsg = `HTTP ${resp.status}`;
+        try {
+          const j = await resp.json();
+          if (j?.error) errMsg = j.error;
+        } catch (_) {}
+        throw new Error(errMsg);
+      }
+      const mime = resp.headers.get('Content-Type') || 'audio/mpeg';
+      const arrayBuffer = await resp.arrayBuffer();
+      if (!silent) showTransfer(true, 'Декодирование...', 85);
+
+      const decoded = await audio.decodeToCache(trackId, arrayBuffer);
+      const trackObj = {
+        id: trackId,
+        type: 'file',
+        name: displayName,
+        duration: decoded.duration,
+        size: arrayBuffer.byteLength,
+        mime,
+        buffer: arrayBuffer,
+        ymId: String(ymTrack.id),
+      };
+      // Сервер УЖЕ сохранил этот файл в RAM комнаты (room.tracks[safeHash]) —
+      // помечаем _serverTrackUrl, чтобы Хост не перезагружал файл обратно на сервер!
+      if (network._serverMode && state.roomCode) {
+        trackObj._serverRoomCode = state.roomCode;
+        trackObj._serverTrackUrl = `${baseUrl}/api/rooms/${state.roomCode}/tracks/${safeHash}`;
+      }
+
+      if (!state.playlist.some((t) => t.id === trackId)) {
+        state.playlist.push(trackObj);
+      }
+      if (!silent) showTransfer(false);
+
+      if (playNow) {
+        await hostSelectTrack(trackId, true);
+      } else if (!state.activeTrackId) {
+        await hostSelectTrack(trackId, false);
+      } else {
+        network.updatePlaylistCatalog(state.playlist);
+        renderPlaylist();
+      }
+      if (!silent) showToast(playNow ? `Играет: ${displayName}` : `Добавлено: ${displayName}`, 'success');
+      return true;
+    } catch (err) {
+      if (!silent) {
+        showTransfer(false);
+        showToast(`Яндекс Музыка: ${err.message || 'не удалось загрузить трек'}`, 'error');
+      }
+      return false;
     }
   }
 
@@ -1434,10 +1564,18 @@
     }
   }
 
-  function syncFloorMapData() {
+  let _lastMapDataSig = '';
+  function syncFloorMapData(force = false) {
     if (!floorMap || state.role !== 'host') return;
+    const devs = buildMapDevicesList();
+    const selKey = Array.from(state.selectedDeviceIds).sort().join(',');
+    const sig = `${selKey}|${state.playlist.map((t) => t.id).join(',')}|${devs
+      .map((d) => `${d.id}:${d.trackId || ''}:${d.playing ? 1 : 0}:${d.location ? `${d.location.site}:${d.location.floor}:${d.location.lx}:${d.location.ly}` : ''}`)
+      .join(';')}`;
+    if (!force && sig === _lastMapDataSig) return;
+    _lastMapDataSig = sig;
     floorMap.setData({
-      devices: buildMapDevicesList(),
+      devices: devs,
       playlist: state.playlist,
       selectedIds: state.selectedDeviceIds,
     });
@@ -1685,7 +1823,7 @@
     const canvas = ui.visualizerCanvas;
     const ctx2d = canvas.getContext('2d');
 
-    const tick = () => {
+    const tick = (now) => {
       const countdown = audio.getCountdownSec();
       // Показываем бейдж обратного отсчёта только если реальное ожидание > 0.35с (например, медленный BT)
       if (countdown > 0.35) {
@@ -1707,44 +1845,52 @@
         if (state.role === 'host') {
           const snap = getTargetControlSnapshot();
           if (snap.track) {
-            ui.timeCurrent.textContent = formatTime(snap.position);
+            const tStr = formatTime(snap.position);
+            if (ui.timeCurrent.textContent !== tStr) ui.timeCurrent.textContent = tStr;
             ui.seekSlider.value = String(snap.position);
           }
         } else if (audio.hasPlayableAudio()) {
           const pos = audio.getAcousticPosition();
-          ui.timeCurrent.textContent = formatTime(pos);
+          const tStr = formatTime(pos);
+          if (ui.timeCurrent.textContent !== tStr) ui.timeCurrent.textContent = tStr;
           ui.seekSlider.value = String(pos);
         }
       }
 
-      const w = canvas.width;
-      const h = canvas.height;
-      ctx2d.clearRect(0, 0, w, h);
+      // В простое не перерисовываем canvas визуализатора 60 раз в секунду
+      const shouldDrawViz = audio.isPlaying || !startRenderLoop._drewIdle || now - (startRenderLoop._lastViz || 0) > 250;
+      if (shouldDrawViz) {
+        startRenderLoop._drewIdle = !audio.isPlaying;
+        startRenderLoop._lastViz = now;
+        const w = canvas.width;
+        const h = canvas.height;
+        ctx2d.clearRect(0, 0, w, h);
 
-      const isDark = darkThemeQuery.matches;
-      const hasAudio = audio.isPlaying && audio.getFrequencyData(freqBins);
-      const barCount = 42;
-      const gap = 5;
-      const barWidth = (w - gap * (barCount - 1)) / barCount;
+        const isDark = darkThemeQuery.matches;
+        const hasAudio = audio.isPlaying && audio.getFrequencyData(freqBins);
+        const barCount = 42;
+        const gap = 5;
+        const barWidth = (w - gap * (barCount - 1)) / barCount;
 
-      for (let i = 0; i < barCount; i++) {
-        const val = hasAudio ? freqBins[i] / 255 : 0.06;
-        const barH = Math.max(4, val * (h - 14));
-        const x = i * (barWidth + gap);
-        const y = (h - barH) / 2;
+        for (let i = 0; i < barCount; i++) {
+          const val = hasAudio ? freqBins[i] / 255 : 0.06;
+          const barH = Math.max(4, val * (h - 14));
+          const x = i * (barWidth + gap);
+          const y = (h - barH) / 2;
 
-        if (hasAudio) {
-          ctx2d.fillStyle = isDark ? '#0a84ff' : '#007aff';
-        } else {
-          ctx2d.fillStyle = isDark ? 'rgba(255, 255, 255, 0.14)' : 'rgba(0, 0, 0, 0.12)';
+          if (hasAudio) {
+            ctx2d.fillStyle = isDark ? '#0a84ff' : '#007aff';
+          } else {
+            ctx2d.fillStyle = isDark ? 'rgba(255, 255, 255, 0.14)' : 'rgba(0, 0, 0, 0.12)';
+          }
+          ctx2d.beginPath();
+          if (typeof ctx2d.roundRect === 'function') {
+            ctx2d.roundRect(x, y, barWidth, barH, 3);
+          } else {
+            ctx2d.rect(x, y, barWidth, barH);
+          }
+          ctx2d.fill();
         }
-        ctx2d.beginPath();
-        if (typeof ctx2d.roundRect === 'function') {
-          ctx2d.roundRect(x, y, barWidth, barH, 3);
-        } else {
-          ctx2d.rect(x, y, barWidth, barH);
-        }
-        ctx2d.fill();
       }
 
       state.rafId = requestAnimationFrame(tick);
@@ -1818,6 +1964,11 @@
   ui.btnLeaveRoom.addEventListener('click', leaveRoom);
   ui.btnHome.addEventListener('click', () => {
     if (state.role) leaveRoom();
+  });
+
+  ui.hostNavBar?.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-host-view]');
+    if (btn) setHostTab(btn.dataset.hostView);
   });
 
   ui.btnToggleQR.addEventListener('click', () => {
@@ -2183,6 +2334,8 @@
     network,
     getClock: () => clock,
     getFloorMap: () => floorMap,
+    getYandexPanel: () => yandexPanel,
+    setHostTab,
     setSelection,
     enterAsHost,
     enterAsListener,

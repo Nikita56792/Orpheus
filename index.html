@@ -10,14 +10,15 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   <title>Orpheus Sync — Синхронная музыка</title>
   <link rel="preconnect" href="https://158.160.205.107" crossorigin />
-  <link rel="stylesheet" href="styles.css?v=20" />
+  <link rel="stylesheet" href="styles.css?v=21" />
   <script defer src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js" onerror="var s=document.createElement('script');s.src='https://unpkg.com/qrcode-generator@1.4.4/qrcode.min.js';document.head.appendChild(s);"></script>
-  <script defer src="js/wake-lock.js?v=20"></script>
-  <script defer src="js/clock-sync.js?v=20"></script>
-  <script defer src="js/audio-engine.js?v=20"></script>
-  <script defer src="js/network.js?v=20"></script>
-  <script defer src="js/floor-map.js?v=20"></script>
-  <script defer src="js/app.js?v=20"></script>
+  <script defer src="js/wake-lock.js?v=21"></script>
+  <script defer src="js/clock-sync.js?v=21"></script>
+  <script defer src="js/audio-engine.js?v=21"></script>
+  <script defer src="js/network.js?v=21"></script>
+  <script defer src="js/floor-map.js?v=21"></script>
+  <script defer src="js/yandex-music.js?v=21"></script>
+  <script defer src="js/app.js?v=21"></script>
 </head>
 <body>
   <script>
@@ -203,9 +204,40 @@
         </div>
       </section>
 
-      <!-- Рабочая область комнаты (2 колонки на широком экране для Хоста: Карта + Плеер) -->
+      <!-- Переключатель разделов Хоста: Карта и комнаты | Яндекс Музыка -->
+      <nav id="hostNavBar" class="host-nav-bar hidden" role="tablist" aria-label="Разделы управления">
+        <button type="button" class="host-nav-btn active" data-host-view="map">Карта и комнаты</button>
+        <button type="button" class="host-nav-btn" data-host-view="yandex">Яндекс Музыка</button>
+      </nav>
+
+      <!-- Рабочая область комнаты (2 колонки на широком экране для Хоста: Карта/Яндекс Музыка + Плеер) -->
       <div class="room-workspace" id="roomWorkspace">
         <div class="room-col-primary">
+          <!-- Встроенная страница Яндекс Музыки (протокол yamusic-rs) -->
+          <section id="hostYandexSection" class="card ym-card hidden">
+            <div class="ym-auth-bar" id="ymAuthBar"></div>
+            <div class="ym-device-box hidden" id="ymDeviceBox"></div>
+            <form id="ymTokenForm" class="url-form hidden" style="margin-bottom: 12px;">
+              <input id="ymTokenInput" class="input" type="password" placeholder="Вставьте OAuth-токен Яндекс Музыки" autocomplete="off" />
+              <button class="btn btn-primary btn-sm" type="submit">Войти</button>
+            </form>
+
+            <form id="ymSearchForm" class="ym-search-form">
+              <input id="ymSearchInput" class="input" type="search" placeholder="Поиск треков, исполнителей, альбомов..." autocomplete="off" />
+              <button class="btn btn-secondary btn-sm" type="submit">Найти</button>
+            </form>
+
+            <div class="ym-tabs" role="tablist">
+              <button type="button" class="floor-pill active" data-ym-tab="chart">Чарт</button>
+              <button type="button" class="floor-pill" data-ym-tab="search">Поиск</button>
+              <button type="button" class="floor-pill" data-ym-tab="wave">Моя волна</button>
+              <button type="button" class="floor-pill" data-ym-tab="likes">Мне нравится</button>
+              <button type="button" class="floor-pill" data-ym-tab="playlists">Плейлисты</button>
+            </div>
+
+            <div id="ymContent" class="ym-content"></div>
+          </section>
+
           <!-- Интерактивная многоэтажная карта здания (только Хост) -->
           <section id="hostMapSection" class="card map-card hidden">
             <div class="map-header">

@@ -1600,3 +1600,339 @@ body.orpheus-selecting {
 .listener-apk-link:hover {
   text-decoration: underline;
 }
+
+
+/* ==================== HOST NAV & YANDEX MUSIC MODULE (v21) ==================== */
+
+.host-nav-bar {
+  display: inline-flex;
+  align-self: flex-start;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  padding: 4px;
+  border-radius: 14px;
+  gap: 4px;
+  box-shadow: var(--shadow-card);
+}
+
+.host-nav-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.88rem;
+  font-weight: 650;
+  padding: 8px 16px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.host-nav-btn:hover {
+  color: var(--text);
+}
+
+.host-nav-btn.active {
+  background: var(--primary);
+  color: #ffffff;
+}
+
+.ym-card {
+  padding: 16px;
+}
+
+.ym-auth-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--bg-secondary);
+  margin-bottom: 12px;
+}
+
+.ym-auth-info {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  flex: 1;
+}
+
+.ym-logo-badge {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: #fc3f1d;
+  color: #ffffff;
+  font-weight: 800;
+  font-size: 0.9rem;
+  flex-shrink: 0;
+}
+
+.ym-user-name {
+  font-weight: 650;
+  font-size: 0.88rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ym-auth-hint {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.ym-plus-pill {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  background: linear-gradient(135deg, #7b4dff, #ff4d8d);
+  color: #ffffff;
+}
+
+.ym-auth-btns {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.ym-device-box {
+  margin-bottom: 12px;
+  padding: 14px;
+  border-radius: 14px;
+  background: var(--primary-soft);
+  border: 1px solid rgba(0, 122, 255, 0.25);
+}
+
+.ym-device-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  font-size: 0.88rem;
+}
+
+.ym-device-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ym-device-code {
+  font-size: 1.55rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--primary);
+}
+
+.ym-device-hint {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+
+.ym-device-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ym-search-form {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.ym-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.ym-content {
+  min-height: 160px;
+}
+
+.ym-subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 10px;
+  font-size: 0.84rem;
+  font-weight: 650;
+  color: var(--text-muted);
+}
+
+.ym-subhead-left,
+.ym-subhead-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ym-track-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 540px;
+  overflow-y: auto;
+}
+
+.ym-track-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 9px;
+  border-radius: 12px;
+  background: var(--bg-secondary);
+  border: 1px solid transparent;
+  transition: background 0.12s ease;
+}
+
+.ym-track-item:hover {
+  background: var(--bg-hover);
+}
+
+.ym-cover {
+  width: 42px;
+  height: 42px;
+  border-radius: 9px;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: var(--bg-card);
+}
+
+.ym-cover-ph {
+  display: grid;
+  place-items: center;
+  color: var(--text-muted);
+  font-weight: 700;
+}
+
+.ym-track-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.ym-track-title {
+  font-size: 0.88rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ym-track-sub {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ym-exp {
+  display: inline-block;
+  font-size: 0.62rem;
+  font-weight: 700;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--border-strong);
+  color: var(--text-muted);
+  vertical-align: middle;
+}
+
+.ym-track-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.ym-play-btn {
+  min-width: 34px;
+}
+
+.ym-cards-row,
+.ym-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(126px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.ym-col-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text);
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.14s ease, transform 0.08s ease;
+}
+
+.ym-col-card:hover {
+  background: var(--bg-hover);
+}
+
+.ym-col-card:active {
+  transform: scale(0.98);
+}
+
+.ym-col-cover {
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: 10px;
+  object-fit: cover;
+  background: var(--bg-card);
+}
+
+.ym-col-title {
+  font-size: 0.8rem;
+  font-weight: 650;
+  width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ym-col-sub {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ym-empty {
+  padding: 28px 14px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.88rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.ym-err {
+  color: var(--danger);
+}

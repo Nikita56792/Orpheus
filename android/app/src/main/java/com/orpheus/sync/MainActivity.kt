@@ -56,11 +56,17 @@ class MainActivity : Activity() {
 
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                    val url = request.url.toString()
-                    if (url.endsWith(".apk", ignoreCase = true)) return false
-                    if (url.startsWith("https://158.160.205.107") || url.startsWith("https://nikita56792.github.io")) {
-                        return false
+                    val uri = request.url ?: return false
+                    val url = uri.toString()
+                    val host = uri.host?.lowercase() ?: ""
+                    if (host == "ya.ru" || host.endsWith(".ya.ru") || host == "oauth.yandex.ru" || host.endsWith(".yandex.ru") || host == "passport.yandex.ru") {
+                        // Открываем авторизацию Яндекс во внешнем браузере, где пользователь уже вошёл в аккаунт
+                        try {
+                            startActivity(Intent(Intent.ACTION_VIEW, uri))
+                            return true
+                        } catch (_: Throwable) {}
                     }
+                    if (url.endsWith(".apk", ignoreCase = true)) return false
                     return false
                 }
 
